@@ -44,6 +44,7 @@ fn app() -> App {
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
         .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>()
         .add_message::<SpellKitFx>()
         .add_message::<StateDoneKit>()
         .add_message::<crate::net::FieldChanged>()
@@ -58,6 +59,7 @@ fn app() -> App {
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<super::SpellEffectClear>()
         .add_message::<super::KitEffectClear>()
+        .add_message::<super::UnitEffectClear>()
         .add_message::<SheathRequest>();
     app.insert_resource(SpellVisuals(SpellVisualCatalog::from_tables(
         HashMap::from([
@@ -81,6 +83,7 @@ fn app() -> App {
                 PRECAST_KIT,
                 VisualKit {
                     anim_id: Some(HOLD_ANIM),
+                    rearms_base: true,
                     ..Default::default()
                 },
             ),
@@ -147,8 +150,11 @@ fn timed_cast_hold_arms_and_releases_across_frames() {
     app.update();
     assert_eq!(hold(&app, unit), Some(SPELL), "START arms the hold");
 
-    app.world_mut()
-        .write_message(cast_event(unit, SPELL, CastEventKind::Go));
+    app.world_mut().write_message(cast_event(
+        unit,
+        SPELL,
+        CastEventKind::Go { ends_cast: true },
+    ));
     app.update();
     assert_eq!(hold(&app, unit), None, "GO releases it");
 }
@@ -165,14 +171,123 @@ fn same_frame_start_and_go_leave_no_hold() {
         SPELL,
         CastEventKind::Start { visuals: true },
     ));
-    app.world_mut()
-        .write_message(cast_event(unit, SPELL, CastEventKind::Go));
+    app.world_mut().write_message(cast_event(
+        unit,
+        SPELL,
+        CastEventKind::Go { ends_cast: true },
+    ));
     app.update();
     assert_eq!(
         hold(&app, unit),
         None,
         "the instant cast's hold is released"
     );
+}
+
+/// The base re-picks a frame wrote, as (unit, seq).
+fn rearms(app: &mut App) -> Vec<(Entity, u64)> {
+    app.world_mut()
+        .resource_mut::<Messages<super::BaseRearm>>()
+        .drain()
+        .map(|r| (r.entity, r.seq))
+        .collect()
+}
+
+/// An instant cast's START and GO in one frame: the end that clears the cast state re-picks the
+/// base under a precast kit with an anim (`0x7fec7a`), at the GO's stamp; a GO that ends no cast
+/// state re-picks nothing (`0x7fed81`), and neither does a failure that ends none.
+#[test]
+fn a_cast_end_rearms_the_base_under_a_precast_anim() {
+    let mut app = app();
+    let unit = app.world_mut().spawn_empty().id();
+    let edge = |app: &mut App, kind, seq| {
+        app.world_mut().write_message(CastEvent {
+            seq,
+            ..cast_event(unit, SPELL, kind)
+        });
+    };
+
+    edge(&mut app, CastEventKind::Start { visuals: true }, 4);
+    edge(&mut app, CastEventKind::Go { ends_cast: true }, 5);
+    app.update();
+    assert_eq!(rearms(&mut app), vec![(unit, 5)], "the GO's end re-picks");
+
+    edge(&mut app, CastEventKind::Go { ends_cast: false }, 6);
+    app.update();
+    assert!(rearms(&mut app).is_empty(), "a GO that ends no cast state");
+
+    let fail = |ends_cast| CastEventKind::Fail {
+        interrupt: false,
+        wire_reason: 0,
+        ends_cast,
+    };
+    edge(&mut app, fail(true), 7);
+    app.update();
+    assert_eq!(
+        rearms(&mut app),
+        vec![(unit, 7)],
+        "a failure's end re-picks"
+    );
+    edge(&mut app, fail(false), 8);
+    app.update();
+    assert!(rearms(&mut app).is_empty(), "a failure that ends none");
+}
+
+/// A spell with no precast kit plays its cast kit's anim with no re-pick before it, so the driver's
+/// same-id keep holds a repeat (`0x738000`); a precast kit whose start and anim are both 0
+/// re-picks nothing either (`0x7fec68`).
+#[test]
+fn no_precast_anim_no_rearm() {
+    let mut app = app();
+    let unit = app.world_mut().spawn_empty().id();
+
+    app.world_mut().write_message(cast_event(
+        unit,
+        RANGED_SPELL,
+        CastEventKind::Start { visuals: true },
+    ));
+    app.world_mut().write_message(cast_event(
+        unit,
+        RANGED_SPELL,
+        CastEventKind::Go { ends_cast: true },
+    ));
+    app.update();
+    assert!(rearms(&mut app).is_empty(), "no precast kit, no re-pick");
+    let anims: Vec<(u16, u64)> = app
+        .world_mut()
+        .resource_mut::<Messages<EmoteAnim>>()
+        .drain()
+        .map(|e| (e.anim_id, e.seq))
+        .collect();
+    assert_eq!(
+        anims,
+        vec![(FIRE_ANIM, 1)],
+        "the cast kit's anim still plays"
+    );
+
+    // The same precast kit with columns 1 and 2 both 0.
+    let bare = VisualKit {
+        id: PRECAST_KIT,
+        start_anim: Some(0),
+        ..Default::default()
+    };
+    app.insert_resource(SpellVisuals(SpellVisualCatalog::from_tables(
+        HashMap::from([(
+            VISUAL,
+            VisualStages {
+                precast: PRECAST_KIT,
+                ..Default::default()
+            },
+        )]),
+        HashMap::from([(PRECAST_KIT, bare)]),
+    )));
+    app.world_mut().write_message(cast_event(
+        unit,
+        SPELL,
+        CastEventKind::Go { ends_cast: true },
+    ));
+    app.update();
+    assert!(rearms(&mut app).is_empty(), "a 0/0 precast kit");
 }
 
 /// The hold is keyed by spell id, so a proc's GO never drops it, in the same frame or later.
@@ -186,8 +301,11 @@ fn a_foreign_go_never_drops_the_hold() {
         SPELL,
         CastEventKind::Start { visuals: true },
     ));
-    app.world_mut()
-        .write_message(cast_event(unit, 999, CastEventKind::Go));
+    app.world_mut().write_message(cast_event(
+        unit,
+        999,
+        CastEventKind::Go { ends_cast: false },
+    ));
     app.update();
     assert_eq!(
         hold(&app, unit),
@@ -195,8 +313,11 @@ fn a_foreign_go_never_drops_the_hold() {
         "same-frame foreign GO ignored"
     );
 
-    app.world_mut()
-        .write_message(cast_event(unit, 999, CastEventKind::Go));
+    app.world_mut().write_message(cast_event(
+        unit,
+        999,
+        CastEventKind::Go { ends_cast: false },
+    ));
     app.update();
     assert_eq!(hold(&app, unit), Some(SPELL), "later foreign GO ignored");
 }
@@ -223,6 +344,7 @@ fn precast_kit_sound_rings_once_at_start() {
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
         .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>()
         .add_message::<SpellKitFx>()
         .add_message::<StateDoneKit>()
         .add_message::<crate::net::FieldChanged>()
@@ -237,6 +359,7 @@ fn precast_kit_sound_rings_once_at_start() {
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<super::SpellEffectClear>()
         .add_message::<super::KitEffectClear>()
+        .add_message::<super::UnitEffectClear>()
         .add_message::<SheathRequest>();
     app.insert_resource(SpellVisuals(SpellVisualCatalog::from_tables(
         HashMap::from([(
@@ -290,8 +413,11 @@ fn precast_kit_sound_rings_once_at_start() {
         "START rings the precast kit's sound once (got {played:?})"
     );
 
-    app.world_mut()
-        .write_message(cast_event(unit, HERB, CastEventKind::Go));
+    app.world_mut().write_message(cast_event(
+        unit,
+        HERB,
+        CastEventKind::Go { ends_cast: true },
+    ));
     app.update();
     let after_go: Vec<_> = app
         .world_mut()
@@ -375,6 +501,7 @@ fn same_frame_start_and_fail_leave_no_hold() {
         CastEventKind::Fail {
             interrupt: false,
             wire_reason: 0,
+            ends_cast: true,
         },
     ));
     app.update();
@@ -525,7 +652,8 @@ fn aura_state_kit_arms_persistent_and_reaps_on_aura_end() {
         .add_message::<SpellKitShake>()
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<super::SpellEffectClear>()
-        .add_message::<super::KitEffectClear>();
+        .add_message::<super::KitEffectClear>()
+        .add_message::<super::UnitEffectClear>();
     app.init_resource::<crate::net::GuidIndex>();
     app.add_message::<crate::aura_visual::BodyProcPlay>();
     app.add_message::<SheathRequest>();
@@ -534,7 +662,8 @@ fn aura_state_kit_arms_persistent_and_reaps_on_aura_end() {
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
-        .add_message::<super::BaseAnimRecompute>();
+        .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>();
     app.init_resource::<FxLog>();
     app.insert_resource(SpellVisuals(SpellVisualCatalog::from_tables_with_paths(
         HashMap::from([(
@@ -694,7 +823,8 @@ fn an_ending_aura_plays_its_state_done_kit_once() {
         .add_message::<SpellKitShake>()
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<super::SpellEffectClear>()
-        .add_message::<super::KitEffectClear>();
+        .add_message::<super::KitEffectClear>()
+        .add_message::<super::UnitEffectClear>();
     app.init_resource::<crate::net::GuidIndex>();
     app.add_message::<crate::aura_visual::BodyProcPlay>();
     app.add_message::<SheathRequest>();
@@ -709,10 +839,12 @@ fn an_ending_aura_plays_its_state_done_kit_once() {
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<super::SpellEffectClear>()
         .add_message::<super::KitEffectClear>()
+        .add_message::<super::UnitEffectClear>()
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
-        .add_message::<super::BaseAnimRecompute>();
+        .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>();
     app.init_resource::<FxLog>();
     app.init_resource::<super::super::PlaySeq>();
     let mut slots = [None; 9];
@@ -823,6 +955,7 @@ fn a_harmful_go_wounds_each_hit_once_and_a_missile_arrival_always() {
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
         .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>()
         .add_message::<SpellKitFx>()
         .add_message::<StateDoneKit>()
         .add_message::<crate::net::FieldChanged>()
@@ -837,6 +970,7 @@ fn a_harmful_go_wounds_each_hit_once_and_a_missile_arrival_always() {
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<super::SpellEffectClear>()
         .add_message::<super::KitEffectClear>()
+        .add_message::<super::UnitEffectClear>()
         .add_message::<SheathRequest>();
     let stages = VisualStages {
         impact: IMPACT_KIT,
@@ -895,8 +1029,11 @@ fn a_harmful_go_wounds_each_hit_once_and_a_missile_arrival_always() {
             .collect()
     };
     for (spell_id, expected) in [(HARMFUL, vec![target]), (HELPFUL, Vec::new())] {
-        app.world_mut()
-            .write_message(cast_event(caster, spell_id, CastEventKind::Go));
+        app.world_mut().write_message(cast_event(
+            caster,
+            spell_id,
+            CastEventKind::Go { ends_cast: true },
+        ));
         app.world_mut().write_message(SpellGoTargets {
             list: Vec::new(),
             target_mask: 0x2,
@@ -958,6 +1095,7 @@ fn missile_spawn_defers_iff_the_cast_kit_animates() {
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
         .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>()
         .add_message::<SpellKitFx>()
         .add_message::<StateDoneKit>()
         .add_message::<crate::net::FieldChanged>()
@@ -972,6 +1110,7 @@ fn missile_spawn_defers_iff_the_cast_kit_animates() {
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<super::SpellEffectClear>()
         .add_message::<super::KitEffectClear>()
+        .add_message::<super::UnitEffectClear>()
         .add_message::<SheathRequest>();
     app.insert_resource(SpellVisuals(SpellVisualCatalog::from_tables(
         HashMap::from([
@@ -1095,6 +1234,7 @@ fn ground_app(
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
         .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>()
         .add_message::<SpellKitFx>()
         .add_message::<StateDoneKit>()
         .add_message::<crate::net::FieldChanged>()
@@ -1109,6 +1249,7 @@ fn ground_app(
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<super::SpellEffectClear>()
         .add_message::<super::KitEffectClear>()
+        .add_message::<super::UnitEffectClear>()
         .add_message::<SheathRequest>();
     app.insert_resource(SpellVisuals(SpellVisualCatalog::from_tables_with_paths(
         HashMap::from([(VISUAL, stages)]),
@@ -1388,8 +1529,11 @@ fn ranged_visual_play_arms_the_any_caster_hold_and_a_non_ranged_play_clears_it()
     let mut app = app();
     let unit = app.world_mut().spawn_empty().id();
 
-    app.world_mut()
-        .write_message(cast_event(unit, RANGED_SPELL, CastEventKind::Go));
+    app.world_mut().write_message(cast_event(
+        unit,
+        RANGED_SPELL,
+        CastEventKind::Go { ends_cast: true },
+    ));
     app.update();
     assert!(
         app.world().entity(unit).get::<RangedHold>().is_some(),
@@ -1408,8 +1552,11 @@ fn ranged_visual_play_arms_the_any_caster_hold_and_a_non_ranged_play_clears_it()
     );
 
     // A ranged START re-arms it too, but this chain's precast stage is empty, so the GO re-arms it.
-    app.world_mut()
-        .write_message(cast_event(unit, RANGED_SPELL, CastEventKind::Go));
+    app.world_mut().write_message(cast_event(
+        unit,
+        RANGED_SPELL,
+        CastEventKind::Go { ends_cast: true },
+    ));
     app.update();
     assert!(
         app.world().entity(unit).get::<RangedHold>().is_some(),
@@ -1601,8 +1748,11 @@ fn a_kit_with_a_chain_char_proc_asks_for_a_beam_from_both_dispatcher_sites() {
 
     // Site 1, the cast release.
     let unit = app.world_mut().spawn_empty().id();
-    app.world_mut()
-        .write_message(cast_event(unit, BEAM_SPELL, CastEventKind::Go));
+    app.world_mut().write_message(cast_event(
+        unit,
+        BEAM_SPELL,
+        CastEventKind::Go { ends_cast: true },
+    ));
     app.update();
     assert_eq!(
         plays(&mut app),
@@ -1610,8 +1760,11 @@ fn a_kit_with_a_chain_char_proc_asks_for_a_beam_from_both_dispatcher_sites() {
         "the cast kit's type-12 proc asks for a one-shot beam"
     );
 
-    app.world_mut()
-        .write_message(cast_event(unit, SPELL, CastEventKind::Go));
+    app.world_mut().write_message(cast_event(
+        unit,
+        SPELL,
+        CastEventKind::Go { ends_cast: true },
+    ));
     app.update();
     assert!(plays(&mut app).is_empty(), "a beam-less kit stays silent");
 
@@ -1726,6 +1879,7 @@ fn real_shooter(weapon: &RealRanged) -> Option<(App, Entity)> {
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
         .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>()
         .add_message::<SpellKitFx>()
         .add_message::<StateDoneKit>()
         .add_message::<crate::net::FieldChanged>()
@@ -1740,6 +1894,7 @@ fn real_shooter(weapon: &RealRanged) -> Option<(App, Entity)> {
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<super::SpellEffectClear>()
         .add_message::<super::KitEffectClear>()
+        .add_message::<super::UnitEffectClear>()
         .add_message::<SheathRequest>();
     app.insert_resource(SpellVisuals(visuals));
     app.insert_resource(crate::ui_action::Spells {
@@ -1811,8 +1966,11 @@ fn a_real_bow_shooters_auto_shot_go_plays_attackbow() {
     let Some((mut app, unit)) = real_shooter(&WORN_SHORTBOW) else {
         return;
     };
-    app.world_mut()
-        .write_message(cast_event(unit, AUTO_SHOT, CastEventKind::Go));
+    app.world_mut().write_message(cast_event(
+        unit,
+        AUTO_SHOT,
+        CastEventKind::Go { ends_cast: true },
+    ));
     app.update();
     assert_eq!(
         emote_anims(&mut app, unit),
@@ -1833,8 +1991,11 @@ fn a_real_gun_or_crossbow_shooters_auto_shot_go_plays_attackrifle() {
         let Some((mut app, unit)) = real_shooter(weapon) else {
             return;
         };
-        app.world_mut()
-            .write_message(cast_event(unit, AUTO_SHOT, CastEventKind::Go));
+        app.world_mut().write_message(cast_event(
+            unit,
+            AUTO_SHOT,
+            CastEventKind::Go { ends_cast: true },
+        ));
         app.update();
         assert_eq!(
             emote_anims(&mut app, unit),
@@ -1877,8 +2038,11 @@ fn a_real_bow_shooters_auto_shot_start_arms_the_loadbow_hold() {
         .collect();
     assert_eq!(sheaths, vec![2], "…and the ranged stance snaps drawn");
 
-    app.world_mut()
-        .write_message(cast_event(unit, AUTO_SHOT, CastEventKind::Go));
+    app.world_mut().write_message(cast_event(
+        unit,
+        AUTO_SHOT,
+        CastEventKind::Go { ends_cast: true },
+    ));
     app.update();
     assert!(
         app.world().entity(unit).get::<CastHold>().is_none(),
@@ -1909,8 +2073,11 @@ fn a_shooter_with_no_ranged_weapon_resolves_no_clip_at_all() {
         AUTO_SHOT,
         CastEventKind::Start { visuals: true },
     ));
-    app.world_mut()
-        .write_message(cast_event(unit, AUTO_SHOT, CastEventKind::Go));
+    app.world_mut().write_message(cast_event(
+        unit,
+        AUTO_SHOT,
+        CastEventKind::Go { ends_cast: true },
+    ));
     app.update();
     assert!(
         emote_anims(&mut app, unit).is_empty(),
@@ -1947,6 +2114,7 @@ fn an_instant_hit_plays_its_impact_kit_and_no_state_kit() {
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
         .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>()
         .add_message::<SpellKitFx>()
         .add_message::<StateDoneKit>()
         .add_message::<crate::net::FieldChanged>()
@@ -1961,6 +2129,7 @@ fn an_instant_hit_plays_its_impact_kit_and_no_state_kit() {
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<super::SpellEffectClear>()
         .add_message::<super::KitEffectClear>()
+        .add_message::<super::UnitEffectClear>()
         .add_message::<SheathRequest>();
     app.insert_resource(SpellVisuals(SpellVisualCatalog::from_tables(
         HashMap::from([(
@@ -2002,8 +2171,11 @@ fn an_instant_hit_plays_its_impact_kit_and_no_state_kit() {
 
     let caster = app.world_mut().spawn_empty().id();
     let victim = struck_unit(app.world_mut(), 1, &[(0, CHARGE, 1)]);
-    app.world_mut()
-        .write_message(cast_event(caster, CHARGE, CastEventKind::Go));
+    app.world_mut().write_message(cast_event(
+        caster,
+        CHARGE,
+        CastEventKind::Go { ends_cast: true },
+    ));
     app.world_mut().write_message(SpellGoTargets {
         list: Vec::new(),
         target_mask: 0x2,
@@ -2084,11 +2256,13 @@ fn an_anim_only_state_kit_still_arms_on_the_aura_add_edge() {
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<super::SpellEffectClear>()
         .add_message::<super::KitEffectClear>()
+        .add_message::<super::UnitEffectClear>()
         .init_resource::<crate::net::GuidIndex>()
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
         .add_message::<SpellKitSound>()
-        .add_message::<super::BaseAnimRecompute>();
+        .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>();
     app.insert_resource(SpellVisuals(SpellVisualCatalog::from_tables(
         HashMap::from([(
             VISUAL,
@@ -2160,11 +2334,13 @@ fn a_detection_aura_s_state_kit_follows_our_own_aura_vision() {
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<super::SpellEffectClear>()
         .add_message::<super::KitEffectClear>()
+        .add_message::<super::UnitEffectClear>()
         .init_resource::<crate::net::GuidIndex>()
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
         .add_message::<SpellKitSound>()
-        .add_message::<super::BaseAnimRecompute>();
+        .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>();
     app.insert_resource(SpellVisuals(SpellVisualCatalog::from_tables(
         HashMap::from([(
             VISUAL,
@@ -2849,7 +3025,9 @@ fn the_impact_kit_is_the_casters_on_the_caster_and_the_targets_elsewhere() {
     let rung: Vec<(Entity, u32)> = sounds(&mut app)
         .into_iter()
         .filter_map(|s| match s {
-            SpellKitSound::Play { entity, kit_sound } => Some((entity, kit_sound)),
+            SpellKitSound::Play {
+                entity, kit_sound, ..
+            } => Some((entity, kit_sound)),
             _ => None,
         })
         .collect();
@@ -2879,7 +3057,11 @@ fn the_impact_kit_is_the_casters_on_the_caster_and_the_targets_elsewhere() {
     app.update();
     assert!(matches!(
         sounds(&mut app)[..],
-        [SpellKitSound::Play { entity, kit_sound: 200 }] if entity == caster
+        [SpellKitSound::Play {
+            entity,
+            kit_sound: 200,
+            ..
+        }] if entity == caster
     ));
 
     // No target impact kit: the target falls back on column 3, and a point takes the kit.
@@ -3438,6 +3620,7 @@ fn a_failure_releases_the_hold_on_the_reference_s_paths() {
     let fail = |interrupt, wire_reason| CastEventKind::Fail {
         interrupt,
         wire_reason,
+        ends_cast: true,
     };
     assert_eq!(
         edge_of(&mut app, unit, 101, 4, fail(true, 0x28)),
@@ -3470,7 +3653,14 @@ fn a_failure_releases_the_hold_on_the_reference_s_paths() {
         "a reason past it, shared 0x91 with it"
     );
     assert!(
-        edge_of(&mut app, unit, 101, 4, CastEventKind::Go).is_empty(),
+        edge_of(
+            &mut app,
+            unit,
+            101,
+            4,
+            CastEventKind::Go { ends_cast: true }
+        )
+        .is_empty(),
         "GO keeps it"
     );
 }
@@ -3652,11 +3842,13 @@ fn aura_arm_app_with(state_kit: VisualKit) -> App {
         .add_message::<crate::weapon_trail::TrailArm>()
         .add_message::<super::SpellEffectClear>()
         .add_message::<super::KitEffectClear>()
+        .add_message::<super::UnitEffectClear>()
         .init_resource::<crate::net::GuidIndex>()
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
         .add_message::<SpellKitSound>()
-        .add_message::<super::BaseAnimRecompute>();
+        .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>();
     app.insert_resource(SpellVisuals(SpellVisualCatalog::from_tables(
         HashMap::from([(
             VISUAL,
@@ -4275,7 +4467,7 @@ fn a_beam_spells_flag_1_impact_kit_waits_for_the_beam_or_drops_at_the_timeout() 
             .resource_mut::<Messages<SpellKitSound>>()
             .drain()
             .filter(|s| {
-                matches!(s, SpellKitSound::Play { entity, kit_sound: IMPACT_SOUND } if *entity == on)
+                matches!(s, SpellKitSound::Play { entity, kit_sound: IMPACT_SOUND, .. } if *entity == on)
             })
             .count()
     };
@@ -4438,7 +4630,7 @@ fn a_held_ground_targeting_kit_plants_at_its_point_on_the_casters_reach() {
         app.world_mut()
             .resource_mut::<Messages<crate::entities::dest_fx::GroundBurst>>()
             .drain()
-            .map(|b| (b.path, b.pos, b.held_by))
+            .map(|b| (b.path, b.pos, b.held_by.map(|(e, _)| e)))
             .collect()
     };
     let rang_at = |app: &mut App| -> Vec<Vec3> {
@@ -4495,7 +4687,8 @@ fn a_beam_spells_flag_1_state_kit_arms_when_the_beam_reaches_its_unit() {
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
         .add_message::<SpellKitSound>()
-        .add_message::<super::BaseAnimRecompute>();
+        .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>();
     app.init_resource::<super::BeamKitWaits>();
     let state_only = VisualStages {
         state: STATE_KIT,
@@ -4694,7 +4887,9 @@ fn a_beam_spells_precast_channel_and_area_kits_wait_for_the_beam() {
             .resource_mut::<Messages<SpellKitSound>>()
             .drain()
             .filter_map(|s| match s {
-                SpellKitSound::Play { entity, kit_sound } => Some((entity, kit_sound)),
+                SpellKitSound::Play {
+                    entity, kit_sound, ..
+                } => Some((entity, kit_sound)),
                 _ => None,
             })
             .collect()
@@ -5016,7 +5211,8 @@ fn a_state_kits_anim_rides_the_effect_list_while_its_aura_holds() {
         .add_message::<crate::aura_visual::BodyProcPlay>()
         .add_message::<SheathRequest>()
         .add_message::<SpellKitSound>()
-        .add_message::<super::BaseAnimRecompute>();
+        .add_message::<super::BaseAnimRecompute>()
+        .add_message::<super::BaseRearm>();
     app.insert_resource(SpellVisuals(SpellVisualCatalog::from_tables(
         HashMap::from([(
             VISUAL,

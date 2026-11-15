@@ -105,7 +105,7 @@ fn go_aimed(
     app.world_mut().write_message(CastEvent {
         entity: caster,
         spell_id: SPELL,
-        kind: CastEventKind::Go,
+        kind: CastEventKind::Go { ends_cast: true },
         cast_count: 1,
         seq: 1,
     });
@@ -164,7 +164,9 @@ fn played_on(sounds: &[SpellKitSound], who: Entity) -> Vec<u32> {
     sounds
         .iter()
         .filter_map(|s| match *s {
-            SpellKitSound::Play { entity, kit_sound } if entity == who => Some(kit_sound - SOUND),
+            SpellKitSound::Play {
+                entity, kit_sound, ..
+            } if entity == who => Some(kit_sound - SOUND),
             _ => None,
         })
         .collect()

@@ -98,13 +98,7 @@ fn owned<R>(lua: &Lua, i: usize, f: impl FnOnce() -> R) -> R {
 fn with_owner<R>(lua: &Lua, name: &str, f: impl FnOnce() -> R) -> R {
     let (tag, outer) = {
         let mut model = crate::script::model_mut_of(lua);
-        let owners = &mut model.addon_owners;
-        let at = owners.iter().position(|n| n.eq_ignore_ascii_case(name));
-        let at = at.unwrap_or_else(|| {
-            owners.push(name.to_string());
-            owners.len() - 1
-        });
-        let tag = (at + 1).min(GC_OWNERS - 1) as u8;
+        let tag = super::taint::tag_of(&mut model, name);
         (tag, std::mem::replace(&mut model.addon_owner, tag))
     };
     // SAFETY: a plain store to the thread's owner cells.
@@ -810,7 +804,7 @@ fn log_error(lua: &Lua, host: &str, bare: &str) {
 
 /// The glue's AddOn verbs (table `0xac3e00`) over the same registry the in-game ones read: the
 /// array the server's `SMSG_ADDON_INFO` builds, keyed by its 1-based index. The per-character
-/// enable verbs are not built yet.
+/// enable verbs are [`super::glue_addons`]'s.
 pub(super) fn install_glue(lua: &Lua) -> mlua::Result<()> {
     let g = lua.globals();
 

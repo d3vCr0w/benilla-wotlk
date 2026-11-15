@@ -447,11 +447,17 @@ pub(crate) enum CastEventKind {
     /// A cast sent with visuals took the free cast state: its precast starts at the press, ahead
     /// of the server's start (`0x80b573`).
     Sent,
-    /// `SMSG_SPELL_GO`: reaps the precast, plays the cast kit.
-    Go,
+    /// `SMSG_SPELL_GO`: reaps the precast, plays the cast kit; `ends_cast` when it ended the
+    /// unit's cast state (`0x7fed81`).
+    Go { ends_cast: bool },
     /// Died without release, through the end-cast (`0x7fecc0`) with the reason byte as sent;
-    /// `interrupt` when `SMSG_SPELL_FAILURE` names the unit's running cast (`0x72ed80`).
-    Fail { interrupt: bool, wire_reason: u8 },
+    /// `interrupt` when `SMSG_SPELL_FAILURE` names the unit's running cast (`0x72ed80`), `ends_cast`
+    /// when it ended the unit's cast state (`0x7fed81`).
+    Fail {
+        interrupt: bool,
+        wire_reason: u8,
+        ends_cast: bool,
+    },
     /// A missile landed: `on_caster` picks the kit (`0x800d00`), `at` is its point (`0x702e5a`);
     /// `caster` is the guid both of its kit plays carry (`0x702f5f`).
     Impact {
@@ -620,6 +626,15 @@ pub(crate) struct BaseAnimRecompute {
     pub(crate) anim_id: u16,
     /// The kit play's flags, which a dead or dying id is played with (`0x73b33e`).
     pub(crate) play: AnimPlayFlags,
+}
+
+/// A cast's end re-picks the caster's base when its precast kit names a start or an anim
+/// (`0x7fec7a`), so the cast kit's anim after it arms from time 0 even when it is the one playing.
+#[derive(Message, Clone, Copy)]
+pub(crate) struct BaseRearm {
+    pub(crate) entity: Entity,
+    /// `PlaySeq` stamp, the cast edge's: the cast kit's anim carries the same and comes after.
+    pub(crate) seq: u64,
 }
 
 /// A live kit effect's `AnimID` and the play flags its own kit flags give (`0x73e79d`).
@@ -850,8 +865,8 @@ use env_damage::{hard_landing_dust, load_env_damage_table};
 pub(crate) use env_damage::{EnvDamageTable, HardLanding, HARD_LANDING_DESCENT};
 pub(crate) use spell_visual::area_kit_models;
 use spell_visual::{
-    arm_aura_state_fx, arm_go_loot_fx, arm_level_up_fx, arm_loot_fx, arm_morph_latch,
-    arm_mount_poof_fx, load_spell_visuals, play_delayed_area_kits, play_dest_loc_casts,
+    arm_aura_state_fx, arm_go_loot_fx, arm_loot_fx, arm_morph_latch, arm_mount_poof_fx,
+    arm_unit_edge_fx, load_spell_visuals, play_delayed_area_kits, play_dest_loc_casts,
     play_state_done_kits, replay_morph_kit, route_cast_visuals, track_violence_level, MorphLatch,
     StateDoneKit,
 };
@@ -860,8 +875,9 @@ use spell_visual::{
 pub(crate) use spell_visual::arm_aura_state_fx as arm_aura_state_fx_for_test;
 pub(crate) use spell_visual::{
     end_cast_clears_hold, held_strike_sound, BeamKitWaits, ChainProcPlay, ChannelSpellLeft,
-    FxClass, FxStage, KitEffectClear, KitPush, MissileRelease, MissileSpawn, ReleaseKind,
-    SpellEffectClear, SpellKitFx, SpellKitShake, SpellKitSound, SpellVisuals, UnitKitLanes,
+    EffectListClear, FxClass, FxStage, KitEffectClear, KitPush, MissileRelease, MissileSpawn,
+    ReleaseKind, SpellEffectClear, SpellKitFx, SpellKitShake, SpellKitSound, SpellVisuals,
+    UnitEffectClear, UnitKitLanes,
 };
 
 /// The unit's own variation stream ([`benilla_assets::AnimRng::stream`]), cut on its first frame
@@ -1189,6 +1205,7 @@ impl Plugin for CreatureAnimPlugin {
             .add_message::<EmoteAnim>()
             .add_message::<QueueNpcEmotes>()
             .add_message::<BaseAnimRecompute>()
+            .add_message::<BaseRearm>()
             .add_message::<MountFlourish>()
             .add_message::<WoundAnim>()
             .add_message::<SheathSwapMessage>()
@@ -1207,6 +1224,7 @@ impl Plugin for CreatureAnimPlugin {
             .add_message::<ChannelSpellLeft>()
             .add_message::<SpellEffectClear>()
             .add_message::<KitEffectClear>()
+            .add_message::<UnitEffectClear>()
             .add_message::<KitPush>()
             // The aura CharProc edges, drained by `crate::aura_visual`.
             .add_message::<crate::aura_visual::AuraProc>()
@@ -1226,8 +1244,7 @@ impl Plugin for CreatureAnimPlugin {
                 )
                     .after(AssetSet::Open),
             )
-            // Ahead of the frame's kit resolves; a `violenceLevel` change applies next frame.
-            .add_systems(First, track_violence_level)
+            .add_observer(track_violence_level)
             .add_systems(
                 Update,
                 (
@@ -1238,7 +1255,7 @@ impl Plugin for CreatureAnimPlugin {
                         // After the stream stage, whose collider finish is an exclusive system.
                         play_dest_loc_casts.after(WorldStage::Stream),
                         play_delayed_area_kits,
-                        arm_level_up_fx,
+                        arm_unit_edge_fx,
                         arm_mount_poof_fx,
                     )
                         .chain(),

@@ -177,20 +177,15 @@ fn icon_and_link(
     commands: &NetCommands,
 ) -> (Option<String>, Option<String>) {
     let template = items.template(entry, 0, commands);
-    let texture = template.and_then(|t| {
-        icons
-            .and_then(|i| i.catalog.get(t.display_info_id))
-            .and_then(|d| d.icon.clone())
-    });
+    let texture = template.and_then(|t| crate::ui_items::item_icon(icons, t.display_info_id));
     (
         texture,
         template.map(|t| item_link(entry, &t.name, t.quality)),
     )
 }
 
-/// A row's `ItemExtendedCost.dbc` record, its required items resolved. A personal-rating demand
-/// passes only through the personal-and-team rating check (`0x5a37b0`), which needs a team in the
-/// bracket; arena teams are not built, so it fails as for a player in none.
+/// A row's `ItemExtendedCost.dbc` record, its required items resolved; the VM tests its rating
+/// demand against the arena teams it holds.
 fn resolve_extended_cost(
     id: u32,
     costs: Option<&ExtendedCosts>,
@@ -217,7 +212,8 @@ fn resolve_extended_cost(
         honor: row.honor,
         arena: row.arena,
         items,
-        rating_met: row.personal_rating == 0,
+        required_rating: row.personal_rating,
+        arena_bracket: row.arena_slot as i32,
     })
 }
 
@@ -245,9 +241,7 @@ fn resolve_item(
         block: t.block,
         sell_price: t.sell_price,
     });
-    let texture = icons
-        .and_then(|i| i.catalog.get(item.display_id))
-        .and_then(|d| d.icon.clone());
+    let texture = crate::ui_items::item_icon(icons, item.display_id);
     let num_available = if item.current_count == STOCK_UNLIMITED {
         -1
     } else {
@@ -314,9 +308,7 @@ fn resolve_buyback(
         sell_price: t.sell_price,
     });
     let display_id = template.map(|t| t.display_info_id).unwrap_or(0);
-    let texture = icons
-        .and_then(|i| i.catalog.get(display_id))
-        .and_then(|d| d.icon.clone());
+    let texture = crate::ui_items::item_icon(icons, display_id);
     MerchantItem {
         name,
         texture,
@@ -1575,7 +1567,7 @@ mod tests {
     }
 
     /// A row's extended cost resolves from `ItemExtendedCost.dbc`: points, the non-zero items in
-    /// record order, and a personal-rating demand that fails with no arena team.
+    /// record order, and the rating demand with its bracket.
     #[test]
     fn an_extended_cost_row_resolves_its_record() {
         use benilla_formats::{ExtendedCostRow, ItemExtendedCosts};
@@ -1595,6 +1587,7 @@ mod tests {
                 2277,
                 ExtendedCostRow {
                     arena: 150,
+                    arena_slot: 1,
                     personal_rating: 1800,
                     ..Default::default()
                 },
@@ -1608,11 +1601,12 @@ mod tests {
         assert_eq!((cost.honor, cost.arena), (7000, 0));
         assert_eq!(cost.items.len(), 1);
         assert_eq!((cost.items[0].item_id, cost.items[0].count), (20560, 3));
-        assert!(cost.rating_met);
+        assert_eq!(cost.required_rating, 0);
 
         token.extended_cost = 2277;
         let rated = resolve_item(&token, &items, None, Some(&costs), &commands);
-        assert!(!rated.extended_cost.expect("the record").rating_met);
+        let rated = rated.extended_cost.expect("the record");
+        assert_eq!((rated.required_rating, rated.arena_bracket), (1800, 1));
 
         token.extended_cost = 9;
         assert_eq!(

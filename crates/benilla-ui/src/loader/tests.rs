@@ -866,7 +866,7 @@ mod loader_tests {
         assert!(s.eval::<bool>("return FineRan == true").unwrap());
     }
 
-    /// `OnAttributeChanged` is 2.0's; no 1.12 handler resolver has a slot for it.
+    /// A script element the widget type lacks is a load warning, not an error.
     #[test]
     fn unsupported_script_name_is_a_warning() {
         let s = UiScript::new().unwrap();
@@ -1332,7 +1332,7 @@ mod loader_tests {
         s.set_screen_size(800.0, 600.0);
         let doc = parse(
             r#"<Ui>
-                <EditBox name="XmlEdit" letters="5" numeric="true">
+                <EditBox name="XmlEdit" letters="5" numeric="true" countInvisibleLetters="true">
                     <Size><AbsDimension x="120" y="20"/></Size>
                     <Anchors>
                         <Anchor point="BOTTOMLEFT" relativePoint="BOTTOMLEFT">
@@ -1349,6 +1349,11 @@ mod loader_tests {
         assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
 
         assert_eq!(s.eval::<i64>("return XmlEdit:GetNumLetters()").unwrap(), 0);
+        assert_eq!(
+            s.eval::<i64>("return XmlEdit:IsCountInvisibleLetters()")
+                .unwrap(),
+            1
+        );
         s.run(r#"XmlEdit:Insert("12x")"#).unwrap(); // numeric: aborts
         s.run(r#"XmlEdit:Insert("123456")"#).unwrap(); // digits, capped at 5
         assert_eq!(
