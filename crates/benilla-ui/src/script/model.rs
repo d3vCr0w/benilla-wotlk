@@ -367,6 +367,8 @@ pub(crate) struct Model {
     pub(crate) petition_requests: Vec<petition::PetitionRequest>,
     /// The arena registrar's petition vendor, as pushed.
     pub(crate) petition_vendor: petition::PetitionVendorState,
+    /// The charter the petition vendor's button holds (`0xc0f7d8`), engine-side like the cursor.
+    pub(crate) petition_button: Option<petition::PetitionButtonItem>,
     /// Per chat window from `ChatFrame1`, the tint, alpha and font size its tab menu can change.
     /// One per frame the target's FrameXML builds (`NUM_CHAT_WINDOWS`).
     pub(crate) chat_window_looks: Vec<chat_window::ChatWindowLook>,
@@ -739,9 +741,6 @@ pub(crate) struct Model {
     pub(crate) pet_autocast_toggles: Vec<u32>,
     /// `PetStopAttack()` calls.
     pub(crate) pet_stop_attacks: u32,
-    /// `HasFullControl`, the reference's control flag: set by `SMSG_CLIENT_CONTROL_UPDATE` for the
-    /// player, boots 1, and every cast, item and cursor gate refuses at 0.
-    pub(crate) player_control: bool,
     /// One `CMSG_PET_SET_ACTION` per entry, its one or two `(position, packed word)` pairs: the
     /// server tells the forms apart by body size, so a move's two pairs must not be flattened.
     pub(crate) pet_set_actions: Vec<Vec<(u32, u32)>>,
@@ -857,11 +856,10 @@ pub(crate) struct Model {
     /// Skill-line ids `SetTrainerSkillLineFilter` turned off, reset per list.
     pub(crate) trainer_lines_off: HashSet<u32>,
 
-    /// The open taxi map, the `TakeTaxiNode` calls, whether `CloseTaxiMap` ran and whether we ride.
+    /// The open taxi map, the `TakeTaxiNode` calls and whether `CloseTaxiMap` ran.
     pub(crate) taxi: Option<taxi::TaxiUiState>,
     pub(crate) taxi_takes: Vec<usize>,
     pub(crate) taxi_close: bool,
-    pub(crate) taxi_riding: bool,
 
     /// The open tradeskill window, its filters and repeat.
     pub(crate) trade_skill: tradeskill::TradeSkillModel,
@@ -1492,6 +1490,7 @@ impl Model {
             petition: petition::PetitionState::default(),
             petition_requests: Vec::new(),
             petition_vendor: Default::default(),
+            petition_button: None,
             // Per window, as the stock dock differs: 1 and 2 are the dock, the rest undocked.
             chat_window_looks: (0..chat_window::ENGINE_CHAT_WINDOW_SLOTS)
                 .map(chat_window::ChatWindowLook::stock)
@@ -1667,7 +1666,6 @@ impl Model {
             pet_bar: super::pet::PetBarState::default(),
             pet_autocast_toggles: Vec::new(),
             pet_stop_attacks: 0,
-            player_control: true,
             pet_set_actions: Vec::new(),
             pet_abandons: 0,
             pet_dismisses: 0,
@@ -1725,7 +1723,6 @@ impl Model {
             taxi: None,
             taxi_takes: Vec::new(),
             taxi_close: false,
-            taxi_riding: false,
             trade_skill: Default::default(),
             lfg: Default::default(),
             calendar: Default::default(),

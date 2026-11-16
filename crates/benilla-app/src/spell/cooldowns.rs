@@ -1940,7 +1940,7 @@ mod tests {
         let t0 = Instant::now();
         let mut cds = Cooldowns::default();
         let display = spell(35, 25_000, 0, (133, 1500), 0);
-        cds.start_gcd(122, &display, t0, &super::SpellModifiers::default());
+        cds.start_gcd(122, &display, t0, &super::SpellModifiers::default(), 1.0);
         cds.start_spell(122, &display, 0, t0, None);
 
         cds.clear_spell_recovery(122);
@@ -1962,7 +1962,7 @@ mod tests {
         );
 
         let later = t0 + Duration::from_millis(300);
-        cds.start_gcd(122, &display, later, &super::SpellModifiers::default());
+        cds.start_gcd(122, &display, later, &super::SpellModifiers::default(), 1.0);
         assert!(
             cds.not_ready(133, 0, Some(&fireball()), later),
             "a newly armed GCD still blocks until its own server clear"

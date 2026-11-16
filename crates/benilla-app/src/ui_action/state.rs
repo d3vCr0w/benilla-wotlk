@@ -27,7 +27,7 @@ use crate::spell::AutoRepeatActive;
 
 /// The feed's memory: what was last pushed, and the edge detectors.
 #[derive(Default)]
-pub(super) struct StateMemory {
+pub(crate) struct StateMemory {
     pushed: HashMap<u32, ActionState>,
     last_generation: Option<u64>,
     auto_repeat: Option<u32>,
@@ -40,7 +40,7 @@ pub(super) struct StateMemory {
 /// Shared between the normal feed and the post-input cooldown pass.  Keeping one VM memo means
 /// the second pass updates the same snapshot instead of emitting a second, contradictory edge.
 #[derive(Resource, Default)]
-pub(super) struct StateMemoryStore(pub(crate) crate::ui_script::VmMemo<StateMemory>);
+pub(crate) struct StateMemoryStore(pub(crate) crate::ui_script::VmMemo<StateMemory>);
 
 /// `AttributesExD & 0x200`: a reactive spell, whose turn to usable floats its name
 /// (`0x54228c`).
@@ -148,8 +148,8 @@ fn pet_slot<'a>(
 
 /// Computes and diff-pushes every occupied slot's state, and fires the reference's events.
 #[allow(clippy::type_complexity)] // a Bevy system's full input set
-pub(super) fn feed_action_state(
-    script: Option<NonSendMut<UiScript>>,
+pub(crate) fn feed_action_state(
+    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
     actions: Res<PlayerActions>,
     spells: Option<Res<Spells>>,
     mut cooldowns: ResMut<Cooldowns>,
@@ -649,7 +649,7 @@ pub(super) fn feed_action_state(
 /// `PLAYER_ENTER_COMBAT` and `PLAYER_LEAVE_COMBAT`, one per attack start and stop of ours, in
 /// packet order: a new victim enters again, a stop and a start in one frame leave then enter.
 pub(super) fn fire_combat_edges(
-    script: Option<NonSendMut<UiScript>>,
+    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
     edges: Option<ResMut<crate::creature_anim::PlayerCombatEdges>>,
 ) {
     let (Some(mut script), Some(mut edges)) = (script, edges) else {

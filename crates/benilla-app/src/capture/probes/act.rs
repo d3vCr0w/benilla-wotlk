@@ -45,7 +45,10 @@ struct ProbeChat {
 fn fire_probe_chat(
     mut probe: ResMut<ProbeChat>,
     time: ProbeClock,
-    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    (script, _live): (
+        Option<NonSendMut<benilla_ui::script::UiScript>>,
+        crate::ui_script::LendLive,
+    ),
     self_player: Query<(), With<crate::net::SelfPlayer>>,
 ) {
     if probe.lines.is_empty() {
@@ -219,12 +222,14 @@ fn fire_probe_key(
     mut buttons: ResMut<ButtonInput<MouseButton>>,
     mut events: MessageWriter<bevy::input::keyboard::KeyboardInput>,
     mut hold: ResMut<benilla_world::modkeys::SyntheticHold>,
+    frames: Res<bevy::diagnostic::FrameCount>,
 ) {
     probe.armed |= !self_player.is_empty();
     if probe.taps.is_empty() || !probe.armed {
         return;
     }
     let now = time.elapsed_secs();
+    let frame = frames.0;
     let mut synth = |key: KeyCode, state: bevy::input::ButtonState| {
         events.write(bevy::input::keyboard::KeyboardInput {
             key_code: key,
@@ -240,7 +245,7 @@ fn fire_probe_key(
     for tap in &mut probe.taps {
         if !tap.pressed && now >= tap.at {
             info!(
-                "probe-key: {:?} down ({now:.1}s, hold {:.2}s)",
+                "probe-key: {:?} down ({now:.1}s, hold {:.2}s, frame {frame})",
                 tap.key, tap.hold
             );
             match tap.key {
@@ -302,8 +307,17 @@ impl Plugin for ProbeLuaPlugin {
             again,
             ..default()
         })
+        .add_systems(First, stamp_probe_frame)
         .add_systems(Update, (fire_probe_lua, fire_probe_interacts));
     }
+}
+
+/// The frame number `ProbeFrame()` answers, the one `probe-key` lines carry.
+static PROBE_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Stamp this frame's number before any schedule that runs Lua.
+fn stamp_probe_frame(frames: Res<bevy::diagnostic::FrameCount>) {
+    PROBE_FRAME.store(frames.0, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// `ProbeInteract()` calls not yet run, each a right-click on the target.
@@ -480,6 +494,17 @@ fn install_probe_log(script: &benilla_ui::script::UiScript) {
         }
         Err(e) => error!("probe-lua: creating ProbeClick: {e}"),
     }
+    match script
+        .lua()
+        .create_function(|_, ()| Ok(PROBE_FRAME.load(std::sync::atomic::Ordering::Relaxed)))
+    {
+        Ok(f) => {
+            if let Err(e) = script.lua().globals().set("ProbeFrame", f) {
+                error!("probe-lua: installing ProbeFrame: {e}");
+            }
+        }
+        Err(e) => error!("probe-lua: creating ProbeFrame: {e}"),
+    }
     match script.lua().create_function(|_, text: String| {
         info!("probe-log: {text}");
         Ok(())
@@ -497,7 +522,10 @@ fn install_probe_log(script: &benilla_ui::script::UiScript) {
 fn fire_probe_lua(
     mut probe: ResMut<ProbeLua>,
     time: ProbeClock,
-    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    (script, _live): (
+        Option<NonSendMut<benilla_ui::script::UiScript>>,
+        crate::ui_script::LendLive,
+    ),
     self_player: Query<(), With<crate::net::SelfPlayer>>,
     state: Res<State<crate::char_select::ClientState>>,
     entry_ui_pending: Option<Res<crate::ui_script::PendingEntryUiLoad>>,
@@ -651,7 +679,10 @@ fn glue_chunk_failure(e: &dyn std::fmt::Display) -> String {
 fn fire_probe_glue_lua(
     mut probe: ResMut<ProbeGlueLua>,
     time: ProbeClock,
-    script: Option<NonSend<benilla_ui::script::UiScript>>,
+    (script, _live): (
+        Option<NonSend<benilla_ui::script::UiScript>>,
+        crate::ui_script::LendLive,
+    ),
     mut commands: Commands,
 ) {
     let now = time.elapsed_secs();
@@ -757,7 +788,10 @@ fn fire_probe_hover(
     mut probe: ResMut<ProbeHover>,
     mut synthetic: ResMut<crate::ui_script::SyntheticPointer>,
     time: ProbeClock,
-    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    (script, _live): (
+        Option<NonSendMut<benilla_ui::script::UiScript>>,
+        crate::ui_script::LendLive,
+    ),
     self_player: Query<(), With<crate::net::SelfPlayer>>,
 ) {
     if probe.names.is_empty() {
@@ -893,7 +927,10 @@ fn fire_probe_drag(
     mut probe: ResMut<ProbeDrag>,
     mut synthetic: ResMut<crate::ui_script::SyntheticPointer>,
     time: ProbeClock,
-    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    (script, _live): (
+        Option<NonSendMut<benilla_ui::script::UiScript>>,
+        crate::ui_script::LendLive,
+    ),
     self_player: Query<(), With<crate::net::SelfPlayer>>,
 ) {
     if probe.pairs.is_empty() || probe.pair >= probe.pairs.len() {

@@ -108,6 +108,7 @@ impl Plugin for NetPlugin {
             .init_resource::<PlayedTimeAnswer>()
             .init_resource::<PlayedClock>()
             .init_resource::<Proficiencies>()
+            .init_resource::<ControlFlag>()
             .init_resource::<crate::names::NameCache>()
             .init_resource::<crate::go_templates::GameObjectTemplates>()
             .init_resource::<crate::items::Items>()
@@ -271,8 +272,8 @@ pub(crate) fn current_speed(s: &MoveSpeeds, flags: u32) -> f32 {
 pub(crate) struct ObjectStore(pub(crate) ObjectFields);
 
 impl ObjectStore {
-    /// The object manager's unit lookup (`ecx = 8`): a unit or a player, which share the unit
-    /// block; a game object, corpse or item is not one.
+    /// The verbs' unit lookup (`0x60c1f0`), type mask 8 (`0x60c21e`): a unit or a player, which
+    /// share the unit block; a game object, corpse or item is not one.
     pub(crate) fn is_unit(&self) -> bool {
         use benilla_protocol::messages::ObjectType;
         matches!(
@@ -409,7 +410,7 @@ pub(crate) struct ActiveMover;
 
 /// The inbound event channel, drained each frame by [`apply_net_updates`].
 #[derive(Resource)]
-pub(crate) struct NetEvents(Receiver<SessionEvent>);
+pub(crate) struct NetEvents(pub(crate) Receiver<SessionEvent>);
 
 /// The outbound command channel.
 #[derive(Resource)]
@@ -1187,6 +1188,8 @@ pub(crate) enum ClientCommand {
         counter: u32,
         client_ms: u32,
     },
+    /// `CMSG_WARDEN_DATA`: every Warden reply the world read queued, sealed in order.
+    WardenReplies,
     /// `CMSG_SET_ACTIVE_MOVER`: at our own player's create and on possession; the server drops
     /// `MSG_MOVE_*` for an unconfirmed mover.
     SetActiveMover {
@@ -2482,7 +2485,7 @@ pub(crate) enum ClientCommand {
     ChatIgnored {
         guid: u64,
     },
-    /// `CMSG_WHO`, parsed into wire fields by `ui_social::who_query`.
+    /// `CMSG_WHO`, the `/who` filter parsed into wire fields as `SendWho` builds them.
     Who {
         request: Box<WhoRequest>,
     },
@@ -2848,6 +2851,17 @@ pub(crate) struct SelfMoveMessage {
 pub(crate) struct SelfCreateMover {
     pub(crate) flags: u32,
     pub(crate) pitch: f32,
+}
+
+/// The UI's control flag (`0xbcfb8c`) the verbs read: set at a game start (`0x52b8a0`) and by our
+/// own create (`0x513880`), written by the control update for our own unit (`0x520fe0`).
+#[derive(Resource, Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ControlFlag(pub(crate) bool);
+
+impl Default for ControlFlag {
+    fn default() -> Self {
+        Self(true)
+    }
 }
 
 /// `SMSG_CLIENT_CONTROL_UPDATE`, verbatim; the controller decides. `mover` is the unit spoken

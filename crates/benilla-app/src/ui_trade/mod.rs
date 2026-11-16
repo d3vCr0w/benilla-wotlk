@@ -402,8 +402,11 @@ impl Plugin for UiTradePlugin {
                     // the input pass, with the drain after it, so each lands the same frame. No
                     // range guard: vmangos cancels a trade on distance (`Player.cpp:6117`).
                     feed_trade.after(crate::ui_unit::UnitFeed).in_set(UiFeed),
-                    // Ahead of the feed, so an accepted partner shows the frame the window opens.
-                    answer_trade_request.before(feed_trade),
+                    // Ahead of the press and the feed, so an accepted partner shows the frame the
+                    // window opens.
+                    answer_trade_request
+                        .before(crate::ui_script::UiPress)
+                        .before(feed_trade),
                     // The coinage-change reflex's trade half, after the world's fields land.
                     trim_offer_to_purse
                         .after(crate::ui_unit::UnitFeed)
@@ -628,7 +631,7 @@ fn snapshot(
 /// Push the trade into the VM and fire its events on a change, diffed against `Local` memory;
 /// `TRADE_ACCEPT_UPDATE` fires after `TRADE_SHOW`, whose handler hides the highlights.
 fn feed_trade(
-    script: Option<NonSendMut<UiScript>>,
+    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
     mut trade: ResMut<TradeSession>,
     items: Res<Items>,
     icons: Option<Res<ItemDisplays>>,
@@ -757,7 +760,7 @@ fn feed_trade(
 /// Drain the Lua intents into the trade `CMSG`s. `CloseTrade` clears the session, sending
 /// `CMSG_CANCEL_TRADE` only while one is live.
 fn drain_trade(
-    script: Option<NonSendMut<UiScript>>,
+    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
     mut trade: ResMut<TradeSession>,
     commands: Res<NetCommands>,
     selection: Res<Selection>,

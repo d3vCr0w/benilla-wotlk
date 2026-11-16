@@ -18,8 +18,6 @@ This project does not distribute Blizzard's original client code or game assets.
 > The 3.3.5a port is in progress. The client can authenticate, enter the world, and run the stock
 > 3.3.5a interface, but parts of the data and gameplay layers still use 1.12.1 layouts or behavior.
 
-Other client versions are not planned. Warden will come later. Use a 3.3.5a server with
-Warden disabled for now.
 
 ## Highlights
 
@@ -44,9 +42,8 @@ subsystems, instruments, and scripts.
 
 ## Requirements
 
-- An English World of Warcraft 3.3.5a client installation (build 12340). Benilla reads it but never
-  writes to it.
-- A 3.3.5a server with Warden disabled. Development uses
+- An English World of Warcraft 3.3.5a client installation (build 12340).
+- A 3.3.5a server. Development uses
   [AzerothCore](https://github.com/azerothcore/azerothcore-wotlk).
 - Stable Rust and a C compiler because the vendored Lua runtime is built from source.
   - Windows: the MSVC build tools selected by the Rust installer.
@@ -55,15 +52,15 @@ subsystems, instruments, and scripts.
 
 ## Quick start
 
-Clone the repository, point `WOW_DATA` at the `Data` directory of your 3.3.5a installation, and
-run `cargo play`. It builds the player binary and starts it; the first build takes a while.
+Clone the repository, point `WOW_INSTALL` at your 3.3.5a installation and run `cargo play`. It builds the player binary and starts it; the first build
+takes a while.
 
 ### Windows PowerShell
 
 ```powershell
 git clone https://github.com/Onixaz/benilla-wotlk.git
 Set-Location benilla-wotlk
-$env:WOW_DATA = "C:\Games\World of Warcraft 3.3.5a\Data"
+$env:WOW_INSTALL = "C:\Games\World of Warcraft 3.3.5a"
 cargo play
 ```
 
@@ -72,7 +69,7 @@ cargo play
 ```sh
 git clone https://github.com/Onixaz/benilla-wotlk.git
 cd benilla-wotlk
-WOW_DATA=/path/to/WoW/Data cargo play
+WOW_INSTALL=/path/to/WoW cargo play
 ```
 
 ### Faster with a profile
@@ -95,7 +92,7 @@ with a profile. Record a new one after a Rust toolchain update. See
 [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md).
 
 For the last few percent, set `BENILLA_PGO_LTO=fat` for both commands. They then use fat link-time
-optimization (LTO), with a profile of its own, which measures 3–7% less frame time than the
+optimization (LTO), with a profile of its own, which measures 3–7% more FPS than the
 default thin LTO at Acherus. Each build takes about three times as long, about an hour of building
 for the first run. In PowerShell, set `$env:BENILLA_PGO_LTO = "fat"` first.
 
@@ -115,7 +112,7 @@ not the one to play on. It also finds a `WoW` link at the repository root. See
 
 | Setting | Purpose |
 | --- | --- |
-| `WOW_DATA` | Path to the installation's `Data` directory. |
+| `WOW_INSTALL` | Path to the installation, the folder `Wow.exe` and `Data` sit in. The game data is read from its `Data`, and a server running Warden has its memory checks answered from its `Wow.exe`. |
 | `WOW_HOST` | Authentication endpoint; defaults to `localhost:3724`. A hostname or `host:port` is accepted. |
 | `WOW_USER` and `WOW_PASS` | Optional credentials for automatic login. Set both or use the login screen. |
 | `WOW_CHAR` | Optional character name for automatic selection. |
@@ -139,8 +136,6 @@ Issues and pull requests are welcome. Bugs, questions, and ideas can also be dis
 [Discord](https://discord.gg/wJSJx467G4).
 
 ## Acknowledgements and legal
-
-The project builds upon the original [Benilla](https://github.com/samwhosung/benilla) client and acknowledges the work of its original author and contributors.
 
 Benilla-Wotlk is an independent fan project and is not affiliated with or endorsed by Blizzard
 Entertainment. It ships no assets extracted from World of Warcraft: no models, sounds, maps, MPQ

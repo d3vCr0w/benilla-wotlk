@@ -75,7 +75,8 @@ pub(crate) use price_discount::vendor_price_discount;
 pub(crate) use price_discount::{stormwind_fixture, HUMAN_WARRIOR};
 pub(crate) use relations::{
     can_assist, can_assist_dir, can_attack, can_interact, corpse_friendly, highlight_variant,
-    is_possessed_by, selection_color, Assist, UNIT_FLAG_POSSESSED,
+    is_friendly, is_possessed_by, selection_color, selection_color_unheld, Assist,
+    UNIT_FLAG_POSSESSED,
 };
 // The attack validator's target half, run in the call that asks, for the player's Attack and the
 // pet bar's; the melee probe's press with nothing selected.
@@ -447,15 +448,6 @@ impl Plugin for TargetPlugin {
                         .chain(),
                     // The loot close's guid-scoped deselect.
                     click::clear_target_requests,
-                    // The script calls that touch the selection, the cast or the targeting cursor
-                    // (`TargetUnit`, `/target`, `ClearTarget`, `/cast`, `UseAction`, …), applied
-                    // in the order the script made them; then the two item legs.
-                    (
-                        crate::script_calls::apply_script_calls,
-                        crate::ui_action::drop_item::drop_item_on_unit,
-                        crate::ui_action::drop_item::drop_on_world_click,
-                    )
-                        .chain(),
                     // The chat layer's by-name asks: `/target` and `/assist` commit through
                     // `scan::commit`; `/follow` hands its subject to `crate::player`.
                     (
@@ -482,6 +474,21 @@ impl Plugin for TargetPlugin {
                     .chain()
                     .in_set(TargetUpdate)
                     .after(WorldStage::Input),
+            )
+            // The script calls that touch the selection, the cast or the targeting cursor
+            // (`TargetUnit`, `/target`, `ClearTarget`, `/cast`, `UseAction`, …), applied in the
+            // order the script made them, then the two item legs: in the press pass after the
+            // clicks and keys that made them, so the frame's feed publishes what they arm.
+            .add_systems(
+                Update,
+                (
+                    crate::script_calls::apply_script_calls,
+                    crate::ui_action::drop_item::drop_item_on_unit,
+                    crate::ui_action::drop_item::drop_on_world_click,
+                )
+                    .chain()
+                    .in_set(crate::ui_script::UiPress)
+                    .after(crate::bindings::BindingSet),
             )
             // PostUpdate: the brighten sets MeshTag bit 31 after every Update writer that
             // overwrites the whole tag.

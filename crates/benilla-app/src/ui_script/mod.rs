@@ -21,6 +21,15 @@ pub(crate) mod glue;
 pub(crate) mod glue_mgr;
 pub(crate) mod glue_scene;
 mod input;
+pub(crate) mod live;
+pub(crate) use live::LendLive;
+#[cfg(test)]
+pub(crate) mod live_tests;
+// The press-frame tests run the input pass as a system of their own.
+#[cfg(test)]
+pub(crate) use input::feed_ui_input;
+#[cfg(test)]
+mod characterization_tests;
 #[cfg(test)]
 mod layer_tests;
 mod load_log;
@@ -107,7 +116,7 @@ pub(crate) struct UiCostWanted(pub(crate) bool);
 #[derive(Resource, Default)]
 pub(crate) struct PlayerUiHover(pub(crate) Option<u32>);
 
-/// Who owns this frame's keys (the client's key-owner gate), written in [`UiInput`] and
+/// Who owns this frame's keys (the client's key-owner gate), written in [`UiPress`] and
 /// read after it: a focused EditBox takes every key, a shown keyboard-enabled frame only the key it
 /// ate. Neither releases a held key: only the window deactivate and the world-enter cascade clear
 /// the direction bits, so W keeps running while you type.
@@ -236,10 +245,18 @@ pub(crate) struct UiPassState {
 #[derive(Resource, Default)]
 pub(crate) struct PointerOverUiPanel(pub(crate) bool);
 
-/// The player-UI feed phase, after [`WorldStage::Net`] and ungated (`UnitFeed` is the gated
-/// sub-phase): every push this frame's tick must see, as in the reference's frame, where packet
-/// dispatch precedes every script event signal and both precede `OnUpdate`. Every VM holder in
-/// `Update` is in this set or `.after(UiInput)`, as `game_plugins::schedule_tests` checks.
+/// The player-UI press pass, after [`WorldStage::Net`] and before [`UiFeed`]: the pointer and key
+/// feed (hit-testing the rects the last tick resolved, the ones on screen), the binding dispatch
+/// and the script calls they make, so a press is sent and its GCD published in its own frame. The
+/// reference handles input (`0x480410`) ahead of the paint, whose layer update (`0x495810` →
+/// `0x495320`) runs `OnUpdate` and the cooldown widgets.
+#[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct UiPress;
+
+/// The player-UI feed phase, after [`UiPress`] and ungated (`UnitFeed` is the gated sub-phase):
+/// every push this frame's tick must see, as in the reference's frame, where packet dispatch
+/// precedes every script event signal and both precede `OnUpdate`. Every VM holder in `Update` is
+/// in this set, in [`UiPress`] or `.after(UiInput)`, as `game_plugins::schedule_tests` checks.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiFeed;
 
@@ -247,8 +264,8 @@ pub(crate) struct UiFeed;
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiPaint;
 
-/// The player-UI input pass (tick, hit-test, handlers), before [`WorldStage::Input`] so its
-/// [`PlayerUiHover`] reaches `PointerOverUi` before `player::control` reads it.
+/// The VM's tick (`OnUpdate`, the layout, the cooldown widgets' update), before
+/// [`WorldStage::Input`]; what the press and the tick queued drains `.after` it.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiInput;
 
@@ -463,11 +480,13 @@ impl Plugin for UiScriptPlugin {
                 PreUpdate,
                 (run_pending_reload, lifecycle::run_pending_entry_load).chain(),
             )
-            // The three UI phases in order: feeds after the net drain, the tick, then the paint.
+            // The four UI phases in order after the net drain: the press, the feeds, the tick,
+            // then the paint.
             .configure_sets(
                 Update,
                 (
-                    UiFeed.after(WorldStage::Net),
+                    UiPress.after(WorldStage::Net),
+                    UiFeed,
                     UiInput.before(WorldStage::Input),
                     UiPaint,
                 )
@@ -475,18 +494,18 @@ impl Plugin for UiScriptPlugin {
             )
             // In the feed phase, so an `OnUpdate` reads this frame's `GetFramerate()`.
             .add_systems(Update, feed_framerate.in_set(UiFeed))
-            // The input pass hit-tests the rects the tick just resolved, and runs in-world only or
-            // on the stock glue screens.
+            // The press hit-tests the rects the last tick resolved, the ones on screen, in-world
+            // or on the stock glue screens.
             .init_resource::<UiPassState>()
             .init_resource::<PointerOverUiPanel>()
             .add_systems(
                 Update,
-                (extract::tick_script, input::feed_ui_input)
-                    .chain()
-                    .in_set(UiInput)
+                input::feed_ui_input
+                    .in_set(UiPress)
                     // So a key a focused box consumed never also fires a binding.
                     .before(crate::bindings::BindingSet),
             )
+            .add_systems(Update, extract::tick_script.in_set(UiInput))
             // After the plate driver seats this frame's nameplates, and before the append lane
             // fills the widget slot this pass parks.
             .add_systems(
@@ -554,7 +573,7 @@ pub(crate) use lifecycle::{
 /// `GetFramerate()`'s host half: FPS on `Time<Real>`, smoothed by a one-second pole; how the
 /// reference averages it is untraced.
 fn feed_framerate(
-    script: Option<NonSendMut<UiScript>>,
+    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
     time: Res<Time<bevy::time::Real>>,
     mut smoothed: Local<f64>,
 ) {
@@ -577,7 +596,10 @@ fn feed_framerate(
 }
 
 /// Synthetic player and target snapshots for a server-less UI capture, and its first events once.
-fn demo_unit_feed(script: Option<NonSendMut<UiScript>>, mut fired: Local<VmMemo<bool>>) {
+fn demo_unit_feed(
+    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut fired: Local<VmMemo<bool>>,
+) {
     /// The synthetic target's guid: a creature high part; only its distinctness matters.
     const DEMO_TARGET_GUID: u64 = 0xF130_0000_0000_0001;
 

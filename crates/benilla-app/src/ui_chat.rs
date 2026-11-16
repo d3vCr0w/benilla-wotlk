@@ -126,7 +126,7 @@ impl Plugin for UiChatPlugin {
             )
             // The last-input stamp, ungated and ahead of the UI pass: the reference stamps raw
             // input before dispatch, so a key the chat box swallows still counts.
-            .add_systems(Update, idle::stamp_input.before(UiInput))
+            .add_systems(Update, idle::stamp_input.before(crate::ui_script::UiPress))
             // A fresh VM's joined-channel mirror, before the feed so its first line is numbered.
             .add_systems(
                 Update,
@@ -191,7 +191,10 @@ impl Plugin for UiChatPlugin {
 /// Deviation: not run on benilla's same-character reconnect, which the reference lacks (it
 /// returns to the login screen), so the window keeps its scrollback there.
 fn end_session_chat(
-    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    (script, _live): (
+        Option<NonSendMut<benilla_ui::script::UiScript>>,
+        crate::ui_script::LendLive,
+    ),
     mut log: ResMut<ChatLog>,
 ) {
     end_chat_session(script.map(NonSendMut::into_inner), &mut log);

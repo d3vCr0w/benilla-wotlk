@@ -123,8 +123,8 @@ pub(crate) struct FeedMemory {
 #[derive(Resource, Default)]
 pub(crate) struct FeedMemoryStore(pub(crate) crate::ui_script::VmMemo<FeedMemory>);
 
-fn feed_spellbook(
-    script: Option<NonSendMut<UiScript>>,
+pub(crate) fn feed_spellbook(
+    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
     actions: Res<PlayerActions>,
     spells: Option<Res<Spells>>,
     skill_lines: Option<Res<SkillLines>>,

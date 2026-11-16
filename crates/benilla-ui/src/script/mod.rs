@@ -198,6 +198,8 @@ mod layout;
 mod layout_cache;
 mod level_grant;
 mod lfg;
+pub(crate) mod live;
+pub use live::{read_live, LiveLoan, LiveState};
 mod loot;
 mod loot_roll;
 mod lua51;
@@ -278,6 +280,7 @@ mod update_walk;
 mod vehicle;
 pub use tooltip_unit::{skill_rung, skill_rung_suffix, TooltipTint};
 pub use tracking::{TownKind, TownType, TrackingSpell, TOWN_TYPES};
+pub use who_sort::{cmp_utf8i, contains_utf8i, starts_with_utf8i};
 mod trade;
 mod tradeskill;
 mod trainer;
@@ -374,8 +377,8 @@ pub use macro_options::{EquippedForMacros, EquippedRow, OptionState};
 pub use mirror_timer::{MirrorTimer, MIRROR_TIMER_TOKENS};
 pub use modelframe::ModelPaneFrame;
 pub use petition::{
-    petition_type_name, validate_guild_name, ArenaBannerChoice, PetitionRecordView,
-    PetitionRequest, PetitionState, PetitionVendorItem, PetitionVendorState,
+    petition_type_name, validate_guild_name, ArenaBannerChoice, PetitionButtonItem,
+    PetitionRecordView, PetitionRequest, PetitionState, PetitionVendorItem, PetitionVendorState,
 };
 pub use tabard::{
     emblem_mask_path, TabardHost, TabardIntent, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
@@ -608,9 +611,9 @@ pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 24] = [
     "GetSpacing",
 ];
 
-/// The Region method map: the names every region leaf reaches on a miss, 3.3.5a's `SetSize` and
-/// `GetSize` (`0x49d7a0`, `0x49d6f0`, registrar `0xac1480`) among them.
-pub(crate) const REGION_MAP_METHODS: [&str; 26] = [
+/// The Region method map: the names every region leaf reaches on a miss, 3.3.5a's `SetSize`,
+/// `GetSize` and `GetRect` (`0x49d7a0`, `0x49d6f0`, `0x49ce50`, registrar `0xac1480`) among them.
+pub(crate) const REGION_MAP_METHODS: [&str; 27] = [
     "IsProtected",
     "CanChangeProtectedState",
     "GetObjectType",
@@ -619,6 +622,7 @@ pub(crate) const REGION_MAP_METHODS: [&str; 26] = [
     "GetParent",
     "SetParent",
     "GetCenter",
+    "GetRect",
     "GetLeft",
     "GetRight",
     "GetTop",
@@ -1495,6 +1499,22 @@ impl UiScript {
             .set_name(name)
             .set_mode(mlua::ChunkMode::Text)
             .exec()
+    }
+
+    /// The script executor a Warden check binds (`0x819210`), called with no name and no taint:
+    /// the chunk compiles as `?` and runs as secure code; a compile or run error goes to the error
+    /// handler, never to the caller.
+    pub fn execute_secure(&self, chunk: &str) {
+        let lua = &self.lua;
+        let run = taint::run_as(0, || {
+            lua.load(chunk)
+                .set_name("?")
+                .set_mode(mlua::ChunkMode::Text)
+                .exec()
+        });
+        if let Err(e) = run {
+            model_mut_of(lua).record_lua_error(&e);
+        }
     }
 
     /// Load and evaluate a Lua chunk, returning its result: for tests and one-shot queries.
