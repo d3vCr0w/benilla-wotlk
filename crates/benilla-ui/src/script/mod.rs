@@ -133,6 +133,7 @@ pub(crate) mod anim;
 mod client;
 mod clock;
 mod cvars;
+mod debug_verbs;
 mod dressup;
 mod duel;
 pub(crate) mod event;
@@ -200,7 +201,7 @@ mod layout_cache;
 mod level_grant;
 mod lfg;
 pub(crate) mod live;
-pub use live::{read_live, LiveLoan, LiveState};
+pub use live::{read_live, write_live, LiveLoan, LiveState};
 mod loot;
 mod loot_roll;
 mod lua51;
@@ -258,6 +259,7 @@ pub(crate) mod slider;
 mod social;
 mod sound;
 mod spell_info;
+mod spell_predicates;
 mod spellbook;
 mod stable;
 pub(crate) mod statusbar;
@@ -386,7 +388,7 @@ pub use tabard::{
     emblem_mask_path, TabardHost, TabardIntent, EMBLEM_MASK_TOKEN, TABARD_COUNTS,
     TABARD_CREATION_COST,
 };
-pub use tooltip_quest::QuestTooltipView;
+pub use tooltip_quest::{QuestRecord, QuestTooltipRead, QuestTooltipView};
 pub use unit_cast::UnitCast;
 pub use video_pairs::VIDEO_PAIR_CVARS;
 pub use worldmap_arrow::ARROW_MODEL;
@@ -457,11 +459,12 @@ pub use pvp::{
     PLAYER_FLAGS_PVP_TIMER,
 };
 pub use quest::{
-    QuestAction, QuestItemView, QuestPanel, QuestRewardExtras, QuestRewardSpell, QuestSelect,
-    QuestState,
+    QuestActOutcome, QuestAction, QuestItemRecord, QuestItemView, QuestPanel, QuestRewardExtras,
+    QuestRewardSpell, QuestSelect, QuestState,
 };
 pub use quest_log::{
-    fold_quest_log, QuestLogDetail, QuestLogEntryView, QuestLogObjectiveView, QuestLogState,
+    carry_collapse_filter, fold_quest_log, remap_selection, QuestLogDetail, QuestLogEntryView,
+    QuestLogObjectiveView, QuestLogPlan, QuestLogRow, QuestLogState,
 };
 pub use quest_poi::QuestPoiLines;
 pub use quest_watch::{QuestPoiRegion, QuestPoiView, QuestSpecialItemView};
@@ -1228,6 +1231,8 @@ fn install_in_game(lua: &Lua) -> mlua::Result<()> {
     worldmap::install(lua)?;
     worldstate::install(lua)?;
     net_stats::install(lua)?;
+    debug_verbs::install(lua)?;
+    spell_predicates::install(lua)?;
     Ok(())
 }
 
@@ -1368,12 +1373,23 @@ impl UiScript {
 
     /// Push the modifier state behind `IsShiftKeyDown`/`IsControlKeyDown`/`IsAltKeyDown`; the app
     /// calls it before the frame's mouse events, so a click handler reads the state of its click.
+    /// With no side known, a held modifier reads as its left key.
     pub fn set_modifiers(&mut self, shift: bool, ctrl: bool, alt: bool) {
-        if self.model_ref().modifiers == (shift, ctrl, alt) {
+        let keys = u8::from(shift) | u8::from(ctrl) << 2 | u8::from(alt) << 4;
+        self.set_modifier_keys(keys);
+    }
+
+    /// Push the six modifier keys by side, as [`Model::modifier_keys`] lays them out (left shift
+    /// `0x1`, right shift `0x2`, left control `0x4`, right control `0x8`, left alt `0x10`, right
+    /// alt `0x20`); `IsShiftKeyDown` and its siblings read either side.
+    pub fn set_modifier_keys(&mut self, keys: u8) {
+        let sides = (keys & 0x3 != 0, keys & 0xc != 0, keys & 0x30 != 0);
+        if self.model_ref().modifiers == sides && self.model_ref().modifier_keys == keys {
             return;
         }
         let mut model = self.model_mut();
-        model.modifiers = (shift, ctrl, alt);
+        model.modifiers = sides;
+        model.modifier_keys = keys;
     }
 
     /// Push the player's WMO-containment state onto every Minimap: it picks which persisted zoom
