@@ -23,7 +23,7 @@ use crate::net::{ClientCommand, NetCommands, ObjectStore, Objects, SelfPlayer};
 use crate::pending_item_ops::PendingItemOps;
 use crate::portrait::PaperDollBooth;
 use crate::ui_items::{find_equip_slot, item_link};
-use crate::ui_script::{gate, UiFeed, UiInput};
+use crate::ui_script::{gate, UiDrain, UiFeed};
 
 /// Equipment slots, 0-based (`EQUIPMENT_SLOT_*`): main hand, off hand, ranged.
 const SLOT_MAIN_HAND: u8 = 15;
@@ -156,7 +156,7 @@ impl Plugin for UiCharPlugin {
                     .in_set(UiFeed),
                 watch_skill_ups.in_set(UiFeed),
                 feed_skills.in_set(UiFeed),
-                drain_skill_abandons.after(UiInput),
+                drain_skill_abandons.in_set(UiDrain),
             ),
         );
     }
@@ -1266,7 +1266,7 @@ mod tests {
     #[test]
     fn a_skill_pair_folds_the_permanent_bonus_into_the_base() {
         /// `PLAYER_SKILL_INFO_1_1`: id|step, value|max, temp|perm per slot.
-        const F_SKILL: u16 = 718;
+        const F_SKILL: u16 = benilla_protocol::field::FIELD_PLAYER_SKILL_INFO_1_1;
         let pair = |lo: u16, hi: u16| u32::from(lo) | (u32::from(hi) << 16);
         // Slot 0: Defense (95) at 300, +10 temporary, +5 permanent.
         // Slot 1: Swords (43) at 0, with a +7 permanent that must not surface.
@@ -1306,7 +1306,7 @@ mod tests {
     #[test]
     fn a_hands_skill_line_follows_the_item_in_it() {
         /// `PLAYER_FIELD_INV_SLOT_HEAD`, one guid pair per slot.
-        const F_INV_SLOT_HEAD: u16 = 486;
+        const F_INV_SLOT_HEAD: u16 = benilla_protocol::field::FIELD_PLAYER_INV_SLOT_HEAD;
         const SWORD: u64 = 0x4000_0000_0000_0001;
         const SHIELD: u64 = 0x4000_0000_0000_0002;
         let mut app = App::new();
@@ -1356,11 +1356,11 @@ mod tests {
     }
 
     /// `PLAYER_FIELD_BANK_BAG_SLOT_1`, bank bag slot 0's guid pair.
-    const F_BANK_BAG_1: u16 = 1572;
+    const F_BANK_BAG_1: u16 = benilla_protocol::field::FIELD_PLAYER_BANK_BAG_SLOT_1;
     /// `OBJECT_FIELD_ENTRY` on the item object.
-    const F_OBJECT_ENTRY: u16 = 3;
+    const F_OBJECT_ENTRY: u16 = benilla_protocol::field::FIELD_OBJECT_ENTRY;
     /// `ITEM_FIELD_STACK_COUNT`, one of the six item fields the reference's watcher covers.
-    const F_ITEM_STACK_COUNT: u16 = 14;
+    const F_ITEM_STACK_COUNT: u16 = benilla_protocol::field::FIELD_ITEM_STACK_COUNT;
     /// Any container entry ("Traveler's Backpack"); the feed only needs it to resolve.
     const BAG_ENTRY: u32 = 4500;
     const BAG: u64 = 0x4000_0000_0000_0abc;

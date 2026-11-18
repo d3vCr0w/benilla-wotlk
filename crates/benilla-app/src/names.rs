@@ -431,6 +431,17 @@ impl NameCache {
         self.player_realms.get(&guid).map(String::as_str)
     }
 
+    /// A player's full name off the name record (`0x67d770`), asked on a miss and again after a deny (`0x67a2d0`).
+    pub(crate) fn full_name_record(&self, guid: u64, commands: &NetCommands) -> Option<String> {
+        if self.players.answered_unknown(guid) {
+            self.players.ask_again(guid, || {
+                let _ = commands.0.send(ClientCommand::NameQuery { guid });
+            });
+            return None;
+        }
+        self.full_name(guid, commands)
+    }
+
     /// A player's name as the reference's realm-aware callers format it: `name-realm` when the
     /// record holds a realm (`"%s-%s"`, `0x54b58a`), else the bare name. Asks once on a miss.
     pub(crate) fn full_name(&self, guid: u64, commands: &NetCommands) -> Option<String> {
@@ -468,8 +479,15 @@ pub(crate) mod net {
             race,
             class,
             gender,
+            declensions,
         } = ev
         {
+            // The name cache keeps the declined forms the `|3` rule reads (`0x6357d0`).
+            benilla_ui::declension::set_name_forms(
+                benilla_ui::declension::NameKind::Player,
+                &name,
+                declensions,
+            );
             player_name(guid, name, race, class, gender, &mut names);
             names.set_player_realm(guid, realm);
         }
@@ -486,7 +504,18 @@ pub(crate) mod net {
     }
 
     fn on_pet_name(In(ev): In<SessionEvent>, mut names: ResMut<NameCache>) {
-        if let SessionEvent::PetName { pet_number, name } = ev {
+        if let SessionEvent::PetName {
+            pet_number,
+            name,
+            declensions,
+        } = ev
+        {
+            // The pet-name cache keeps the declined forms the `|3` rule reads (`0x6352c0`).
+            benilla_ui::declension::set_name_forms(
+                benilla_ui::declension::NameKind::Pet,
+                &name,
+                declensions,
+            );
             pet_name(pet_number, name, &mut names);
         }
     }
@@ -910,8 +939,8 @@ mod tests {
     }
 
     /// `OBJECT_FIELD_ENTRY` and `UNIT_FIELD_PETNUMBER`, absolute descriptor indices.
-    const ENTRY: u16 = 3;
-    const PETNUMBER: u16 = 139;
+    const ENTRY: u16 = benilla_protocol::field::FIELD_OBJECT_ENTRY;
+    const PETNUMBER: u16 = benilla_protocol::field::FIELD_UNIT_PETNUMBER;
 
     fn unit(fields: &[(u16, u32)]) -> ObjectStore {
         ObjectStore(benilla_protocol::ObjectFields::from_pairs(fields))

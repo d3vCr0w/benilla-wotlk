@@ -143,6 +143,7 @@ impl PluginGroup for GamePlugins {
             .add(crate::death::DeathPlugin)
             .add(crate::ui_notices::NoticesPlugin)
             .add(crate::ui_movie::MoviePlugin)
+            .add(crate::ui_movie::player::MoviePlayerPlugin)
             .add(crate::char_select::CharSelectPlugin { start: self.start })
             .add(crate::login::LoginPlugin)
             .add(crate::realm_select::RealmSelectPlugin)
@@ -495,7 +496,12 @@ pub(crate) mod schedule_tests {
             }
             // Pass 2: build, and read what the build found. `is_send` is only known once a
             // system's params have registered their access, i.e. after this.
-            schedule.initialize(world).expect("the schedule builds");
+            if let Err(e) = schedule.initialize(world) {
+                panic!(
+                    "the schedule builds: {} ({e:?})",
+                    e.to_string(schedule.graph(), world)
+                );
+            }
             let mut non_send = Vec::new();
             for (key, system) in schedule.systems().expect("initialized") {
                 if !system.is_send() {
@@ -929,7 +935,7 @@ pub(crate) mod schedule_tests {
     ///   test reads one frame late at worst, as `ui_unit::feed_unit_reach`'s range test does
     ///   (`UiFeed` runs before `WorldStage::Input`, so it cannot follow the transport chain); and
     ///   against the `TutorialEvent` writers `tutorial::watch_self`, `watch_windows`,
-    ///   `ui_battlefield::feed_battlefield` and the drain `tutorial::feed_tutorials`: it only appends one fire-once ask.
+    ///   the status handler's one-shot system and the drain `tutorial::feed_tutorials`: it only appends one fire-once ask.
     /// - The vehicle seats (#632) add 15: `vehicle::ride::ride_seats` re-roots a passenger's rig in
     ///   the entity-visuals chain right after `reseat_mounts`, as a mount re-seat does, and shares
     ///   its unordered `RigPose` readers (the nameplate, overhead mark, combat-text and anim-event
@@ -1020,6 +1026,11 @@ pub(crate) mod schedule_tests {
     ///   against six writers (+6): a mover's flags a frame late only delay a sampled stamp.
     /// - The cast attempt's area leg reads `CurrentArea` against `update_current_area` from each
     ///   `CastLadder` drain (+9): a press reads the area under the player a frame late at worst.
+    /// - The cast attempt's place legs (`0x739650`) read `PlayerPlace` against `feed_zone_events`
+    ///   from the two click commits (+2), and the player's book for Cold Weather Flying against
+    ///   `drain_action_sets` and `drain_equipment_sets` from the other `CastLadder` drains (+10):
+    ///   a press reads the place or a slot write a frame late at worst, and neither drain changes
+    ///   which spells the book holds.
     /// - The display swap's carry (#1043) adds 3 net: `refresh_live_display` reads the swapped
     ///   unit's `AnimationPlayer` for its dying anim's progress against `apply_aura_anim_rate`,
     ///   `drive_go_anim`, `drive_booth_turn`, `pose_markers` and `sync_tiles`, which pause or pose
@@ -1028,10 +1039,16 @@ pub(crate) mod schedule_tests {
     // The corpse resolver (#636) follows the transport chain inside UiFeed, ordering 63 more.
     // The press pass (#1215) runs the script calls ahead of the feeds and their drains, and the
     // packet-derived state a press reads ahead of it, taking the count from at most 3891 to 3808.
+    // The live view (#1274) reads `Player` and the held objects' `Transform` at call time, so the
+    // frame declares 12340's order (`0x47eff0`: input, the net poll, the movement idle, the
+    // paint): the transport chain before the press, the tick's drains (`UiDrain`) before the
+    // world update, and the booths, quest markers and entity visuals after the drains, taking it
+    // to 3152.
     // The post-input cooldown snapshot has three deliberate VM readers: it must run after a
     // script cast and before the synchronous cooldown flush, adding 50 same-frame resource pairs
     // with world/UI drains that are otherwise independent and may settle a frame later.
-    const UPDATE_ACTIONABLE_CEILING: usize = 3_858;
+    // The merged live-view and cooldown graph settles at 3241 actionable pairs.
+    const UPDATE_ACTIONABLE_CEILING: usize = 3_241;
     const UPDATE_ACTIONABLE_SLACK: usize = 40;
 
     fn ratchet(what: &str, n: usize, ceiling: usize, slack: usize) {
@@ -1178,7 +1195,7 @@ pub(crate) mod schedule_tests {
     const FRAME_FLOOR: &[(&str, usize, usize)] = &[
         // The three cooldown post-input feeds are event-gated: they do not add to the quiet
         // frame floor, but remain explicit dispatch entries when a cast arms a local GCD.
-        ("Update", 748, 737),
+        ("Update", 736, 725),
         ("PostUpdate", 183, 142),
         ("PreUpdate", 60, 60),
         ("First", 11, 8),
@@ -1424,10 +1441,11 @@ pub(crate) mod schedule_tests {
 
     /// The VM ticks once a frame (`extract::tick_script`, in `UiInput`): a press rides `UiPress`
     /// and a push the tick must see rides `UiFeed`, both chained after the net drain and before
-    /// the tick; a drain of what it produced is `.after(UiInput)`. Read off the built graph. Fails
-    /// a holder with no path to or from the tick, one before the tick outside both phases and not
-    /// argued in [`OUTSIDE_THE_FEED_PHASE`], a phase member the graph does not place between the
-    /// drain and the tick, and a stale row.
+    /// the tick; a drain of what it produced is in `UiDrain`, or `.after(UiInput)` when it follows
+    /// the world update. Read off the built graph. Fails a holder with no path to or from the
+    /// tick, one before the tick outside both phases and not argued in
+    /// [`OUTSIDE_THE_FEED_PHASE`], a phase member the graph does not place between the drain and
+    /// the tick, and a stale row.
     #[test]
     fn every_vm_holder_in_update_declares_its_side_of_the_tick() {
         let mut app = headless_client();
@@ -1510,7 +1528,7 @@ pub(crate) mod schedule_tests {
                 ));
             } else {
                 offenders.push(format!(
-                    "{}: no declared side of the tick — `.in_set(UiFeed)` for a push the tick must see this frame, `.after(UiInput)` for a drain of what the tick produced",
+                    "{}: no declared side of the tick — `.in_set(UiFeed)` for a push the tick must see this frame, `.in_set(UiDrain)` for a drain of what the tick produced",
                     s.name
                 ));
             }
@@ -1540,7 +1558,7 @@ pub(crate) mod schedule_tests {
         assert!(
             offenders.is_empty(),
             "these systems hold the VM in `Update` without declaring their side of the tick \
-             (`UiPress` or `UiFeed` before it, or `.after(UiInput)`):\n  {}",
+             (`UiPress` or `UiFeed` before it, or `.in_set(UiDrain)`):\n  {}",
             offenders.join("\n  ")
         );
         assert!(stale.is_empty(), "stale rows:\n  {}", stale.join("\n  "));
@@ -1574,8 +1592,8 @@ pub(crate) mod schedule_tests {
          "`seen_generation` is a `VmMemo`: a new VM reads `None`, rebuilds and re-fires UPDATE_BINDINGS"),
         ("capture/probe_bg.rs", "bg_probe", Because::SelfHealing,
          "the battleground probe: dev-only (`WOW_PROBE_BG`, `cfg(feature = \"dev\")`) so it is not in a player build at all, and its `mem::take` is of its OWN pending-events string, not a queue anything else fills. Its one real VM dependency is the Lua event tap, which self-heals: `EVENT_DRAIN` returns a `<tap-gone>` sentinel when the tap's globals are missing — the case this window causes, since a tap installed in the boot VM is discarded when `mint_entry_vm` builds the interface — and the probe re-installs on the next frame"),
-        ("death/mod.rs", "feed_death", Because::MemoLatched,
-         "`feed.vm: VmMemo<DeathAnnounced>`: a fresh memo makes the first snapshot an edge and re-announces a held offer, confirm and corpse range"),
+        ("ui_movie/player.rs", "drive_movie", Because::FilledByVm,
+         "the mailbox holds only the VM's own `StartMovie`/`StopMovie` calls, and a movie whose VM is replaced is dropped by its session check"),
         ("screenshot.rs", "ask_for_captures", Because::FilledByVm,
          "`pending` holds only the VM's own `Screenshot()` asks, and the take spawns a capture, publishing nothing"),
         ("screenshot.rs", "report_captures", Because::FilledByVm,
@@ -1592,22 +1610,18 @@ pub(crate) mod schedule_tests {
          "`BankErrors` answers a `BuyBankSlot` click; the OPENED edge rides `VmMemo`s"),
         ("ui_guild_bank/mod.rs", "feed_guild_bank", Because::PlayerRoundTrip,
          "every owed event answers a click on a guild banker or a guild bank verb, and the view rides a `VmMemo`"),
-        ("ui_battlefield.rs", "feed_battlefield", Because::SelfHealing,
-         "`reset_on_world_enter` runs before it at each world-enter cascade, clears the session and re-sends `BattlefieldStatusRequest`"),
+        ("ui_battlefield.rs", "drain_battlefield", Because::PlayerRoundTrip,
+         "`closed` ends a battlemaster session, which only a list packet answering a click on a battlemaster opens"),
         ("ui_binder.rs", "feed_binder", Because::PlayerRoundTrip,
          "`SMSG_BINDER_CONFIRM` only answers the innkeeper's gossip line"),
         ("ui_char.rs", "feed_char", Because::MemoLatched,
          "`feed.vm: VmMemo<CharFeedMemo>`; `vm_reset` fires every transition on a fresh memo"),
         ("ui_chat/recruitment.rs", "guild_recruitment_cascade", Because::SelfHealing,
          "`pending` is held until the zone mask and zone id are settled, which happens on the entry VM"),
-        ("ui_duel.rs", "feed_duel", Because::PlayerRoundTrip,
-         "a duel exists only after someone's Duel cast, and the server ends any duel at logout; FINISHED/bounds ride `VmMemo<FedDuel>` (another player's act: coincidence-only residual)"),
         ("ui_follow.rs", "feed_follow", Because::MemoLatched,
          "`feed.vm: VmMemo<FollowFeedMemo>`; a fresh VM re-fires BEGIN for a follow in progress"),
         ("ui_gm_ticket.rs", "feed_gm_ticket", Because::MemoLatched,
          "`feed.vm: VmMemo<FedTicket>` counters restart per VM while `state.answers` keeps counting, so the latest answer is re-fired"),
-        ("ui_honor.rs", "feed_honor", Because::MemoLatched,
-         "`state.vm: VmMemo<HonorFeedMemo>`; `events_for(None, ..)` re-fires both events on a fresh VM"),
         ("ui_inspect.rs", "feed_inspect", Because::MemoLatched,
          "the token is latched only by Lua's `NotifyInspect`, and the diffs ride a `VmMemo`"),
         ("ui_item_text.rs", "drain_item_text", Because::FilledByVm,
@@ -1644,8 +1658,6 @@ pub(crate) mod schedule_tests {
          "acts on the glue VM alone, which the lifecycle installs with its GlueXML loaded and seated, so there is no frameless window; its takes are the manager's own flags and outbox"),
         ("ui_stable/mod.rs", "feed_stable", Because::PlayerRoundTrip,
          "both packets follow a stable master's gossip and a click in its window"),
-        ("ui_summon.rs", "feed_summon", Because::PlayerRoundTrip,
-         "only another player's Ritual of Summoning latches the ask (the duel's shape; coincidence-only residual)"),
         ("ui_tabard.rs", "drain_tabard", Because::FilledByVm,
          "the intents are Lua's; the event answers a Save intent"),
         ("ui_tabard.rs", "feed_tabard", Because::PlayerRoundTrip,

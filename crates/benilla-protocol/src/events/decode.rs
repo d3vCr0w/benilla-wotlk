@@ -1,6 +1,6 @@
 //! The [`ServerPacket`] to [`SessionEvent`] mapping: pure functions of the packet, no state.
 
-use crate::messages::{CastOutcome, MovementBlock, Object, ObjectFields, ObjectType, ServerPacket};
+use crate::messages::{CastOutcome, Object, ObjectFields, ObjectType, ServerPacket};
 use crate::wire::Vector3d;
 
 use super::{EntityKind, MoveSpeeds, SessionEvent};
@@ -1300,6 +1300,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             race,
             gender,
             class,
+            declensions,
         } => vec![SessionEvent::PlayerName {
             guid,
             name,
@@ -1307,13 +1308,20 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
             race,
             gender,
             class,
+            declensions,
         }],
         ServerPacket::NameQueryMiss { guid, miss } => {
             vec![SessionEvent::PlayerNameMiss { guid, miss }]
         }
-        ServerPacket::PetNameQueryResponse { pet_number, name } => {
-            vec![SessionEvent::PetName { pet_number, name }]
-        }
+        ServerPacket::PetNameQueryResponse {
+            pet_number,
+            name,
+            declensions,
+        } => vec![SessionEvent::PetName {
+            pet_number,
+            name,
+            declensions,
+        }],
         ServerPacket::CreatureQueryResponse { entry, info } => {
             let (
                 name,
@@ -1618,9 +1626,7 @@ fn decode_objects(objects: Vec<Object>) -> Vec<SessionEvent> {
                     });
                     continue;
                 }
-                if let Some((position, orientation)) =
-                    create_placement(object_type, &mask, &movement)
-                {
+                if let Some((position, orientation)) = movement.position {
                     let display = display_id(object_type, &mask);
                     let scale = object_scale(object_type, &mask);
                     let speeds = movement.speeds.map(MoveSpeeds::from_wire);
@@ -1714,19 +1720,4 @@ fn object_scale(t: ObjectType, mask: &ObjectFields) -> f32 {
         _ => None,
     };
     raw.filter(|s| *s > 0.0).unwrap_or(1.0)
-}
-
-/// A create's pose: a GameObject's `GAMEOBJECT_POS_*` when sent, else the movement block, since
-/// vmangos never sets those fields on a transport. Gate on `gameobject_pos_sent`, not `.or`: a
-/// create reads absent fields as zero, so `gameobject_position()` is `Some` even when unsent.
-fn create_placement(
-    object_type: ObjectType,
-    mask: &ObjectFields,
-    movement: &MovementBlock,
-) -> Option<(Vector3d, f32)> {
-    if object_type == ObjectType::GameObject && mask.gameobject_pos_sent() {
-        mask.gameobject_position()
-    } else {
-        movement.position
-    }
 }

@@ -14,7 +14,25 @@ use super::{load_ingame_ui, CursorPayloadHeld, PlayerUiHover, UiClock, UiKeyboar
 use crate::ui_script::addons;
 
 pub(crate) fn setup_script(world: &mut World) {
-    install_glue_side_vm(world, super::glue::GlueScreen::Login);
+    let screen = boot_screen(world);
+    install_glue_side_vm(world, screen);
+}
+
+/// The startup screen (`0x404234`): `"movie"` while the `movie` CVar is 1, which this clears, else
+/// `"login"`. Deviation: an unattended run boots to `"login"` and leaves the CVar alone, since a
+/// probe's fresh config would otherwise sit through the intro before its login.
+fn boot_screen(world: &mut World) -> super::glue::GlueScreen {
+    if crate::run_mode::unattended() {
+        return super::glue::GlueScreen::Login;
+    }
+    let Some(mut cvars) = world.get_resource_mut::<crate::cvars::Cvars>() else {
+        return super::glue::GlueScreen::Login;
+    };
+    if cvars.get("movie") != Some("1") {
+        return super::glue::GlueScreen::Login;
+    }
+    cvars.set("movie", "0");
+    super::glue::GlueScreen::Movie
 }
 
 /// Install the VM the world holds outside the world: the stock glue screens', put up on `screen`,
@@ -135,6 +153,7 @@ fn new_vm<E: std::fmt::Display>(
     seed_class_names(world, &mut script);
     seed_paperdoll_item_frame(world, &mut script);
     install_addon_asset_resolvers(world, &mut script);
+    crate::ui_movie::player::seat_movie_host(world, &mut script);
     info!("ui_script: new VM, session {}", script.session());
     Some(script)
 }
@@ -822,6 +841,10 @@ fn close_ui_session(world: &mut World) {
 #[derive(Resource, Default)]
 pub(crate) struct ReloadUiPending(pub(crate) bool);
 
+/// The reload byte (`0xbd0790`): from `ReloadUI()` (`0x52b00c`) to the world entry it re-enters.
+#[derive(Resource, Default)]
+pub(crate) struct ReloadEntry(pub(crate) bool);
+
 /// Run a pending `ReloadUI()`: the reference's teardown and rebuild, for us [`end_ui_session`] then
 /// [`load_ingame_ui_on_world_entry`] without leaving the world, so a `DisableAddOn` staged in the
 /// dying VM reaches `AddOns.txt` before the rebuild reads it. `PLAYER_ENTERING_WORLD` then refires
@@ -840,6 +863,8 @@ pub(crate) fn run_pending_reload(world: &mut World) {
         return;
     }
     info!("ui_script: ReloadUI — ending the UI session and building a new one");
+    // The teardown leaves the world (`0x528c30`).
+    crate::ui_battlefield::leave_world(world);
     // The combat log's store outlives a reload, as the reference keeps it outside the VM.
     let combat_log = world
         .get_non_send_resource_mut::<UiScript>()
@@ -892,6 +917,7 @@ pub(crate) fn run_pending_reload(world: &mut World) {
         .is_some();
     if seated {
         world.write_message(crate::net::WorldEnterCascadeMessage);
+        world.get_resource_or_init::<ReloadEntry>().0 = true;
     }
 }
 
@@ -966,6 +992,20 @@ pub(crate) fn finish_ui_load_with(
     between(world, script);
     // `0x52a9e6`: the one-shot the world entry fires and clears.
     script.arm_player_login();
+    // Each UI starts its countdowns zeroed (`0x52a9f6`-`0x52aa20`): release, reclaim, instance
+    // boot, instance lock and summon.
+    if let Some(mut globals) = world.get_resource_mut::<crate::death::DeathGlobals>() {
+        globals.reset_at_ui_load();
+    }
+    if let Some(mut boot) = world.get_resource_mut::<crate::ui_dialog_verbs::InstanceBoot>() {
+        boot.reset_at_ui_load();
+    }
+    if let Some(mut instance) = world.get_resource_mut::<crate::ui_instance::InstanceState>() {
+        instance.reset_at_ui_load();
+    }
+    if let Some(mut summon) = world.get_resource_mut::<crate::ui_summon::SummonState>() {
+        summon.reset_at_ui_load();
+    }
 }
 
 /// Run the patch chain's `Interface\FrameXML\GlobalStrings.lua`, the first file in the reference's

@@ -187,6 +187,8 @@ pub(crate) fn feed_action_state(
         usable::UsableAuras,
         // The pet bar a pet-action slot reads.
         Option<Res<crate::ui_pet::PetBar>>,
+        // Where the player stands, for the walk's place legs.
+        usable::UsablePlaceFeed,
     ),
     factions: Option<Res<crate::target::Factions>>,
     reputations: Res<crate::net::Reputations>,
@@ -197,7 +199,8 @@ pub(crate) fn feed_action_state(
         Local<crate::ui_script::VmMemo<StateMemory>>,
     ),
 ) {
-    let (units, usable_auras, pet_bar) = &units_and_auras;
+    let (units, usable_auras, pet_bar, place_feed) = &units_and_auras;
+    let place = place_feed.player(actions.spells.contains(&usable::COLD_WEATHER_FLYING));
     let Some(mut script) = script else {
         return;
     };
@@ -348,6 +351,7 @@ pub(crate) fn feed_action_state(
                             spell_mods,
                             // The pet is not the active player: no rune spell is usable on it.
                             runes: None,
+                            place: place_feed.pet(),
                             combo_points: combo
                                 .as_deref()
                                 .map_or(0, |c| c.pet.on(0, selection.guid.unwrap_or(0))),
@@ -414,6 +418,7 @@ pub(crate) fn feed_action_state(
                         runes: rune_check,
                         combo_points,
                         auto_unshift,
+                        place,
                     };
                     let (u, oom) = usable::spell_usable(
                         button.action,
@@ -509,6 +514,7 @@ pub(crate) fn feed_action_state(
                         runes: rune_check,
                         combo_points,
                         auto_unshift,
+                        place,
                     };
                     let (u, oom) = usable::item_usable(
                         button.action,
@@ -611,6 +617,7 @@ pub(crate) fn feed_action_state(
             runes: rune_check,
             combo_points,
             auto_unshift,
+            place,
         };
         for (id, was_ready) in memory.reactive.iter_mut().flatten() {
             let Some(d) = sp.catalog.get(*id) else {
@@ -810,7 +817,7 @@ mod tests {
         const SWUNG_AT: u64 = 0xA1;
         const SELECTED: u64 = 0xB2;
         /// `UNIT_FIELD_COMBATREACH`.
-        const REACH: u16 = 130;
+        const REACH: u16 = benilla_protocol::field::FIELD_UNIT_COMBATREACH;
 
         let verdict = |distance: f32| {
             let (tx, _rx) = crossbeam_channel::unbounded();
@@ -871,7 +878,7 @@ mod tests {
                 .spawn((
                     Transform::from_xyz(2.0, 0.0, 0.0),
                     ObjectStore(ObjectFields::from_pairs(&[
-                        (22, 100),
+                        (benilla_protocol::field::FIELD_UNIT_HEALTH, 100),
                         (REACH, 4.0f32.to_bits()),
                     ])),
                 ))
@@ -880,14 +887,20 @@ mod tests {
                 SelfPlayer,
                 Engaged(SWUNG_AT),
                 Transform::default(),
-                ObjectStore(ObjectFields::from_pairs(&[(22, 100), (23, 500)])),
+                ObjectStore(ObjectFields::from_pairs(&[
+                    (benilla_protocol::field::FIELD_UNIT_HEALTH, 100),
+                    (benilla_protocol::field::FIELD_UNIT_POWER1, 500),
+                ])),
             ));
             // The selected unit keeps the descriptor's default 1.5 reach.
             let selected = app
                 .world_mut()
                 .spawn((
                     Transform::from_xyz(distance, 0.0, 0.0),
-                    ObjectStore(ObjectFields::from_pairs(&[(22, 100)])),
+                    ObjectStore(ObjectFields::from_pairs(&[(
+                        benilla_protocol::field::FIELD_UNIT_HEALTH,
+                        100,
+                    )])),
                 ))
                 .id();
             let mut index = app.world_mut().resource_mut::<crate::net::GuidIndex>();
@@ -1006,7 +1019,10 @@ mod tests {
                 crate::net::Embodied,
                 speeds,
                 Transform::default(),
-                ObjectStore(ObjectFields::from_pairs(&[(22, 100), (23, 500)])),
+                ObjectStore(ObjectFields::from_pairs(&[
+                    (benilla_protocol::field::FIELD_UNIT_HEALTH, 100),
+                    (benilla_protocol::field::FIELD_UNIT_POWER1, 500),
+                ])),
             ));
             // A mob at the descriptor's default 1.5 reach; a live spline at 8 yd/s is its run.
             let mob = app
@@ -1014,7 +1030,10 @@ mod tests {
                 .spawn((
                     speeds,
                     Transform::from_xyz(distance, 0.0, 0.0),
-                    ObjectStore(ObjectFields::from_pairs(&[(22, 100)])),
+                    ObjectStore(ObjectFields::from_pairs(&[(
+                        benilla_protocol::field::FIELD_UNIT_HEALTH,
+                        100,
+                    )])),
                 ))
                 .id();
             if mob_runs {
@@ -1070,8 +1089,8 @@ mod tests {
         const FOOD_ITEM: u32 = 1487;
         const FOOD_SPELL: u32 = 433;
         // Raw indices: `ITEM_FIELD_STACK_COUNT`, and `PLAYER_FIELD_PACK_SLOT_1`, backpack slot 1.
-        const STACK: u16 = 14;
-        const PACK_SLOT_1: u16 = 532;
+        const STACK: u16 = benilla_protocol::field::FIELD_ITEM_STACK_COUNT;
+        const PACK_SLOT_1: u16 = benilla_protocol::field::FIELD_PLAYER_PACK_SLOT_1;
 
         let lit = |in_combat: bool| {
             let (tx, _rx) = crossbeam_channel::unbounded();
@@ -1134,7 +1153,10 @@ mod tests {
             crate::items::test_spawn_item(
                 app.world_mut(),
                 0xF0,
-                ObjectFields::from_pairs(&[(3, FOOD_ITEM), (STACK, 10)]),
+                ObjectFields::from_pairs(&[
+                    (benilla_protocol::field::FIELD_OBJECT_ENTRY, FOOD_ITEM),
+                    (STACK, 10),
+                ]),
                 false,
             );
             // The player: alive, with the ten muffins in backpack slot 1.
@@ -1148,9 +1170,9 @@ mod tests {
                 SelfPlayer,
                 Transform::default(),
                 ObjectStore(ObjectFields::from_pairs(&[
-                    (22, 100),
-                    (23, 500),
-                    (46, flags),
+                    (benilla_protocol::field::FIELD_UNIT_HEALTH, 100),
+                    (benilla_protocol::field::FIELD_UNIT_POWER1, 500),
+                    (benilla_protocol::field::FIELD_UNIT_FLAGS, flags),
                     (PACK_SLOT_1, 0xF0),
                 ])),
             ));
@@ -1177,7 +1199,7 @@ mod tests {
         use benilla_protocol::ObjectFields;
         const REVENGE: u32 = 6572;
         // `UNIT_FIELD_AURASTATE`.
-        const AURA_STATE: u16 = 125;
+        const AURA_STATE: u16 = benilla_protocol::field::FIELD_UNIT_AURASTATE;
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut app = App::new();
         let mut actions = PlayerActions::default();
@@ -1222,7 +1244,10 @@ mod tests {
             .spawn((
                 SelfPlayer,
                 Transform::default(),
-                ObjectStore(ObjectFields::from_pairs(&[(22, 100), (23, 500)])),
+                ObjectStore(ObjectFields::from_pairs(&[
+                    (benilla_protocol::field::FIELD_UNIT_HEALTH, 100),
+                    (benilla_protocol::field::FIELD_UNIT_POWER1, 500),
+                ])),
             ))
             .id();
         let script = UiScript::new().unwrap();
@@ -1237,8 +1262,8 @@ mod tests {
             app.world_mut()
                 .entity_mut(me)
                 .insert(ObjectStore(ObjectFields::from_pairs(&[
-                    (22, 100),
-                    (23, 500),
+                    (benilla_protocol::field::FIELD_UNIT_HEALTH, 100),
+                    (benilla_protocol::field::FIELD_UNIT_POWER1, 500),
                     (AURA_STATE, u32::from(lit)),
                 ])));
             app.update();
@@ -1437,14 +1462,20 @@ mod tests {
             app.world_mut().spawn((
                 SelfPlayer,
                 Transform::default(),
-                ObjectStore(ObjectFields::from_pairs(&[(22, 100), (23, 0)])),
+                ObjectStore(ObjectFields::from_pairs(&[
+                    (benilla_protocol::field::FIELD_UNIT_HEALTH, 100),
+                    (benilla_protocol::field::FIELD_UNIT_POWER1, 0),
+                ])),
             ));
             if pet_streamed {
                 let pet = app
                     .world_mut()
                     .spawn((
                         Transform::default(),
-                        ObjectStore(ObjectFields::from_pairs(&[(22, 100), (23, 10)])),
+                        ObjectStore(ObjectFields::from_pairs(&[
+                            (benilla_protocol::field::FIELD_UNIT_HEALTH, 100),
+                            (benilla_protocol::field::FIELD_UNIT_POWER1, 10),
+                        ])),
                     ))
                     .id();
                 app.world_mut()

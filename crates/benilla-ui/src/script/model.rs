@@ -448,18 +448,19 @@ pub(crate) struct Model {
     pub(crate) session_requests: Vec<session::SessionRequest>,
     /// The glue core's slots and request queue; empty in an in-game VM.
     pub(crate) glue: super::glue_core::GlueCore,
+    /// The frame each held key's press went to (`m_keydownCapture`, `0x4943c0`), which its release
+    /// goes to alone (`0x494490`); by key name.
+    pub(crate) key_capture: std::collections::HashMap<String, FrameHandle>,
+    /// The app's movie player, which the MovieFrame verbs open and close movies through.
+    pub(crate) movie_host: Option<std::rc::Rc<dyn super::movieframe::MovieHost>>,
     /// `TogglePVP` calls, a count because `CMSG_TOGGLE_PVP` has no body.
     pub(crate) pvp_toggles: u32,
     /// `SetPVP` calls, each the byte its `CMSG_TOGGLE_PVP` carries.
     pub(crate) pvp_sets: Vec<u8>,
-    /// The player's PvP toggle timer (`0x6de7a0`) as the app computed it this frame, ms.
-    pub(crate) pvp_toggle_timer: i32,
     /// The inspected player's arena teams by slot, resolved by the app.
-    pub(crate) inspect_arena_teams: [Option<pvp::InspectArenaTeamView>; 3],
-    /// The arena-team mirror: the three teams, the roster's sort and selection.
+    pub(crate) inspect_arena_teams: [Option<pvp::InspectArenaTeamWords>; 3],
+    /// The arena-team state the VM owns: the roster's sort, offline filter, selection and sends.
     pub(crate) arena_teams: super::arena_team::ArenaTeams,
-    /// The player's private honor fields; before the first push the six self getters read zeros.
-    pub(crate) honor: Option<pvp::HonorState>,
     /// The last `MSG_INSPECT_HONOR_STATS` reply; its presence is `HasInspectHonorData`'s answer.
     pub(crate) inspect_honor: Option<pvp::InspectHonorData>,
     /// `RequestInspectHonorData` calls; the pending gate keeps this at 0 or 1.
@@ -656,13 +657,6 @@ pub(crate) struct Model {
     pub(crate) battlefield_score_requests: u32,
     /// The battlefield queue mirror: types, list, selection, slots and the sends.
     pub(crate) battlefield: super::battlefield_queue::BattlefieldInfo,
-    /// Teammates' map positions, the flag carriers, the icon scale and position requests.
-    pub(crate) battlefield_positions: Vec<super::battlefield_positions::BattlefieldPositionView>,
-    pub(crate) battlefield_flags: Vec<super::battlefield_positions::BattlefieldFlagView>,
-    pub(crate) battlefield_icon_scale: f32,
-    /// A `Cell`: the stock `UIParent` OnUpdate calls the verb every frame and the app drains it
-    /// every frame, and neither is anything drawn (`ModelCell`).
-    pub(crate) battlefield_position_requests: std::cell::Cell<u32>,
     /// Acknowledged tutorials, `None` before `SMSG_TUTORIAL_FLAGS`; all `TutorialsEnabled()` reads.
     pub(crate) tutorial_bank: Option<Vec<u8>>,
     /// The completed tutorials, in completion order, `id + 1` each.
@@ -796,6 +790,13 @@ pub(crate) struct Model {
     /// `RegisterForDrag` buttons per frame, compared case-insensitively. Nothing destroys a frame,
     /// so this, `scripts` and `frame_events` are never pruned; a destroy path must prune all three.
     pub(crate) drag_registered: HashMap<FrameHandle, HashSet<String>>,
+    /// The indented word wrap (style bit `0x20000`) of a message frame's, edit box's or SimpleHTML's
+    /// own font, by frame and font slot (SimpleHTML's `P`, `H1`, `H2`, `H3` are 0 to 3; every other
+    /// frame has slot 0). Stored, not applied, as on a FontString.
+    pub(crate) frame_indented_wrap: HashSet<(FrameHandle, u8)>,
+    /// The minimap art every minimap shares, by the setter that replaced it (`SetBlipTexture`,
+    /// `SetIconTexture`, ...); an absent key is the stock file.
+    pub(crate) minimap_art: HashMap<&'static str, String>,
     /// The drag gesture, armed by a press on a drag-registered frame, started past the threshold.
     pub(crate) drag: Option<cursor::DragGesture>,
     /// The one `StartMoving()` in flight, the client's `root+0xcfc` slot, apart from `drag` as in
@@ -987,8 +988,7 @@ pub(crate) struct Model {
     pub(crate) quest_selects: Vec<quest::QuestSelect>,
     pub(crate) quest_actions: Vec<quest::QuestAction>,
 
-    /// Death countdowns and offers, and the release, reclaim and resurrect calls.
-    pub(crate) death: death::DeathUiState,
+    /// The release, reclaim, resurrect, spirit-healer and soulstone calls, in order; the app sends each.
     pub(crate) death_actions: Vec<death::DeathAction>,
 
     /// The quest log, selection (1-based), abandon mark (a quest id) and abandons.
@@ -1124,7 +1124,7 @@ pub(crate) struct Model {
     /// The inspected unit's gear, from its public `PLAYER_VISIBLE_ITEM_*` fields.
     pub(crate) inspect: Option<inspect::InspectView>,
     /// `NotifyInspect` unit tokens, sent as `CMSG_INSPECT`.
-    pub(crate) inspect_notifies: Vec<String>,
+    pub(crate) inspect_notifies: Vec<(String, u64)>,
     /// `ClearInspectPlayer` ran, after this many of [`Self::inspect_notifies`]: the app drops its
     /// inspect target there, keeping the call order.
     pub(crate) inspect_clear: Option<usize>,
@@ -1218,8 +1218,6 @@ pub(crate) struct Model {
     pub(crate) binder_confirms: u32,
     /// `CheckBinderDist()`: the innkeeper's question is live and in range; false hides its dialog.
     pub(crate) binder_pending: bool,
-    /// The summon getters' answers, defaulting to the reference's `""`, `""`, 0 with none pending.
-    pub(crate) summon_confirm: super::summon::SummonConfirmUiState,
     /// `ConfirmSummon()` (true) and `CancelSummon()` (false) calls in order, one
     /// `CMSG_SUMMON_RESPONSE` each; the app holds the summoner.
     pub(crate) summon_answers: Vec<bool>,
@@ -1534,12 +1532,12 @@ impl Model {
             camera_view_requests: Vec::new(),
             session_requests: Vec::new(),
             glue: Default::default(),
+            movie_host: None,
+            key_capture: Default::default(),
             pvp_toggles: 0,
             pvp_sets: Vec::new(),
-            pvp_toggle_timer: 0,
             inspect_arena_teams: Default::default(),
             arena_teams: Default::default(),
-            honor: None,
             inspect_honor: None,
             inspect_honor_requests: 0,
             inspect_honor_pending: false,
@@ -1624,10 +1622,6 @@ impl Model {
             battlefield_board: Default::default(),
             battlefield_score_requests: 0,
             battlefield: Default::default(),
-            battlefield_positions: Vec::new(),
-            battlefield_flags: Vec::new(),
-            battlefield_icon_scale: 1.0,
-            battlefield_position_requests: std::cell::Cell::new(0),
             tutorial_bank: None,
             tutorials_completed: Vec::new(),
             tutorial_flag_requests: Vec::new(),
@@ -1689,6 +1683,8 @@ impl Model {
             container_autoequips: Vec::new(),
             bag_autostores: Vec::new(),
             drag_registered: HashMap::new(),
+            frame_indented_wrap: HashSet::new(),
+            minimap_art: HashMap::new(),
             drag: None,
             moving: None,
             sizing: None,
@@ -1794,7 +1790,6 @@ impl Model {
             quest: None,
             quest_selects: Vec::new(),
             quest_actions: Vec::new(),
-            death: death::DeathUiState::default(),
             death_actions: Vec::new(),
             quest_log: quest_log::QuestLogState::default(),
             quest_log_selection: 0,
@@ -1856,7 +1851,6 @@ impl Model {
             gm_survey: Default::default(),
             binder_confirms: 0,
             binder_pending: false,
-            summon_confirm: super::summon::SummonConfirmUiState::default(),
             summon_answers: Vec::new(),
             framerate: std::cell::Cell::new(0.0),
             modifiers: (false, false, false),

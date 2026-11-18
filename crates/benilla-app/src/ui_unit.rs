@@ -20,7 +20,7 @@ use crate::net::{
     SelfPlayer,
 };
 use crate::target::{ring_reaction, Factions, Selection};
-use crate::ui_script::{gate, UiInput};
+use crate::ui_script::{gate, UiDrain};
 
 mod held;
 
@@ -182,7 +182,7 @@ impl Plugin for UiUnitPlugin {
         )
         .add_systems(Update, feed_name_records.in_set(UnitFeed))
         .add_systems(Update, taxi_benchmark.in_set(UnitFeed))
-        .add_systems(Update, drain_pvp_toggles.after(UiInput))
+        .add_systems(Update, drain_pvp_toggles.in_set(UiDrain))
         .net_handler(
             benilla_protocol::SessionEventKind::PowerUpdate,
             on_power_update,
@@ -191,8 +191,8 @@ impl Plugin for UiUnitPlugin {
             benilla_protocol::SessionEventKind::HealthUpdate,
             on_health_update,
         )
-        .add_systems(Update, drain_worn_display_toggles.after(UiInput))
-        .add_systems(Update, drain_action_bar_toggles.after(UiInput))
+        .add_systems(Update, drain_worn_display_toggles.in_set(UiDrain))
+        .add_systems(Update, drain_action_bar_toggles.in_set(UiDrain))
         .add_systems(Update, feed_default_language.in_set(UnitFeed))
         .add_systems(Update, feed_known_languages.in_set(UnitFeed))
         .add_systems(
@@ -1104,12 +1104,13 @@ pub(crate) fn snapshot(
         in_combat: store.0.unit_flags() & crate::player::UNIT_FLAG_IN_COMBAT != 0,
         // `UnitIsPVPFreeForAll`: `UNIT_FIELD_BYTES_2` byte 1 bit `0x4` (`0x60d03c`).
         is_pvp_ffa: store.0.unit_byte2_flags() & 0x4 != 0,
-        // The honor rank, `PLAYER_BYTES_3` byte 3 (0..=18), public for every player in view.
-        pvp_rank: store.0.player_pvp_rank().unwrap_or(0),
+        // No honor rank streams: 3.3.5a's `PLAYER_BYTES_3` bytes 2 and 3 are the PvP title and the
+        // arena faction.
+        pvp_rank: 0,
         // The team digit of `PVP_RANK_<rank>_<team>`, from the race ([`race_pvp_team`]).
         pvp_team: store.0.unit_race().map_or(-1, race_pvp_team),
-        // `PLAYER_BYTES_3` byte 2, the city-protector title (`PVP_MEDAL<n>`), unset by vmangos.
-        pvp_medal: store.0.player_pvp_medal().unwrap_or(0),
+        // No city-protector medal streams: 3.3.5a's `PLAYER_BYTES_3` byte 2 is the PvP title.
+        pvp_medal: 0,
         // `PLAYER_CHOSEN_TITLE`, public, the title `UnitPVPName` shows (`0x72a290`).
         chosen_title: store.0.player_chosen_title(),
         // `is_player` and the creature-record fields come from [`enrich_unit`].
@@ -1417,6 +1418,78 @@ pub(crate) fn fire_transitions(
     }
 }
 
+/// The opponent slots' guids then their pets' (`0x608180`, `0x60a2f0`), all zero with no arena.
+fn arena_guids(
+    arena: Option<&crate::ui_arena::ArenaOpponents>,
+    index: Option<&crate::net::GuidIndex>,
+    stores: &Query<&ObjectStore>,
+) -> Vec<u64> {
+    match (arena, index) {
+        (Some(arena), Some(index)) => {
+            let pets = arena.pets(&crate::ui_arena::pet_of(index, stores));
+            let mut guids = arena.opponents().to_vec();
+            guids.extend(pets);
+            guids
+        }
+        _ => vec![0; 2 * crate::ui_arena::ARENA_SLOTS],
+    }
+}
+
+/// The arena units, pushed just before `ARENA_OPPONENT_UPDATE` so its handler reads the slot (`0x608180`); per-token pushes are #1289.
+pub(crate) fn push_arena_units(
+    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    tables: SnapshotTables,
+    self_q: Query<&ObjectStore, With<SelfPlayer>>,
+    index: Option<Res<crate::net::GuidIndex>>,
+    stores: Query<&ObjectStore>,
+    names: Res<NameCache>,
+    commands: Res<NetCommands>,
+    factions: Option<Res<Factions>>,
+    reputations: Res<Reputations>,
+    group: Res<crate::ui_party::GroupState>,
+    (arena, instance): (
+        Option<Res<crate::ui_arena::ArenaOpponents>>,
+        crate::ui_arena::ArenaInstance,
+    ),
+) {
+    let Some(mut script) = script else {
+        return;
+    };
+    let held = held::HeldUnits {
+        names: &names,
+        commands: &commands,
+        factions: factions.as_deref(),
+        reputations: &reputations,
+        group: &group,
+        self_store: self_q.iter().next(),
+        classes: tables.classes(),
+        types: tables.types(&names),
+        loot_lists: tables.loot_lists(),
+        arena: instance.active(),
+    };
+    let guids = arena_guids(arena.as_deref(), index.as_deref(), &stores);
+    let mut slots = [0; crate::ui_arena::ARENA_SLOTS];
+    let mut pets = [0; crate::ui_arena::ARENA_SLOTS];
+    slots.copy_from_slice(&guids[..crate::ui_arena::ARENA_SLOTS]);
+    pets.copy_from_slice(&guids[crate::ui_arena::ARENA_SLOTS..]);
+    let count = arena
+        .as_deref()
+        .map_or(0, crate::ui_arena::ArenaOpponents::count);
+    script.set_arena_unit_guids(slots, pets, count);
+    let tokens = crate::ui_arena::ARENA_TOKENS
+        .into_iter()
+        .chain(crate::ui_arena::ARENA_PET_TOKENS);
+    for (token, &guid) in tokens.zip(&guids) {
+        let state = index
+            .as_ref()
+            .and_then(|i| i.0.get(&guid))
+            .and_then(|&e| stores.get(e).ok())
+            .filter(|_| guid != 0)
+            .map(|store| held.state(store, guid));
+        script.set_unit(token, state);
+    }
+}
+
 /// The sources `feed_units` snapshots besides the selection: the `"npc"` and `"questnpc"` units,
 /// the encounter's `"bossN"` and the arena's `"arenaN"` and `"arenapetN"`.
 #[derive(bevy::ecs::system::SystemParam)]
@@ -1451,7 +1524,11 @@ fn feed_units(
     mut guild: ResMut<crate::ui_guild::GuildState>,
     mut interact: Interactions,
     // Rested billing minutes, sent only in `SMSG_AUTH_RESPONSE`; the reference keeps a global.
-    entered_world: Option<MessageReader<crate::net::EnteredWorldMessage>>,
+    // The commands carry the world-enter cascade's death part.
+    (entered_world, mut deferred): (
+        Option<MessageReader<crate::net::EnteredWorldMessage>>,
+        Commands,
+    ),
 ) {
     let Some(mut script) = script else {
         return;
@@ -1817,6 +1894,9 @@ fn feed_units(
             // (`0x5d1bfa`) with the player seated, which re-shows the XP bar the pre-player
             // `SMSG_INITIALIZE_FACTIONS` fire hid at a 0 maximum.
             script.fire_event("UPDATE_FACTION", vec![]);
+            // The battlefield entry (`0x528230`), ahead of the corpse reset (`0x528362`) and our create's refresh (`0x6e818b`).
+            crate::ui_battlefield::queue_enter_world(&mut deferred);
+            crate::death::queue_enter_world(&mut deferred);
             memo.entered_world = true;
         }
     } else if memo.entered_world {
@@ -1842,15 +1922,7 @@ fn feed_units(
         })
         .collect();
     // `"arenaN"` then `"arenapetN"`: each slot's unit while held, read as `"bossN"` is.
-    let arena_guids = match (interact.arena.as_deref(), index.as_deref()) {
-        (Some(arena), Some(index)) => {
-            let pets = arena.pets(&crate::ui_arena::pet_of(index, &stores.all));
-            let mut guids = arena.opponents().to_vec();
-            guids.extend(pets);
-            guids
-        }
-        _ => vec![0; 2 * crate::ui_arena::ARENA_SLOTS],
-    };
+    let arena_guids = arena_guids(interact.arena.as_deref(), index.as_deref(), &stores.all);
     let arenas: Vec<Option<UnitState>> = arena_guids
         .iter()
         .map(|&guid| {
@@ -2226,11 +2298,11 @@ mod tests {
             )
         };
         // `UNIT_FIELD_BYTES_2` 164, `UNIT_FIELD_FLAGS` 46.
-        let s = snap(&[(164, 0x05 << 8)]);
+        let s = snap(&[(benilla_protocol::field::FIELD_UNIT_BYTES_2, 0x05 << 8)]);
         assert!(s.pvp && s.is_pvp_ffa);
-        let s = snap(&[(164, 0x01 << 8)]);
+        let s = snap(&[(benilla_protocol::field::FIELD_UNIT_BYTES_2, 0x01 << 8)]);
         assert!(s.pvp && !s.is_pvp_ffa);
-        let s = snap(&[(46, 0x1000)]);
+        let s = snap(&[(benilla_protocol::field::FIELD_UNIT_FLAGS, 0x1000)]);
         assert!(!s.pvp && !s.is_pvp_ffa, "the 1.12 bits are not read");
     }
 
@@ -2283,8 +2355,8 @@ mod tests {
         const ME: u64 = 0x10;
         const MY_PET: u64 = 0xF140_0000_0000_0010;
         /// `UNIT_FIELD_CHARM` and `UNIT_FIELD_SUMMON`, each a two-field guid.
-        const CHARM: u16 = 6;
-        const SUMMON: u16 = 8;
+        const CHARM: u16 = benilla_protocol::field::FIELD_UNIT_CHARM;
+        const SUMMON: u16 = benilla_protocol::field::FIELD_UNIT_SUMMON;
 
         /// The `i`-th party member (1-based), `0x1000 + i`, and its pet.
         fn member(i: u64) -> u64 {
@@ -2620,13 +2692,13 @@ mod tests {
         const GONE: u64 = 0xF130_0000_0000_0099;
 
         /// `OBJECT_FIELD_TYPE`, and the masks the object manager's typemask test reads.
-        const OBJECT_TYPE: u16 = 2;
+        const OBJECT_TYPE: u16 = benilla_protocol::field::FIELD_OBJECT_TYPE;
         const PLAYER: u32 = 0x19;
         const UNIT: u32 = 0x09;
         const GAME_OBJECT: u32 = 0x21;
         /// `UNIT_FIELD_SUMMON` and `UNIT_FIELD_TARGET`, each a two-field guid.
-        const SUMMON: u16 = 8;
-        const TARGET: u16 = 16;
+        const SUMMON: u16 = benilla_protocol::field::FIELD_UNIT_SUMMON;
+        const TARGET: u16 = benilla_protocol::field::FIELD_UNIT_TARGET;
 
         fn fields(kind: u32, summon: u64, target: u64) -> ObjectStore {
             let mut pairs = vec![(OBJECT_TYPE, kind)];
@@ -2869,10 +2941,10 @@ mod tests {
         const MOB: u64 = 0xF130_0000_0000_0001;
         const A_PET: u64 = 0xF140_0000_0000_1001;
         /// `OBJECT_FIELD_TYPE`, `UNIT_FIELD_SUMMON`, `UNIT_FIELD_TARGET` and `UNIT_FIELD_FLAGS`.
-        const OBJECT_TYPE: u16 = 2;
-        const SUMMON: u16 = 8;
-        const TARGET: u16 = 16;
-        const FLAGS: u16 = 46;
+        const OBJECT_TYPE: u16 = benilla_protocol::field::FIELD_OBJECT_TYPE;
+        const SUMMON: u16 = benilla_protocol::field::FIELD_UNIT_SUMMON;
+        const TARGET: u16 = benilla_protocol::field::FIELD_UNIT_TARGET;
+        const FLAGS: u16 = benilla_protocol::field::FIELD_UNIT_FLAGS;
         /// `UNIT_FIELD_FLAGS` bit 1 (NON_ATTACKABLE), which `can_attack` refuses.
         const NON_ATTACKABLE: u32 = 1 << 1;
 
@@ -3028,8 +3100,8 @@ mod tests {
     fn the_team_digit_comes_off_the_race_byte_not_the_faction_template() {
         use benilla_protocol::ObjectFields;
         /// `UNIT_FIELD_FACTIONTEMPLATE` and `UNIT_FIELD_BYTES_0` (`[obj+0x110]+0x74`, `+0x78`).
-        const FACTIONTEMPLATE: u16 = 35;
-        const BYTES_0: u16 = 36;
+        const FACTIONTEMPLATE: u16 = benilla_protocol::field::FIELD_UNIT_FACTIONTEMPLATE;
+        const BYTES_0: u16 = benilla_protocol::field::FIELD_UNIT_BYTES_0;
         /// vmangos's GM template: `FactionTemplate.dbc` group mask 0.
         const GM_TEMPLATE: u32 = 35;
 
@@ -3234,7 +3306,7 @@ mod tests {
     #[test]
     fn the_far_sight_edge_fires_on_every_change() {
         use bevy::prelude::*;
-        const FIELD_PLAYER_FARSIGHT: u16 = 712;
+        const FIELD_PLAYER_FARSIGHT: u16 = benilla_protocol::field::FIELD_PLAYER_FARSIGHT;
         let mut app = App::new();
         app.add_systems(Update, feed_farsight_focus);
         let script = UiScript::new().unwrap();
@@ -3507,7 +3579,7 @@ mod tests {
     #[test]
     fn the_self_flag_events_each_fire_on_their_own_bits() {
         use bevy::ecs::system::RunSystemOnce;
-        const FIELD_PLAYER_FLAGS: u16 = 190;
+        const FIELD_PLAYER_FLAGS: u16 = benilla_protocol::field::FIELD_PLAYER_FLAGS;
 
         let mut app = App::new();
         app.add_message::<FieldChanged>();
@@ -3625,7 +3697,7 @@ mod tests {
 
         /// `UNIT_FIELD_FLAGS` bit 1 (NON_ATTACKABLE), which `can_attack` refuses.
         const NON_ATTACKABLE: u32 = 1 << 1;
-        const FIELD_UNIT_FLAGS: u16 = 46;
+        const FIELD_UNIT_FLAGS: u16 = benilla_protocol::field::FIELD_UNIT_FLAGS;
         const ME: u64 = 0x0000_0000_0000_0001;
         const BOAR: u64 = 0xF130_0000_0000_0002;
         const FRIEND: u64 = 0x0000_0000_0000_0003;
@@ -3739,11 +3811,11 @@ mod tests {
         use benilla_protocol::messages::ObjectFields;
 
         /// `UNIT_FIELD_HEALTH` / `MAXHEALTH` / `POWER1` / `MAXPOWER1` / `DYNAMIC_FLAGS`.
-        const HEALTH: u16 = 22;
-        const POWER1: u16 = 23;
-        const MAXHEALTH: u16 = 28;
-        const MAXPOWER1: u16 = 29;
-        const DYNFLAGS: u16 = 143;
+        const HEALTH: u16 = benilla_protocol::field::FIELD_UNIT_HEALTH;
+        const POWER1: u16 = benilla_protocol::field::FIELD_UNIT_POWER1;
+        const MAXHEALTH: u16 = benilla_protocol::field::FIELD_UNIT_MAXHEALTH;
+        const MAXPOWER1: u16 = benilla_protocol::field::FIELD_UNIT_MAXPOWER1;
+        const DYNFLAGS: u16 = benilla_protocol::field::FIELD_UNIT_DYNAMIC_FLAGS;
 
         let vitals = [
             (HEALTH, 1200),
@@ -3806,7 +3878,7 @@ mod tests {
         const ENTRY: u32 = 12397; // Ol' Sooty, a rank-1 elite
         const GUID: u64 = (0xF130u64 << 48) | ((ENTRY as u64) << 24) | 0x42;
         /// `UNIT_FIELD_PETNUMBER`, absolute descriptor index (`OBJECT_END(6) + 0x85`).
-        const PETNUMBER: u16 = 139;
+        const PETNUMBER: u16 = benilla_protocol::field::FIELD_UNIT_PETNUMBER;
 
         let mut names = NameCache::default();
         names.insert_creature(
@@ -3863,7 +3935,10 @@ mod tests {
         let catalog = benilla_formats::load_faction_catalog(&mut chain).expect("Faction.dbc");
         let factions = crate::target::Factions::from_catalog(catalog);
         let side = |race: u32| {
-            let gm = ObjectStore(ObjectFields::from_pairs(&[(36, race), (35, 35)]));
+            let gm = ObjectStore(ObjectFields::from_pairs(&[
+                (benilla_protocol::field::FIELD_UNIT_BYTES_0, race),
+                (benilla_protocol::field::FIELD_UNIT_FACTIONTEMPLATE, 35),
+            ]));
             assert_eq!(
                 faction_group(&gm, Some(&factions)),
                 None,
@@ -3888,8 +3963,8 @@ mod tests {
         let factions = crate::target::Factions::from_catalog(catalog);
 
         /// `UNIT_FIELD_FACTIONTEMPLATE` and `UNIT_FIELD_BYTES_0`, absolute descriptor indices.
-        const FACTIONTEMPLATE: u16 = 35;
-        const BYTES_0: u16 = 36;
+        const FACTIONTEMPLATE: u16 = benilla_protocol::field::FIELD_UNIT_FACTIONTEMPLATE;
+        const BYTES_0: u16 = benilla_protocol::field::FIELD_UNIT_BYTES_0;
         /// Race 1 and class 1 in `UNIT_FIELD_BYTES_0` bytes 0 and 1, for the slot walk.
         const HUMAN_WARRIOR: u32 = 1 | (1 << 8);
         /// A creature entry the cache is never told about.
@@ -4042,7 +4117,7 @@ mod tests {
         use crate::ui_session::InteractNpc;
         use benilla_protocol::messages::ObjectFields;
 
-        const FIELD_UNIT_LEVEL: u16 = 34;
+        const FIELD_UNIT_LEVEL: u16 = benilla_protocol::field::FIELD_UNIT_LEVEL;
         // Two `HIGHGUID_UNIT` guids: the high word decides the family.
         const BROG: u64 = 0xF130_0000_9700_0001;
         const DOBBINS: u64 = 0xF130_0001_D100_0002;
@@ -4123,9 +4198,9 @@ mod tests {
 
         /// `UNIT_FIELD_BYTES_0` and `UNIT_FIELD_BYTES_1`, absolute descriptor indices, and
         /// `OBJECT_FIELD_ENTRY`.
-        const BYTES_0: u16 = 36;
-        const BYTES_2: u16 = 164;
-        const OBJECT_FIELD_ENTRY: u16 = 3;
+        const BYTES_0: u16 = benilla_protocol::field::FIELD_UNIT_BYTES_0;
+        const BYTES_2: u16 = benilla_protocol::field::FIELD_UNIT_BYTES_2;
+        const OBJECT_FIELD_ENTRY: u16 = benilla_protocol::field::FIELD_OBJECT_ENTRY;
         const NIGHT_ELF: u32 = 4;
         const CAT_FORM: u32 = 1;
         /// A row whose type is -1 in the shipped table.

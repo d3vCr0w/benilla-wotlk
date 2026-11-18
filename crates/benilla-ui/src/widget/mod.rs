@@ -125,13 +125,13 @@ pub use kinds::{
     ButtonVisualState, ColorSelectState, CooldownFlash, CooldownPaint, CooldownState, CooldownStep,
     EditAction, EditBoxState, EditOutcome, EditUnit, FrameKind, InsertMode, KindState,
     MessageFrameState, MessageLine, MinimapState, ModelFileFacts, ModelFog, ModelLight,
-    ModelPlayHead, ModelState, QuestBlobCache, QuestBlobMesh, QuestBlobPaint, QuestPoiState,
-    RegionKind, ScrollFrameState, ScrollingMessageState, SequenceFacts, SliderState,
-    StatusBarState, TooltipAnchor, TooltipState, CLICK_LEFT_UP, COOLDOWN_FLASH_MS,
-    COOLDOWN_FLASH_RGB, COOLDOWN_SWIPE_ALPHA, MINIMAP_DEFAULT_ARROW_MODEL, MINIMAP_DEFAULT_MASK,
-    MINIMAP_DEFAULT_PLAYER_MODEL, MINIMAP_DEFAULT_ZOOM, MINIMAP_ENGINE_CHILDREN,
-    MINIMAP_ZOOM_LEVELS, TOOLTIP_DOUBLE_GAP, TOOLTIP_FADE_SECS, TOOLTIP_LINE_GAP, TOOLTIP_PAD,
-    TOOLTIP_TEXTURE_GAP, TOOLTIP_TEXTURE_SLOTS, TOOLTIP_WRAP_WIDTH,
+    ModelPlayHead, ModelState, MovieCaption, MovieState, QuestBlobCache, QuestBlobMesh,
+    QuestBlobPaint, QuestPoiState, RegionKind, ScrollFrameState, ScrollingMessageState,
+    SequenceFacts, SliderState, StatusBarState, TooltipAnchor, TooltipState, CLICK_LEFT_UP,
+    COOLDOWN_FLASH_MS, COOLDOWN_FLASH_RGB, COOLDOWN_SWIPE_ALPHA, MINIMAP_DEFAULT_ARROW_MODEL,
+    MINIMAP_DEFAULT_MASK, MINIMAP_DEFAULT_PLAYER_MODEL, MINIMAP_DEFAULT_ZOOM,
+    MINIMAP_ENGINE_CHILDREN, MINIMAP_ZOOM_LEVELS, TOOLTIP_DOUBLE_GAP, TOOLTIP_FADE_SECS,
+    TOOLTIP_LINE_GAP, TOOLTIP_PAD, TOOLTIP_TEXTURE_GAP, TOOLTIP_TEXTURE_SLOTS, TOOLTIP_WRAP_WIDTH,
 };
 
 // ── Frame and Region nodes ───────────────────────────────────────────────────────────────────
@@ -204,6 +204,12 @@ pub struct Frame {
     pub clamped_to_screen: bool,
     /// `IgnoreDepth` (`0x4a1d80`, `+0xcc`), the opt-out from the UI's stereo depth.
     pub ignore_depth: bool,
+    /// `SetDepth` (`0x4a1c40`, `+0xc4`, default 0): the frame's stereo depth, added to its
+    /// ancestors' for `GetEffectiveDepth`. Stored, not drawn: benilla renders no stereo UI.
+    pub depth: f32,
+    /// `SetDontSavePosition`, frame flag `0x80000`, also XML `dontSavePosition`. Stored: no reader
+    /// of the flag is traced in 12340.
+    pub dont_save_position: bool,
     /// `SetClampRectInsets` (`0x48eb00`), `[left, right, top, bottom]` in frame units: the clamp
     /// (`0x48944e`) lets the frame that far past each screen edge, scaled by the frame's scale.
     pub clamp_rect_insets: [f32; 4],
@@ -578,6 +584,8 @@ impl WidgetArena {
             keyboard_enabled: kind == FrameKind::EditBox,
             clamped_to_screen: matches!(kind, FrameKind::GameTooltip),
             ignore_depth: false,
+            depth: 0.0,
+            dont_save_position: false,
             clamp_rect_insets: [0.0; 4],
             hit_rect_insets: [0.0; 4],
             movable: false,
@@ -616,6 +624,7 @@ impl WidgetArena {
                 FrameKind::GameTooltip => KindState::Tooltip(kinds::TooltipState::default()),
                 FrameKind::Cooldown => KindState::Cooldown(CooldownState::default()),
                 FrameKind::QuestPoiFrame => KindState::QuestPoi(kinds::QuestPoiState::default()),
+                FrameKind::MovieFrame => KindState::Movie(kinds::MovieState::default()),
                 _ => KindState::None,
             },
             next_decl: 0,

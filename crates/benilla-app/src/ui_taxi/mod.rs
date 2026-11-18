@@ -1,5 +1,5 @@
 //! The taxi map's app side: [`TaxiState`] holds the `SMSG_SHOWTAXINODES` map and the one-shot
-//! replies, [`feed_taxi`] pushes the known nodes on the current node's continent with their
+//! replies, [`feed_taxi`] pushes the known nodes on the map the current node draws on with their
 //! routes (built in [`routing`]) and fires the map events, and [`drain_taxi`] sends the activate.
 
 use benilla_protocol::messages::TaxiMask;
@@ -9,11 +9,13 @@ use benilla_ui::script::{TaxiUiState, UiScript};
 
 use crate::names::NameCache;
 use crate::net::{ClientCommand, GuidIndex, NetCommands, ObjectStore, SelfPlayer};
-use crate::ui_script::{UiFeed, UiInput};
+use crate::ui_script::{UiDrain, UiFeed};
 use crate::ui_session::{close_npc_session_out_of_range, NpcSession};
 
 mod routing;
-use routing::{build_nodes, load_taxi_catalogs, taxi_error_key, TaxiCatalogs, TaxiRouteCache};
+use routing::{
+    build_nodes, load_taxi_catalogs, taxi_error_key, TaxiCatalogs, TaxiFares, TaxiRouteCache,
+};
 
 /// The open map, `SMSG_SHOWTAXINODES` as the wire gave it.
 pub(crate) struct TaxiOpen {
@@ -95,6 +97,7 @@ fn feed_taxi(
     stores: Query<&ObjectStore>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
     reactions: crate::target::ReactionInputs,
+    expansion: Res<crate::net::AccountExpansion>,
     mut last: Local<crate::ui_script::VmMemo<Option<TaxiUiState>>>,
     mut last_name: Local<crate::ui_script::VmMemo<Option<String>>>,
     mut sink: crate::ui_action::MessageSink,
@@ -168,23 +171,25 @@ fn feed_taxi(
         return;
     };
 
-    // The continent is the current node's own, as the packet left it (`build_nodes`). The fares
-    // take the flight master's price discount for the player.
+    // The map is the one the current node draws on (`build_nodes`). The fares need the flight
+    // master and the player ([`taxi_fares`]); the player's faction group bars the other team's
+    // nodes from the route walk (`0x5926c0`).
     let fresh = state.open.as_ref().and_then(|open| {
         let flightmaster = index
             .0
             .get(&open.flightmaster)
             .and_then(|&e| stores.get(e).ok());
-        let discount = flightmaster.zip(self_q.iter().next()).map(|(master, me)| {
-            crate::target::vendor_price_discount(
-                reactions.factions.as_deref(),
-                &reactions.reputations,
-                reactions.party(),
-                master,
-                me,
-            )
-        });
-        let (map_id, nodes, resolved) = build_nodes(open, &catalogs, discount)?;
+        let me = self_q.iter().next();
+        let fares = flightmaster
+            .zip(me)
+            .map(|(master, me)| taxi_fares(&reactions, master, me));
+        let catalog = reactions.factions.as_deref().map(|f| f.catalog());
+        let player_group = catalog
+            .zip(me.and_then(|me| me.0.unit_faction_template()))
+            .and_then(|(c, t)| c.template(t))
+            .map(|t| t.group_mask);
+        let (map_id, nodes, resolved) =
+            build_nodes(open, &catalogs, fares, player_group, expansion.0)?;
         cache.0 = resolved;
         Some(TaxiUiState {
             art: format!("Interface\\TaxiFrame\\TAXIMAP{map_id}"),
@@ -220,9 +225,45 @@ fn feed_taxi(
     }
 }
 
+/// What the Lua `TaxiNodeCost`'s fare (`0x591350`) reads off the flight master and the player: the
+/// price discount (`0x7279a0`), and the fare tier from the flight master's reaction toward the
+/// player (`0x7251c0`), read as Neutral when its faction has no reputation slot
+/// (`0x718b30`, on its template's faction).
+fn taxi_fares(
+    reactions: &crate::target::ReactionInputs,
+    master: &ObjectStore,
+    me: &ObjectStore,
+) -> TaxiFares {
+    let factions = reactions.factions.as_deref();
+    let reaction = crate::target::ring_reaction(
+        factions,
+        &reactions.reputations,
+        reactions.party(),
+        Some(master),
+        Some(me),
+    );
+    let has_reputation = factions.is_some_and(|f| {
+        master
+            .0
+            .unit_faction_template()
+            .and_then(|t| f.catalog().template(t))
+            .is_some_and(|t| f.catalog().reputation_faction(t.faction).is_some())
+    });
+    TaxiFares {
+        discount: crate::target::vendor_price_discount(
+            factions,
+            &reactions.reputations,
+            reactions.party(),
+            master,
+            me,
+        ),
+        tier: TaxiFares::tier_of(reaction, has_reputation),
+    }
+}
+
 /// Drain the Lua intents. `TakeTaxiNode(i)` sends `CMSG_ACTIVATETAXI` when a direct `TaxiPath` edge
-/// joins the current node and the target, even if the drawn route detours, and otherwise
-/// `CMSG_ACTIVATETAXIEXPRESS` with the chain and its fare, as the reference's test decides; the
+/// joins the current node and the target, as its one drawn segment shows, and otherwise
+/// `CMSG_ACTIVATETAXIEXPRESS` with the chain, as the reference's test decides; the
 /// `Current` node sends nothing. `CloseTaxiMap()` clears locally, with no packet.
 fn drain_taxi(
     (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
@@ -267,7 +308,6 @@ fn drain_taxi(
             );
             let _ = commands.0.send(ClientCommand::ActivateTaxiExpress {
                 guid: open.flightmaster,
-                total_cost: resolved.cost,
                 nodes: chain.to_vec(),
             });
         }
@@ -294,7 +334,7 @@ impl Plugin for UiTaxiPlugin {
                     // Range-close first so the clear fires `TAXIMAP_CLOSED` the same frame.
                     close_npc_session_out_of_range::<TaxiState>.before(feed_taxi),
                     feed_taxi.in_set(UiFeed),
-                    drain_taxi.after(UiInput),
+                    drain_taxi.in_set(UiDrain),
                 ),
             );
     }
@@ -306,19 +346,16 @@ mod tests {
     use benilla_protocol::field::FIELD_UNIT_FLAGS;
     use benilla_protocol::ObjectFields;
 
-    /// The map's fares take the flight master's discount and the express leg sends the raw route
-    /// sum. Honored, a PvP-flagged flight master and honor rank byte 6 make 0.15: Sentinel Hill's
-    /// direct 110 shows 94, and Thelsamar's route through Ironforge, 50 + 110, shows 136 and sends
-    /// 160.
-    /// With the flight master unresolved the fares show 0.
+    /// The map's fares take the flight master's discount and the express leg sends the chain alone.
+    /// Honored makes 0.1, as no 3.3.5a field carries an honor rank: Sentinel Hill's direct 110
+    /// shows 99, and Thelsamar's route through Ironforge, 50 + 110, shows 144 and sends its three
+    /// nodes. With the flight master unresolved the fares show 0.
     #[test]
-    fn the_map_shows_discounted_fares_and_the_express_sends_the_raw_sum() {
+    fn the_map_shows_discounted_fares_and_the_express_sends_the_chain() {
         use benilla_protocol::field::FIELD_UNIT_FACTIONTEMPLATE;
         use bevy::ecs::system::RunSystemOnce;
 
-        /// `UNIT_FIELD_BYTES_0`, `PLAYER_BYTES_3`: absolute descriptor indices.
-        const BYTES_0: u16 = 36;
-        const PLAYER_BYTES_3: u16 = 195;
+        const BYTES_0: u16 = benilla_protocol::field::FIELD_UNIT_BYTES_0;
         const MASTER: u64 = 0xF130_0000_0000_0099;
 
         let data = benilla_formats::wow_data_or_skip!();
@@ -335,16 +372,17 @@ mod tests {
             .init_resource::<crate::ui_chat::ChatLog>()
             .init_resource::<crate::sound::MessageSounds>()
             .insert_resource(NetCommands(tx))
+            .insert_resource(crate::net::AccountExpansion(2))
             .insert_resource(catalogs)
             .insert_resource(factions)
             .insert_resource(reps)
             .insert_non_send_resource(UiScript::new().unwrap());
         app.world_mut().spawn((
             SelfPlayer,
-            ObjectStore(ObjectFields::from_pairs(&[
-                (BYTES_0, crate::target::HUMAN_WARRIOR),
-                (PLAYER_BYTES_3, 6 << 24),
-            ])),
+            ObjectStore(ObjectFields::from_pairs(&[(
+                BYTES_0,
+                crate::target::HUMAN_WARRIOR,
+            )])),
         ));
         let master = app
             .world_mut()
@@ -376,10 +414,10 @@ mod tests {
                 .unwrap()
         };
         app.world_mut().run_system_once(feed_taxi).unwrap();
-        assert_eq!(node(&mut app, "Sentinel Hill, Westfall").1, 94);
-        assert_eq!(node(&mut app, "Ironforge, Dun Morogh").1, 42);
+        assert_eq!(node(&mut app, "Sentinel Hill, Westfall").1, 99);
+        assert_eq!(node(&mut app, "Ironforge, Dun Morogh").1, 45);
         let (thelsamar, shown) = node(&mut app, "Thelsamar, Loch Modan");
-        assert_eq!(shown, 136);
+        assert_eq!(shown, 144);
 
         app.world_mut()
             .non_send_resource_mut::<UiScript>()
@@ -399,10 +437,9 @@ mod tests {
         assert!(
             matches!(
                 sent.as_slice(),
-                [ClientCommand::ActivateTaxiExpress { total_cost: 160, nodes, .. }]
-                    if nodes == &[2, 6, 8]
+                [ClientCommand::ActivateTaxiExpress { nodes, .. }] if nodes == &[2, 6, 8]
             ),
-            "the express carries the undiscounted sum, got {sent:?}"
+            "the express carries the chain, got {sent:?}"
         );
 
         app.world_mut()

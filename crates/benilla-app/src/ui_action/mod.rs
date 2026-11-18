@@ -11,7 +11,7 @@ use bevy::prelude::*;
 use benilla_formats::SpellCatalog;
 use benilla_protocol::messages::ActionButton;
 
-use crate::ui_script::UiInput;
+use crate::ui_script::UiDrain;
 use crate::ui_unit::UnitFeed;
 use benilla_assets::{AssetSet, LockRecover, WorldAssets};
 
@@ -65,8 +65,8 @@ pub(crate) struct ActionRanks;
 
 pub(crate) use errors::{
     attack_actor_blocked, attack_actor_refusal, keyed_line, keyed_line_s, reagent_totem_refusal,
-    show_messages, ui_error_text, CastErrors, CastFail, Caster, FillArg, MessageSink, MountErrors,
-    PetTameFailures, Shown, ToolCheck, UiError, UiErrorKeys, UiErrorTexts,
+    show_in_turn, show_messages, ui_error_text, CastErrors, CastFail, Caster, FillArg, MessageSink,
+    MountErrors, PetTameFailures, Shown, ToolCheck, UiError, UiErrorKeys, UiErrorTexts,
 };
 pub(crate) use weapon_icon::{melee_auto_attack_icon, ranged_weapon_icon};
 
@@ -487,10 +487,10 @@ impl Plugin for UiActionPlugin {
                     state::fire_combat_edges
                         .in_set(UnitFeed)
                         .after(CooldownEvents),
-                    drain::drain_action_sets.after(UiInput),
-                    equipment_sets::drain_equipment_sets.after(UiInput),
+                    drain::drain_action_sets.in_set(UiDrain),
+                    equipment_sets::drain_equipment_sets.in_set(UiDrain),
                     // The target chain queues the openers earlier in the frame.
-                    drain::drain_go_openers.after(UiInput),
+                    drain::drain_go_openers.in_set(UiDrain),
                     // The latches must be current before the target chain's cursor reads them.
                     track_learned_abilities
                         .in_set(UnitFeed)

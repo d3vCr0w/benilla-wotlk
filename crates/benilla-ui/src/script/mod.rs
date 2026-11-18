@@ -84,7 +84,7 @@ mod battlefield_queue;
 mod battlefield_score;
 mod bind_confirm;
 mod binder;
-mod binding_abi;
+pub(crate) mod binding_abi;
 mod binding_commands;
 mod dialog_verbs;
 pub mod focus;
@@ -168,6 +168,7 @@ pub use glue_realm::{
 };
 pub use glue_select::{GlueCharacter, GlueScenePane, GlueSelectCells};
 pub use glue_system::{GlueBilling, GlueFileReader, ScanDll};
+pub use movieframe::{MovieHost, MovieTick};
 mod gm_ticket;
 mod gossip;
 mod guild;
@@ -299,7 +300,8 @@ pub use addon::AddOnInfo;
 pub use addon_enable::{EnableHash, EnableLists};
 pub use addon_message::{AddonDistribution, AddonSend};
 pub use arena_team::{
-    ArenaTeamMemberView, ArenaTeamRecordView, ArenaTeamRequest, ArenaTeamSlotView,
+    ArenaTeamMemberRef, ArenaTeamMemberView, ArenaTeamRecordView, ArenaTeamRequest,
+    ArenaTeamSlotView,
 };
 pub use auction::{
     AuctionBid, AuctionCategory, AuctionHighBidder, AuctionItemRow, AuctionListState, AuctionQuery,
@@ -310,14 +312,14 @@ pub(crate) use backdrop::set_edge_blend as backdrop_set_edge_blend;
 pub use backdrop::{inset_atlas_bleed, pieces, Backdrop, BackdropPiece, Insets};
 pub use bank::BankState;
 pub use barber::{BarberHost, BarberIntent, BarberStyle};
-pub use battlefield_positions::{BattlefieldFlagView, BattlefieldPositionView};
+pub use battlefield_positions::{BattlefieldFlagLive, BattlefieldPositionLive};
 pub use battlefield_queue::{
-    BattlefieldFrame, BattlefieldJoin, BattlefieldListPush, BattlefieldMgrRequest,
-    BattlefieldQueueSlot, BattlefieldRewardView, BattlemasterRow, WorldPvpQueueView,
-    INSTANCE_TYPE_ARENA, RANDOM_BATTLEGROUND,
+    BattlefieldInstance, BattlefieldJoin, BattlefieldListPush, BattlefieldMgrRequest,
+    BattlefieldQueueSlot, BattlefieldRewardView, BattlegroundType, BattlemasterRow,
+    WorldPvpQueueView, INSTANCE_TYPE_ARENA, RANDOM_BATTLEGROUND,
 };
 pub use battlefield_score::{
-    BattlefieldScoreRow, BattlefieldScores, BattlefieldStatColumn, BattlefieldTeamView,
+    BattlefieldScoreRow, BattlefieldScores, BattlefieldStatColumn, BattlefieldTeamView, ScoreName,
 };
 pub use bind_confirm::PendingEquipAnswer;
 pub use calls::{CastAt, NearestMode, ScriptCall};
@@ -357,7 +359,7 @@ pub use cvars::{
     MultisampleFormat, ScreenMode, ScreenResolution, SeededCvar, VideoCaps, CVAR_GAMMA,
     IN_WORLD_READ_ONLY_CVARS, VIDEO_EFFECTS_DEFAULT_CVARS, VIDEO_RESOLUTION_DEFAULT_CVARS,
 };
-pub use death::{DeathAction, DeathUiState};
+pub use death::DeathAction;
 pub use dressup::DressUpIntent;
 pub use duel::DuelRequest;
 pub use follow::FollowRequest;
@@ -451,7 +453,7 @@ pub use multicast::MultiCastView;
 pub use party::{PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo, SavedInstanceInfo};
 pub use pet::{PetActionView, PetStats, PossessView};
 pub use pvp::{
-    pvp_name_global_keys, HonorState, InspectArenaTeamView, InspectHonorData, RankTitle,
+    pvp_name_global_keys, HonorState, InspectArenaTeamWords, InspectHonorData, RankTitle,
     PLAYER_FLAGS_PVP_TIMER,
 };
 pub use quest::{
@@ -480,7 +482,6 @@ pub use spellbook::{
     resolve_spell_by_name, PetBookState, SpellBookState, SpellSlotView, SpellTabView,
 };
 pub use stable::{StableIntent, StablePetSlot, StableState, NUM_STABLE_SLOTS};
-pub use summon::SummonConfirmUiState;
 pub use talent::{
     TalentGroupView, TalentPrereqView, TalentRankView, TalentTabView, TalentUiState, TalentView,
 };
@@ -565,7 +566,7 @@ pub(crate) const REGION_LEAF_SHARED: [&str; 9] = [
 /// Texture-only, each in the client's Texture map: `GetVertexColor` though `SetVertexColor` is
 /// shared, and `SetGradientAlpha`, not FontString's `SetAlphaGradient`. No Texture `SetSize`;
 /// 3.3.5a's `SetRotation` is `0x48c860`.
-pub(crate) const TEXTURE_ONLY_METHODS: [&str; 13] = [
+pub(crate) const TEXTURE_ONLY_METHODS: [&str; 20] = [
     "SetGradient",
     "SetGradientAlpha",
     "GetTexture",
@@ -579,12 +580,18 @@ pub(crate) const TEXTURE_ONLY_METHODS: [&str; 13] = [
     "SetDesaturated",
     "GetVertexColor",
     "SetRotation",
+    "IsDesaturated",
+    "SetHorizTile",
+    "GetHorizTile",
+    "SetVertTile",
+    "GetVertTile",
+    "SetNonBlocking",
+    "GetNonBlocking",
 ];
 
-/// FontString-only: the font, text, justify and shadow block and the string metrics.
-/// `GetStringHeight`, `SetFormattedText` and `SetSize` are not 1.12 FontString methods; 3.3.5a's
-/// `SetFormattedText` goes into the leaf alone (`region::text::install_formatted`).
-pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 24] = [
+/// FontString-only: the font, text, justify and shadow block, the string metrics and the wrap
+/// flags; `SetFormattedText` goes into the leaf alone (`region::text::install_formatted`).
+pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 29] = [
     "SetFont",
     "GetFont",
     "SetFontObject",
@@ -609,11 +616,16 @@ pub(crate) const FONTSTRING_ONLY_METHODS: [&str; 24] = [
     "SetAlphaGradient",
     "SetSpacing",
     "GetSpacing",
+    "GetStringHeight",
+    "SetWordWrap",
+    "CanWordWrap",
+    "SetIndentedWordWrap",
+    "GetIndentedWordWrap",
 ];
 
 /// The Region method map: the names every region leaf reaches on a miss, 3.3.5a's `SetSize`,
 /// `GetSize` and `GetRect` (`0x49d7a0`, `0x49d6f0`, `0x49ce50`, registrar `0xac1480`) among them.
-pub(crate) const REGION_MAP_METHODS: [&str; 27] = [
+pub(crate) const REGION_MAP_METHODS: [&str; 29] = [
     "IsProtected",
     "CanChangeProtectedState",
     "GetObjectType",
@@ -641,6 +653,8 @@ pub(crate) const REGION_MAP_METHODS: [&str; 27] = [
     "CreateAnimationGroup",
     "GetAnimationGroups",
     "StopAnimating",
+    "IsDragging",
+    "IsMouseOver",
 ];
 const REG_WRAPPERS: &str = "__benilla_wrappers";
 const REG_SCRIPTS: &str = "__benilla_scripts";
@@ -751,9 +765,15 @@ const TOOLTIP_SCRIPTS: &[&str] = &[
     "OnTooltipSetEquipmentSet",
 ];
 
-/// The script names a widget type adds over [`FRAME_SCRIPTS`]. Deviation: the MovieFrame's three
-/// (`0x95db80`) are left out, as nothing fires them; MessageFrame, Minimap, Cooldown, QuestPOIFrame
-/// and the world frame keep the frame's table in their vtables.
+/// A MovieFrame's own scripts (`0x95db80`).
+const MOVIEFRAME_SCRIPTS: &[&str] = &[
+    "OnMovieFinished",
+    "OnMovieShowSubtitle",
+    "OnMovieHideSubtitle",
+];
+
+/// The script names a widget type adds over [`FRAME_SCRIPTS`]. MessageFrame, Minimap, Cooldown,
+/// QuestPOIFrame and the world frame keep the frame's table in their vtables.
 fn type_scripts(kind: crate::widget::FrameKind) -> &'static [&'static str] {
     use crate::widget::FrameKind as K;
     match kind {
@@ -765,10 +785,10 @@ fn type_scripts(kind: crate::widget::FrameKind) -> &'static [&'static str] {
         K::ColorSelect => COLORSELECT_SCRIPTS,
         K::SimpleHtml | K::ScrollingMessageFrame => HYPERLINK_SCRIPTS,
         K::GameTooltip => TOOLTIP_SCRIPTS,
+        K::MovieFrame => MOVIEFRAME_SCRIPTS,
         K::Frame
         | K::WorldFrame
         | K::MessageFrame
-        | K::MovieFrame
         | K::Minimap
         | K::Cooldown
         | K::QuestPoiFrame => &[],
@@ -1818,6 +1838,12 @@ impl UiScript {
     pub fn key_input(&mut self, key: &str) -> bool {
         // The same two stages as `char_input`.
         keyboard::key_input(&self.lua, key) || editbox::key_input(&self.lua, key)
+    }
+
+    /// A key's release by name: it goes to the keyboard frame its press went to, which runs
+    /// `OnKeyUp`. `true` if a frame took the press, which suppresses the release's binding.
+    pub fn key_up(&mut self, key: &str) -> bool {
+        keyboard::key_up(&self.lua, key)
     }
 
     /// An editing key (BACKSPACE, DELETE, the arrows, HOME, END) offered to the keyboard frames

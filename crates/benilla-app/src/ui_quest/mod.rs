@@ -18,7 +18,7 @@ use crate::items::Items;
 use crate::names::NameCache;
 use crate::net::{ClientCommand, Guid, GuidIndex, NetCommands, ObjectStore, SelfPlayer};
 use crate::ui_action::{show_messages, ui_error_text, MessageSink, Shown, Spells, UiError};
-use crate::ui_script::{UiFeed, UiInput};
+use crate::ui_script::{UiDrain, UiFeed};
 use crate::ui_session::{close_npc_session_out_of_range, npc_switched, NpcSession};
 
 /// The wire packet that opened the current panel.
@@ -246,8 +246,8 @@ impl Plugin for UiQuestPlugin {
                         .before(crate::ui_unit::UnitFeed)
                         .before(feed_quest),
                     feed_quest.after(crate::ui_unit::UnitFeed).in_set(UiFeed),
-                    drain_quest.after(UiInput),
-                    read_trivial_tracking.after(UiInput),
+                    drain_quest.in_set(UiDrain),
+                    read_trivial_tracking.in_set(UiDrain),
                 ),
             );
     }
@@ -659,7 +659,7 @@ fn decline_leg(npc: u64, acted: bool, close_on_cancel: u32, npc_flags: Option<u3
 }
 
 /// Drain the Lua intents: greeting-row selects and the panel buttons, each to its `CMSG`.
-fn drain_quest(
+pub(crate) fn drain_quest(
     (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
     mut giver: ResMut<QuestGiver>,
     commands: Res<NetCommands>,
@@ -1190,7 +1190,10 @@ mod tests {
         app.add_message::<crate::target::Interact>();
         if let Some(flags) = npc_flags {
             // 147 = `UNIT_NPC_FLAGS` (the descriptor index `unit_npc_flags()` reads).
-            let fields = benilla_protocol::ObjectFields::from_pairs(&[(147, flags)]);
+            let fields = benilla_protocol::ObjectFields::from_pairs(&[(
+                benilla_protocol::field::FIELD_UNIT_NPC_FLAGS,
+                flags,
+            )]);
             let e = app.world_mut().spawn(ObjectStore(fields)).id();
             app.world_mut()
                 .resource_mut::<GuidIndex>()

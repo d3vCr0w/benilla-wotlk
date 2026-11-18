@@ -13,7 +13,7 @@ use crate::names::NameCache;
 use crate::net::{ClientCommand, GuidIndex, NetCommands, ObjectStore, Objects, SelfPlayer};
 use crate::target::Selection;
 use crate::ui_party::GroupState;
-use crate::ui_script::{UiFeed, UiInput};
+use crate::ui_script::{UiDrain, UiFeed};
 use crate::ui_session::NpcSession;
 
 mod net;
@@ -411,7 +411,7 @@ impl Plugin for UiTradePlugin {
                     trim_offer_to_purse
                         .after(crate::ui_unit::UnitFeed)
                         .before(feed_trade),
-                    drain_trade.after(UiInput),
+                    drain_trade.in_set(UiDrain),
                 ),
             );
     }
@@ -1458,9 +1458,9 @@ mod tests {
     fn a_dead_or_ghost_initiator_is_refused() {
         // The `UNIT_FIELD_HEALTH`, `UNIT_FIELD_MAXHEALTH` and `PLAYER_FLAGS` field ids, and
         // `PLAYER_FLAGS_GHOST`.
-        const HEALTH: u16 = 22;
-        const MAXHEALTH: u16 = 28;
-        const PLAYER_FLAGS: u16 = 190;
+        const HEALTH: u16 = benilla_protocol::field::FIELD_UNIT_HEALTH;
+        const MAXHEALTH: u16 = benilla_protocol::field::FIELD_UNIT_MAXHEALTH;
+        const PLAYER_FLAGS: u16 = benilla_protocol::field::FIELD_PLAYER_FLAGS;
         const GHOST: u32 = 0x10;
         for (label, fields) in [
             ("dead", vec![(HEALTH, 0u32), (MAXHEALTH, 100)]),
