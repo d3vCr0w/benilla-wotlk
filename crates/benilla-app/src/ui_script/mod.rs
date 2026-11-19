@@ -23,7 +23,10 @@ pub(crate) mod glue_mgr;
 pub(crate) mod glue_scene;
 mod input;
 pub(crate) mod live;
-pub(crate) use live::LendLive;
+pub(crate) use live::{
+    LendLive, LentRef, OwnedMut, OwnsActions, OwnsCooldowns, OwnsPending, OwnsPetitions, OwnsPlace,
+    OwnsSelection,
+};
 #[cfg(test)]
 pub(crate) mod live_tests;
 // The press-frame tests run the input pass as a system of their own.
@@ -593,9 +596,9 @@ fn arbitrate_pointer_over_ui(
 /// The session lifecycle: the VM's birth, identity, death and reload.
 mod lifecycle;
 pub(crate) use lifecycle::{
-    end_ui_session, fire_armed_player_login, ingame_ui_up, run_pending_reload, setup_script,
-    strings_vm, AddOnIdentity, LeaveWorldSweep, LeavingWorldArmed, PendingEntryUiLoad, ReloadEntry,
-    ReloadUiPending, WorldLeaveSweepMessage,
+    end_ui_session, fire_armed_player_login, ingame_ui_up, ingame_ui_up_in, run_pending_reload,
+    setup_script, strings_vm, AddOnIdentity, LeaveWorldSweep, LeavingWorldArmed,
+    PendingEntryUiLoad, ReloadEntry, ReloadUiPending, WorldLeaveSweepMessage,
 };
 // Test-only: other modules' tests consume these, and a plain re-export would warn unused.
 #[cfg(test)]
@@ -701,11 +704,14 @@ fn demo_unit_feed(
     );
     // The combo dots need a rogue and banked points, seeded only for `ui-combopoints`.
     if std::env::var("WOW_CAPTURE").as_deref() == Ok("ui-combopoints") {
-        script.set_player_req_state(benilla_ui::script::PlayerReqState {
-            level: 12,
-            class_id: 4, // rogue
-            ..Default::default()
-        });
+        crate::dev::set_fixture_player(
+            &mut script,
+            benilla_ui::script::PlayerReqState {
+                level: 12,
+                class_id: 4, // rogue
+                ..Default::default()
+            },
+        );
         script.set_combo_points(4, DEMO_TARGET_GUID);
         script.fire_event(
             "UNIT_COMBO_POINTS",
@@ -1092,7 +1098,7 @@ mod binder_tests;
 #[cfg(test)]
 mod summon_tests;
 #[cfg(test)]
-mod test_live;
+pub(crate) mod test_live;
 
 #[cfg(test)]
 mod talent_wipe_tests;

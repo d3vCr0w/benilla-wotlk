@@ -96,17 +96,6 @@ impl QuestGiver {
         self.view = None;
     }
 
-    /// Whether the open panel has a row for `item`, which its publish asked the cache for (`0x58b8f0`).
-    pub(crate) fn view_lists_item(&self, item: u32) -> bool {
-        let rows: Box<dyn Iterator<Item = &QuestRewardItem>> = match self.view.as_ref() {
-            Some(QuestView::Detail(d)) => Box::new(d.choices.iter().chain(&d.rewards)),
-            Some(QuestView::Progress(p)) => Box::new(p.required_items.iter()),
-            Some(QuestView::Reward(o)) => Box::new(o.choices.iter().chain(&o.rewards)),
-            _ => return false,
-        };
-        rows.into_iter().any(|r| r.item_id == item)
-    }
-
     /// The open panel's title if it shows `quest_id`: the `%s` of a refusal naming the quest.
     pub(crate) fn view_title(&self, quest_id: u32) -> Option<String> {
         match self.view.as_ref()? {
@@ -523,13 +512,6 @@ pub(crate) fn publish_panel(world: &mut World) {
     });
 }
 
-/// An item answer for a row of the open panel (`0x58b8f0`): `QUEST_ITEM_UPDATE` (`0x58b92d`), the rows' verbs reading the cache at their call.
-pub(crate) fn item_landed(world: &mut World) {
-    crate::ui_script::live::with_live_world(world, |script| {
-        script.fire_event("QUEST_ITEM_UPDATE", vec![]);
-    });
-}
-
 /// The questgiver window's close (`0x58ca70`): nothing with no giver (`0x58ca85`); a decline owed to a player in view (`0x58ca91`-`0x58cb1f`); unless `keep_open`, the giver zeroed and `QUEST_FINISHED` fired (`0x58cb6b`, `0x58cb98`). The panel's text stays, as the publisher's globals do.
 pub(crate) fn giver_finished(world: &mut World, keep_open: bool, quest: u32, decline: bool) {
     let Some(giver) = world.get_non_send_resource::<QuestGiver>() else {
@@ -574,7 +556,7 @@ pub(crate) fn close_quest_out_of_range(
     mut commands: Commands,
 ) {
     let out = giver.npc().is_some_and(|npc| {
-        crate::ui_session::session_out_of_range(npc, &index, &self_q, &transforms)
+        crate::ui_session::npc_out_of_range(npc, &index, &self_q, &transforms) == Some(true)
     });
     if out {
         commands.queue(close_interaction);
@@ -1488,11 +1470,10 @@ mod tests {
         app.world_mut()
             .resource_mut::<Items>()
             .insert_template(6_529, Some(crate::items::test_template("Shiny Bauble")));
-        assert!(app
-            .world()
-            .non_send_resource::<QuestGiver>()
-            .view_lists_item(6_529));
-        item_landed(app.world_mut());
+        // The row's callback on the answer (`0x58b8f0`).
+        crate::ui_script::live::with_live_world(app.world_mut(), |script| {
+            script.item_record_callback(6_529, true, benilla_ui::script::ItemRecordWait::QuestItem)
+        });
         giver_finished(app.world_mut(), false, 7, true);
         giver_finished(app.world_mut(), false, 7, true);
         assert_eq!(

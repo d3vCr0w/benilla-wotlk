@@ -43,9 +43,8 @@ mod weapon_icon;
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CooldownEvents;
 
-/// Post-input feeds are split so every cooldown-backed snapshot is current before the one
-/// synchronous Lua cooldown flush.  Casts are committed after `UiInput`; the reference publishes
-/// their local GCD before the next frame's server packets can clear it.
+/// A GCD armed after the regular feeds is published before paint. Refresh the spellbook snapshot
+/// before the action state's synchronous Lua cooldown flush. Bag handlers read the history live.
 #[derive(SystemSet, Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct CooldownPostFeed;
 
@@ -475,10 +474,11 @@ impl Plugin for UiActionPlugin {
                     // the identity feed that consumes its `dirty`, the state feed after it, so a
                     // slot's rank fix and first state land the same frame. The drains follow the
                     // input pass, in any order: a gesture fills only one of their queues.
+                    // The rank pass writes the store every lent view reads, so it runs ahead of every VM holder, after the packets that dirty it.
                     ranks::normalize_action_ranks
-                        .in_set(UnitFeed)
                         .in_set(ActionRanks)
-                        .before(feed::feed_actions),
+                        .after(benilla_world::schedule::WorldStage::Net)
+                        .before(crate::ui_script::UiPress),
                     feed::feed_actions.in_set(UnitFeed).in_set(SlotIdentityFeed),
                     state::feed_action_state
                         .in_set(UnitFeed)
@@ -495,8 +495,7 @@ impl Plugin for UiActionPlugin {
                     track_learned_abilities
                         .in_set(UnitFeed)
                         .after(feed::feed_actions),
-                    // A script cast is committed after the input pass.  Publish the local GCD
-                    // before painting, while the next network pass remains free to clear it.
+                    // A cast committed after the regular feeds still publishes its GCD this frame.
                     IntoSystem::into_system(state::feed_action_state)
                         .with_name("feed_action_state_post")
                         .in_set(CooldownPostEvents)

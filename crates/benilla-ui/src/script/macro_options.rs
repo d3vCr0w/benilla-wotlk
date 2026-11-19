@@ -199,7 +199,8 @@ fn button_name(n: i64) -> String {
 /// Evaluate one condition against `token`, the group's unit (`target` when it named none).
 fn holds(model: &Model, token: &str, c: &Condition<'_>) -> Option<bool> {
     let unit = model.unit(token);
-    let guid = model.unit_guids.guid_of(token);
+    // The token resolves off the pushed unit guids until the unit tokens read live (#1289).
+    let guid = model.token_guid(token);
     let args = &c.args[..];
     let in_party = |g: u64| g == model.unit_guids.player || model.unit_guids.party.contains(&g);
     let in_raid = |g: u64| model.unit_guids.raid.contains(&g);
@@ -248,10 +249,14 @@ fn holds(model: &Model, token: &str, c: &Condition<'_>) -> Option<bool> {
                 // The name or the creature family, each without regard to case (`0x5efbd0`).
                 Some(p) => args.iter().any(|a| {
                     let a = a.to_lowercase();
-                    [p.name.as_deref(), model.pet_bar.stats.family.as_deref()]
+                    let family = model
+                        .token_guid("pet")
+                        .and_then(|g| super::read_live(|l| l.creature_family(g)).flatten());
+                    let matched = [p.name.as_deref(), family.as_deref()]
                         .into_iter()
                         .flatten()
-                        .any(|n| n.to_lowercase() == a)
+                        .any(|n| n.to_lowercase() == a);
+                    matched
                 }),
             }
         }

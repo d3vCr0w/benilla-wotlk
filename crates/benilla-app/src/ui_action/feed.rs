@@ -81,8 +81,11 @@ impl FailNameTables<'_> {
 
 #[allow(clippy::type_complexity)] // a Bevy system's full input set
 pub(super) fn feed_actions(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
-    mut actions: ResMut<PlayerActions>,
+    (script, _live): (
+        Option<NonSendMut<UiScript>>,
+        crate::ui_script::LendLive<crate::ui_script::OwnsActions>,
+    ),
+    mut action_store: crate::ui_script::OwnedMut<PlayerActions>,
     mut cast_errors: ResMut<CastErrors>,
     mut mount_errors: ResMut<MountErrors>,
     mut pet_tame_failures: ResMut<PetTameFailures>,
@@ -103,7 +106,7 @@ pub(super) fn feed_actions(
     bars: (
         Option<Res<crate::ui_items::ItemSubClasses>>,
         Option<Res<super::TempActionBar>>,
-        Option<Res<crate::ui_pet::PetBar>>,
+        crate::ui_script::LentRef<crate::ui_pet::PetBar>,
     ),
     name_tables: FailNameTables,
     commands: Res<NetCommands>,
@@ -117,7 +120,7 @@ pub(super) fn feed_actions(
     let (sub_classes, temp_bar, pet_bar) = bars;
     let temp_flags = temp_bar.map_or(0, |t| t.flags);
     // Cold Weather Flying, what `flyable` needs in Northrend (`0x7261b0`).
-    script.set_knows_cold_weather_flying(actions.spells.contains(&54197));
+    script.set_knows_cold_weather_flying(action_store.read().spells.contains(&54197));
     let memory = memory.get(&script);
 
     // Cast failures become error lines through [`cast_fail`], all resolved before any event fires.
@@ -342,6 +345,13 @@ pub(super) fn feed_actions(
         .collect();
     show_messages(&mut script, &mut sink, "ui_action", resolved);
 
+    // The sound half of the lines verbs displayed inline, their events already fired in the call.
+    for key in script.take_message_sounds() {
+        if let Some(record) = benilla_ui::messages::by_key(key) {
+            sink.sounds.push(record);
+        }
+    }
+
     // The engine's own by-key refusals (`ERR_PASSIVE_ABILITY`): `benilla_ui` cannot reach
     // [`UiErrorKeys`], so it queues keys that show here, one frame late.
     let engine_keys = script.take_ui_errors();
@@ -412,9 +422,11 @@ pub(super) fn feed_actions(
     let template_epoch = items.template_epoch();
     let macro_generation = script.macros_generation();
     let macros_moved = macro_generation != memory.macro_generation;
-    if !memory.resolved || actions.dirty || template_epoch != memory.template_epoch || macros_moved
-    {
-        actions.dirty = false;
+    let dirty = action_store.read().dirty;
+    if !memory.resolved || dirty || template_epoch != memory.template_epoch || macros_moved {
+        action_store.write().dirty = false;
+        // Read until the slots are resolved; no verb runs meanwhile.
+        let actions = action_store.read();
         memory.resolved = true;
         memory.template_epoch = template_epoch;
         memory.macro_generation = macro_generation;
@@ -495,9 +507,9 @@ pub(super) fn feed_actions(
                 // The pet bar's action at the slot's index (`0x5a97f0`): a spell's icon, or a mode
                 // or order's `PET_%s_TEXTURE` global.
                 super::ACTION_KIND_PET => (
-                    pet_bar.as_deref().and_then(|bar| {
+                    pet_bar.get().and_then(|bar| {
                         crate::ui_pet::temp_slot_texture(
-                            bar,
+                            &bar,
                             button.action,
                             spells.as_ref().map(|s| &s.catalog),
                             &|key| script.lua().globals().get::<String>(key).ok(),
@@ -521,14 +533,14 @@ pub(super) fn feed_actions(
                     // `0x5a80e0`: the pet bar's spell at the slot's index.
                     pet_spell: (button.kind == super::ACTION_KIND_PET)
                         .then(|| {
-                            let entry =
-                                *pet_bar.as_deref()?.spells.bar.get(button.action as usize)?;
+                            let entry = *pet_bar.get()?.spells.bar.get(button.action as usize)?;
                             (entry.is_spell() && !entry.is_empty()).then(|| entry.action())
                         })
                         .flatten(),
                 },
             );
         }
+        drop(actions);
         // A macro rename changes the name line (`GetActionText`) but not the slot value, so a
         // macro edit re-fires every macro slot.
         let changed: Vec<u32> = fresh

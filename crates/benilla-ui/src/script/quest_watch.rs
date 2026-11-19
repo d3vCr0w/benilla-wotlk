@@ -661,7 +661,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             else {
                 return Ok(Value::Nil);
             };
-            let player = i32::try_from(model.player_req.level).unwrap_or(0);
+            let player = i32::try_from(crate::script::item_stats::player_level()).unwrap_or(0);
             let level = e.level as i32;
             let color = quest_color(if level == -1 { player } else { level }, player);
             let link = format!("{color}|Hquest:{}:{level}|h[{}]|h|r", e.quest_id, e.title);
@@ -722,7 +722,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let target = if token.is_empty() {
                 Some(model.unit_guids.target).filter(|&g| g != 0)
             } else {
-                model.unit_guids.guid_of(&token)
+                model.token_guid(&token)
             };
             // The item's spell through the range check at the call (`0x5e55b6`).
             let spell = special_item(&model, index).map(|i| i.spell_id);
@@ -868,7 +868,7 @@ mod tests {
             .unwrap()
         };
         assert_eq!(ask(&s), "nilnilnil");
-        let carried = TestView {
+        let mut carried = TestView {
             special_items: [(
                 2,
                 QuestSpecialItemView {
@@ -884,15 +884,18 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            s.with_live(&carried, |s| ask(s)),
+            s.with_live(&mut carried, |s| ask(s)),
             r"|Hitem:5000|h[Relic]|hInterface\Icons\Relic4"
         );
         let row_one = |s: &UiScript| {
             s.eval::<i64>("return select('#', GetQuestLogSpecialItemInfo(1))")
                 .unwrap()
         };
-        assert_eq!(s.with_live(&carried, |s| row_one(s)), 0);
-        assert_eq!(s.with_live(&TestView::default(), |s| ask(s)), "nilnilnil");
+        assert_eq!(s.with_live(&mut carried, |s| row_one(s)), 0);
+        assert_eq!(
+            s.with_live(&mut TestView::default(), |s| ask(s)),
+            "nilnilnil"
+        );
     }
 
     /// The range check's answer: spell 1000 reaches [`NEAR`] and not [`FAR`]; any other unit or spell has no answer.
@@ -924,7 +927,7 @@ mod tests {
             pet: FAR,
             ..Default::default()
         });
-        let view = TestView {
+        let mut view = TestView {
             special_items: [(
                 2,
                 QuestSpecialItemView {
@@ -938,8 +941,8 @@ mod tests {
             .into(),
             ..Default::default()
         };
-        let ask = |s: &mut UiScript, call: &str| {
-            s.with_live(&view, |s| {
+        let mut ask = |s: &mut UiScript, call: &str| {
+            s.with_live(&mut view, |s| {
                 s.eval::<String>(&format!("return tostring({call})"))
                     .unwrap()
             })
@@ -970,9 +973,9 @@ mod tests {
         assert_eq!(ask(&mut s, "IsQuestLogSpecialItemInRange(2)"), "nil");
         assert_eq!(ask(&mut s, "IsQuestLogSpecialItemInRange(2, 'pet')"), "0");
         // The item gone from the view: nil, whatever the unit.
-        let none = TestView::default();
+        let mut none = TestView::default();
         assert_eq!(
-            s.with_live(&none, |s| s
+            s.with_live(&mut none, |s| s
                 .eval::<String>("return tostring(IsQuestLogSpecialItemInRange(2, 'pet'))")
                 .unwrap()),
             "nil"
@@ -1110,10 +1113,13 @@ mod tests {
 
     #[test]
     fn the_link_and_completion_text_read_the_row() {
-        let s = script_with(1, |log| {
+        let mut s = script_with(1, |log| {
             log.entries[0].completion_text = "Return to Marshal.".into();
         });
-        s.model_mut().player_req.level = 29;
+        s.set_player_req_state(crate::script::PlayerReqState {
+            level: 29,
+            ..Default::default()
+        });
         assert_eq!(
             s.eval::<String>("return GetQuestLink(1)").unwrap(),
             "|cffffff00|Hquest:1:29|h[Quest 1]|h|r"

@@ -201,7 +201,10 @@ mod layout_cache;
 mod level_grant;
 mod lfg;
 pub(crate) mod live;
-pub use live::{read_live, write_live, LiveLoan, LiveState};
+pub use live::{
+    owner_write, read_live, shared_read, write_live, GlobalStrings, LiveLoan, LiveState,
+    OwnerWrite, SharedRead, ViewRef,
+};
 mod loot;
 mod loot_roll;
 mod lua51;
@@ -312,7 +315,6 @@ pub use auction::{
 pub use aura::AuraState;
 pub(crate) use backdrop::set_edge_blend as backdrop_set_edge_blend;
 pub use backdrop::{inset_atlas_bleed, pieces, Backdrop, BackdropPiece, Insets};
-pub use bank::BankState;
 pub use barber::{BarberHost, BarberIntent, BarberStyle};
 pub use battlefield_positions::{BattlefieldFlagLive, BattlefieldPositionLive};
 pub use battlefield_queue::{
@@ -423,7 +425,8 @@ pub use item_scaling::{ScalingDistributionView, ScalingTables, ScalingValuesView
 pub use item_stats::equip_loc_token;
 pub use item_stats::{
     item_usable, item_use_refusal, EnchantEffectView, EnchantRowView, GemView, ItemLimitView,
-    ItemSetMember, ItemSetView, ItemSpellView, ItemTemplateView, PlayerReqState, RandomSuffixView,
+    ItemRecordWait, ItemSetMember, ItemSetView, ItemSpellView, ItemTables, ItemTemplateView,
+    PlayerFields, PlayerReqState, RandomSuffixView, ReqFields,
 };
 pub use item_text::ItemTextState;
 pub use layout_cache::PlacedFrame;
@@ -453,7 +456,7 @@ pub use model::{FontProbe, MacroIconSource, TextureProbe, TextureSizeProbe};
 pub(crate) use model::{Model, ModelCell};
 pub use multicast::MultiCastView;
 pub use party::{PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo, SavedInstanceInfo};
-pub use pet::{PetActionView, PetStats, PossessView};
+pub use pet::{PetActionView, PetBarLive, PetMenuOutcome, PetMenuVerb, PetStats, PossessView};
 pub use pvp::{
     pvp_name_global_keys, HonorState, InspectArenaTeamWords, InspectHonorData, RankTitle,
     PLAYER_FLAGS_PVP_TIMER,
@@ -484,7 +487,9 @@ pub use spell_info::{SpellInfo, SpellInfoSource, SpellStatEffect, SpellStatEffec
 pub use spellbook::{
     resolve_spell_by_name, PetBookState, SpellBookState, SpellSlotView, SpellTabView,
 };
-pub use stable::{StableIntent, StablePetSlot, StableState, NUM_STABLE_SLOTS};
+pub use stable::{
+    StableCallback, StableFamily, StableIntent, StableList, StableRow, NUM_STABLE_SLOTS,
+};
 pub use talent::{
     TalentGroupView, TalentPrereqView, TalentRankView, TalentTabView, TalentUiState, TalentView,
 };
@@ -508,8 +513,9 @@ pub use types::{
 };
 pub(crate) use types::{FontExplicit, MeasuredText, RegionData};
 pub use unit::{
-    grey_band, level_reads_unknown, parse_unit_token, power_token, unit_is_grey, PlayerRecord,
-    SelectionRequest, UnitBase, UnitGuids, UnitState, UnitTokenParse,
+    grey_band, level_reads_unknown, parse_unit_token, power_token, split_name, unit_is_grey, Hop,
+    Hops, PlayerRecord, SelectionRequest, UnitBase, UnitGuids, UnitState, UnitTokenParse,
+    PET_OF_ANYONE,
 };
 pub use vehicle::{
     AimRec, AimUnit, PowerDisplayView, VehicleIndicatorView, VehicleRequest, VehicleSeatView,
@@ -1266,6 +1272,7 @@ impl UiScript {
     }
 
     fn host(lua: Lua) -> UiScript {
+        item_stats::clear_fixture_player();
         UiScript {
             lua,
             instructions: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),

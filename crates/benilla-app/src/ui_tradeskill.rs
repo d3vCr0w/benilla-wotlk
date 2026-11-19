@@ -752,11 +752,14 @@ fn feed_trade_skill(
     let close = std::mem::take(&mut open.close);
     if fresh != *last {
         script.set_trade_skill(fresh.clone());
-        // The link verbs never query, so the feed asks for the missing templates here.
+        // The link verbs never query, so the feed asks the item cache for the missing records here.
         if let Some(f) = &fresh {
-            script.ask_item_templates(f.recipes.iter().flat_map(|r| {
+            let ids = f.recipes.iter().flat_map(|r| {
                 std::iter::once(r.product_item).chain(r.reagents.iter().map(|re| re.item))
-            }));
+            });
+            for id in ids.filter(|&id| id != 0) {
+                items.template(id, 0, &commands);
+            }
         }
         // Every rebuild fires TRADE_SKILL_UPDATE (`0x5de0d5`).
         if fresh.is_some() && !show {
@@ -782,7 +785,10 @@ fn feed_trade_skill(
 /// Drain the Lua intents and run the engine's repeat on our own cast edges: a start commits a
 /// pending repeat, a go may cast again, a failure stops it.
 fn drain_trade_skill(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    (script, _live): (
+        Option<NonSendMut<UiScript>>,
+        crate::ui_script::LendLive<crate::ui_script::OwnsCooldowns>,
+    ),
     mut open: ResMut<TradeSkillOpen>,
     mut cast_events: MessageReader<CastEvent>,
     targeting: cast_target::CastTargeting,

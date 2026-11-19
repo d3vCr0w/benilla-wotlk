@@ -390,14 +390,14 @@ pub(crate) fn publish_picks_self(
 /// the targeting stop among them. It fires on the spell changing, so a cancel and re-arm in one
 /// frame still counts.
 pub(crate) fn feed_targeting_to_vm(
-    targeting: Res<SpellTargeting>,
-    checks: BindChecks,
-    tokens: crate::ui_unit::UnitTokens,
-    mut last: Local<crate::ui_script::VmMemo<Option<u32>>>,
     (script, _live): (
         Option<NonSendMut<benilla_ui::script::UiScript>>,
         crate::ui_script::LendLive,
     ),
+    targeting: Res<SpellTargeting>,
+    checks: BindChecks,
+    tokens: crate::ui_unit::UnitTokens,
+    mut last: Local<crate::ui_script::VmMemo<Option<u32>>>,
 ) {
     if let Some(mut script) = script {
         let last = last.get(&script);
@@ -473,7 +473,8 @@ fn merge(
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct ScriptCursor<'w, 's> {
     tokens: crate::ui_unit::UnitTokens<'w, 's>,
-    selection: Res<'w, crate::target::Selection>,
+    /// Read beside the press appliers' own write of it, at each call.
+    selection: crate::ui_script::LentRef<'w, crate::target::Selection>,
     checks: BindChecks<'w, 's>,
     ladder: crate::spell::CastLadder<'w, 's>,
 }
@@ -483,12 +484,16 @@ impl ScriptCursor<'_, '_> {
     /// dropped a call made while not targeting. Here a token that names no unit raises "Out of
     /// range." (0x59) and ends targeting, as the reference's abort clears the word, and a unit goes
     /// to [`bind_target_unit`].
-    pub(crate) fn spell_target_unit(&mut self, token: &str) {
+    pub(crate) fn spell_target_unit(&mut self, token: &str, vm: &benilla_ui::script::UiScript) {
         // An earlier call may have bound or ended the cast: not targeting, no-op.
         let Some(spell_id) = self.ladder.ground.spell() else {
             return;
         };
-        match self.tokens.resolve(token, &self.selection) {
+        let selection = self.selection.get().map(|s| s.clone()).unwrap_or_default();
+        match self
+            .tokens
+            .resolve(token, &selection, crate::ui_unit::VmUnits::of(vm))
+        {
             Some((entity, guid)) => bind_target_unit(&mut self.ladder, &self.checks, entity, guid),
             None => {
                 debug!("ui_action: SpellTargetUnit({token}) names no unit — cast {spell_id} ends");
@@ -674,7 +679,7 @@ mod tests {
             .run_system_cached(
                 |mut script: NonSendMut<UiScript>, mut cursor: ScriptCursor| {
                     for token in script.take_spell_target_unit() {
-                        cursor.spell_target_unit(&token);
+                        cursor.spell_target_unit(&token, &script);
                     }
                 },
             )
@@ -772,16 +777,23 @@ mod tests {
             ]))
         };
         let seat = |world: &mut World, ally: Entity| {
-            // We and our pet target the ally; the ally targets nobody.
+            // We and our pet target the ally; the ally targets nobody. Our summon names the pet (`0x60acc3`-`0x60acd3`).
             let me = world
                 .query_filtered::<Entity, With<SelfPlayer>>()
                 .single(world)
                 .unwrap();
-            world.entity_mut(me).insert(unit(0x19, ALLY));
+            use benilla_protocol::field::{
+                FIELD_OBJECT_TYPE, FIELD_UNIT_SUMMON, FIELD_UNIT_TARGET,
+            };
+            let ours = ObjectStore(benilla_protocol::ObjectFields::from_pairs(&[
+                (FIELD_OBJECT_TYPE, 0x19),
+                (FIELD_UNIT_TARGET, ALLY as u32),
+                (FIELD_UNIT_TARGET + 1, (ALLY >> 32) as u32),
+                (FIELD_UNIT_SUMMON, PET as u32),
+                (FIELD_UNIT_SUMMON + 1, (PET >> 32) as u32),
+            ]));
+            world.entity_mut(me).insert(ours);
             let pet = world.spawn((Guid(PET), unit(0x09, ALLY))).id();
-            let mut bar = crate::ui_pet::PetBar::default();
-            bar.spells.pet_guid = PET;
-            world.insert_resource(bar);
             let mut index = world.resource_mut::<crate::net::GuidIndex>();
             index.0.insert(ME, me);
             index.0.insert(ALLY, ally);

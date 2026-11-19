@@ -149,10 +149,13 @@ fn pet_slot<'a>(
 /// Computes and diff-pushes every occupied slot's state, and fires the reference's events.
 #[allow(clippy::type_complexity)] // a Bevy system's full input set
 pub(crate) fn feed_action_state(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    (script, _live): (
+        Option<NonSendMut<UiScript>>,
+        crate::ui_script::LendLive<crate::ui_script::OwnsCooldowns>,
+    ),
     actions: Res<PlayerActions>,
     spells: Option<Res<Spells>>,
-    mut cooldowns: ResMut<Cooldowns>,
+    mut cooldowns: crate::ui_script::OwnedMut<Cooldowns>,
     clock: Res<crate::ui_script::UiClock>,
     auto_repeat: Res<AutoRepeatActive>,
     // One tuple for Bevy's 16-param ceiling: cast tracking, macro bindings, spell mods and the
@@ -186,7 +189,7 @@ pub(crate) fn feed_action_state(
         Query<(&ObjectStore, &Transform), Without<SelfPlayer>>,
         usable::UsableAuras,
         // The pet bar a pet-action slot reads.
-        Option<Res<crate::ui_pet::PetBar>>,
+        crate::ui_script::LentRef<crate::ui_pet::PetBar>,
         // Where the player stands, for the walk's place legs.
         usable::UsablePlaceFeed,
     ),
@@ -213,9 +216,13 @@ pub(crate) fn feed_action_state(
     // Every cooldown pushes its absolute start on the `GetTime` clock, derived from this one
     // pair, so a running cooldown derives the same start every frame.
     let (anchor, ui_now) = (clock.anchor, clock.ui_now);
-    cooldowns.prune(now);
-    let gen_changed = memory.last_generation != Some(cooldowns.generation);
-    memory.last_generation = Some(cooldowns.generation);
+    cooldowns.write().prune(now);
+    // Read until the pushes below, which call into Lua, so no verb's write meets it.
+    let cd = cooldowns.read();
+    let pet_read = pet_bar.get();
+    let generation = cd.generation;
+    let gen_changed = memory.last_generation != Some(generation);
+    memory.last_generation = Some(generation);
     // The cooldown-clock trace (`WOW_MOVE_TRACE` sink, tag "cd"): once per second.
     let trace_cd = benilla_assets::trace::enabled()
         && memory
@@ -318,7 +325,7 @@ pub(crate) fn feed_action_state(
             }
         };
         let (kind, id) = if kind == super::ACTION_KIND_PET {
-            match pet_slot(pet_bar.as_deref(), id, spells.as_deref()) {
+            match pet_slot(pet_read.as_deref(), id, spells.as_deref()) {
                 PetSlot::Empty => {
                     fresh.insert(action, st);
                     continue;
@@ -331,7 +338,7 @@ pub(crate) fn feed_action_state(
                 }
                 PetSlot::PlayerSpell(spell) => (ACTION_KIND_SPELL, spell),
                 PetSlot::PetSpell(spell, d) => {
-                    let bar = pet_bar.as_deref().expect("a pet spell reads the bar");
+                    let bar = pet_read.as_deref().expect("a pet spell reads the bar");
                     let pet = objects
                         .entity(bar.spells.pet_guid)
                         .and_then(|e| units.get(e).ok())
@@ -412,7 +419,7 @@ pub(crate) fn feed_action_state(
                         factions: factions.as_deref(),
                         reputations: &reputations,
                         party: crate::target::party_of(group.as_deref()),
-                        cooldowns: &cooldowns,
+                        cooldowns: &cd,
                         carried: &carried,
                         spell_mods,
                         runes: rune_check,
@@ -457,16 +464,11 @@ pub(crate) fn feed_action_state(
                     }
                     _ => None,
                 };
-                let info = cooldowns.info(button.action, 0, Some(d), now);
+                let info = cd.info(button.action, 0, Some(d), now);
                 st.cooldown = info.ui_triple(anchor, ui_now);
                 if let Some(check) = rune_check {
-                    st.cooldown = cooldowns.with_rune_leg(
-                        button.action,
-                        d,
-                        st.cooldown,
-                        &rune_leg(check),
-                        now_ms,
-                    );
+                    st.cooldown =
+                        cd.with_rune_leg(button.action, d, st.cooldown, &rune_leg(check), now_ms);
                 }
                 if st.cooldown.is_some() && trace_cd {
                     // The store's clock against the widget's; the sink stamps wall time.
@@ -508,7 +510,7 @@ pub(crate) fn feed_action_state(
                         factions: factions.as_deref(),
                         reputations: &reputations,
                         party: crate::target::party_of(group.as_deref()),
-                        cooldowns: &cooldowns,
+                        cooldowns: &cd,
                         carried: &carried,
                         spell_mods,
                         runes: rune_check,
@@ -531,7 +533,7 @@ pub(crate) fn feed_action_state(
                 }
                 if let Some(u) = use_spell {
                     let d = spells.as_ref().and_then(|s| s.catalog.get(u.spell_id));
-                    let info = cooldowns.info(u.spell_id, button.action, d, now);
+                    let info = cd.info(u.spell_id, button.action, d, now);
                     st.cooldown = info.ui_triple(anchor, ui_now);
                 }
             }
@@ -541,6 +543,7 @@ pub(crate) fn feed_action_state(
         // a re-arm, even within one frame gap, restarts the sweep.
         fresh.insert(action, st);
     }
+    drop((cd, pet_read));
 
     let mut usable_changed = false;
     let mut state_changed = false;
@@ -603,6 +606,7 @@ pub(crate) fn feed_action_state(
                     .collect(),
             );
         }
+        let cd = cooldowns.read();
         let ctx = usable::UsableCtx {
             self_auras: usable_auras.me.single().ok(),
             target_auras: target_entity.and_then(|e| usable_auras.all.get(e).ok()),
@@ -611,7 +615,7 @@ pub(crate) fn feed_action_state(
             factions: factions.as_deref(),
             reputations: &reputations,
             party: crate::target::party_of(group.as_deref()),
-            cooldowns: &cooldowns,
+            cooldowns: &cd,
             carried: &carried,
             spell_mods,
             runes: rune_check,
@@ -619,6 +623,7 @@ pub(crate) fn feed_action_state(
             auto_unshift,
             place,
         };
+        let mut active = Vec::new();
         for (id, was_ready) in memory.reactive.iter_mut().flatten() {
             let Some(d) = sp.catalog.get(*id) else {
                 continue;
@@ -626,15 +631,19 @@ pub(crate) fn feed_action_state(
             let (usable, oom) = usable::spell_usable(*id, d, sp, &ctx, &objects, &items, &commands);
             let ready = usable && !oom;
             if ready && !*was_ready {
-                script.fire_event(
-                    "COMBAT_TEXT_UPDATE",
-                    vec![
-                        ScriptValue::Str("SPELL_ACTIVE".into()),
-                        ScriptValue::Str(d.name.clone()),
-                    ],
-                );
+                active.push(d.name.clone());
             }
             *was_ready = ready;
+        }
+        drop(cd);
+        for name in active {
+            script.fire_event(
+                "COMBAT_TEXT_UPDATE",
+                vec![
+                    ScriptValue::Str("SPELL_ACTIVE".into()),
+                    ScriptValue::Str(name),
+                ],
+            );
         }
     }
     if auto_repeat.0 != memory.auto_repeat {
@@ -649,7 +658,7 @@ pub(crate) fn feed_action_state(
         );
     }
     if let Some(boundary) = boundary.as_mut() {
-        boundary.generation = cooldowns.generation;
+        boundary.generation = generation;
     }
 }
 
