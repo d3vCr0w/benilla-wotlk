@@ -26,11 +26,12 @@ pub(super) fn pickup_inventory_item(model: &mut Model, id: u32) -> bool {
         model.cursor,
         Some(CursorPayload::Item(_) | CursorPayload::Merchant(_))
     );
-    if !placing && (model.item_pick_armed || model.repair_mode) {
+    let picking = crate::script::spellbook::targeting().wants_item;
+    if !placing && (picking || crate::script::merchant::repair_mode(model)) {
         let usable = model
             .inv_slot("player", id as usize)
             .is_some_and(|s| s.item_id != 0 && !s.locked);
-        if usable && model.item_pick_armed {
+        if usable && picking {
             model.item_picks.push((EQUIPMENT_BAG, id));
         } else if usable && (1..=19).contains(&id) {
             model.inventory_repairs.push(id);
@@ -95,14 +96,23 @@ pub(super) fn pickup_inventory_item(model: &mut Model, id: u32) -> bool {
         // the server equips or refuses. A stale row buys nothing: of the reference's three drop
         // sites only this one checks it; the other two dereference it.
         Some(CursorPayload::Merchant(held)) => {
-            let row = model
-                .merchant
-                .as_ref()
-                .and_then(|m| m.items.get(held.row as usize))
-                .filter(|it| it.item_id == held.item_id)
-                .map(|_| held.row + 1);
+            let row = crate::script::merchant::merchant_row(
+                model,
+                crate::script::MerchantList::Items,
+                held.row as usize,
+                false,
+            )
+            .filter(|it| it.item_id == held.item_id)
+            .map(|_| held.row);
             if let Some(row) = row {
-                model.merchant_slot_buys.push((EQUIPMENT_BAG, id, row));
+                crate::script::merchant::merchant_act(
+                    model,
+                    crate::script::MerchantAct::BuyInSlot {
+                        bag: EQUIPMENT_BAG,
+                        slot: id,
+                        row,
+                    },
+                );
             }
             queue_cursor_update(model);
             true
@@ -176,7 +186,7 @@ pub(super) fn auto_equip_cursor_item(model: &mut Model) -> bool {
 /// mode a worn item is repaired, locked or not.
 pub(super) fn use_inventory_item(model: &mut Model, id: u32) {
     super::clear_cursor(model);
-    if !model.repair_mode {
+    if !crate::script::merchant::repair_mode(model) {
         model
             .script_calls
             .push(crate::script::ScriptCall::UseInventoryItem(id));
@@ -220,8 +230,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let Some(id) = live_id(lua, &id)? else {
                 return Ok(false);
             };
-            let mut model = crate::script::model_mut_of(lua);
-            Ok(pickup_inventory_item(&mut model, id))
+            let repaint = pickup_inventory_item(&mut crate::script::model_mut_of(lua), id);
+            crate::script::calls::press_item_picks(lua);
+            Ok(repaint)
         })?,
     )?;
     g.set(
@@ -257,8 +268,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let Some(id) = live_id(lua, &id)?.filter(|&id| id != 0) else {
                 return Ok(());
             };
-            let mut model = crate::script::model_mut_of(lua);
-            use_inventory_item(&mut model, id);
+            use_inventory_item(&mut crate::script::model_mut_of(lua), id);
+            crate::script::calls::apply_queued(lua);
             Ok(())
         })?,
     )?;
@@ -281,6 +292,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::script::cursor::{CursorAction, CursorPayload, CursorSpell, EQUIPMENT_BAG};
+    use crate::script::live::TestTargeting;
     use crate::script::{ContainerMove, ContainerSlot, ContainerState, InvSlotView, UiScript};
 
     /// Head (1), a ring in finger slot 11 that also fits 12, and Tabard (19).
@@ -807,33 +819,35 @@ mod tests {
     /// The held-payload test runs first in both seams, the bag's and the doll's.
     #[test]
     fn the_armed_item_half_reroutes_bag_and_doll_clicks() {
-        let mut s = UiScript::new().unwrap();
-        s.set_inventory_slots(doll_slots());
-        s.set_container(0, Some(one_fitting_bag_item()));
+        crate::script::live::lending(&mut crate::script::live::TestView::default(), || {
+            let mut s = UiScript::new().unwrap();
+            s.set_inventory_slots(doll_slots());
+            s.set_container(0, Some(one_fitting_bag_item()));
 
-        // Unarmed, both seams do their ordinary gesture and queue nothing.
-        assert!(s.eval::<bool>("return PickupInventoryItem(1)").unwrap());
-        assert!(s.cursor_item().is_some());
-        assert!(s.take_item_picks().is_empty());
+            // Unarmed, both seams do their ordinary gesture and queue nothing.
+            assert!(s.eval::<bool>("return PickupInventoryItem(1)").unwrap());
+            assert!(s.cursor_item().is_some());
+            assert!(s.take_item_picks().is_empty());
 
-        // Armed but holding: the payload wins.
-        s.set_item_pick_armed(true);
-        s.run("PickupContainerItem(0, 1)").unwrap();
-        assert!(
-            s.take_item_picks().is_empty(),
-            "a click while carrying an item is a place, not a bind"
-        );
+            // Armed but holding: the payload wins.
+            s.set_item_pick_armed(true);
+            s.run("PickupContainerItem(0, 1)").unwrap();
+            assert!(
+                s.take_item_picks().is_empty(),
+                "a click while carrying an item is a place, not a bind"
+            );
 
-        // Armed with an empty cursor: both seams bind and leave the cursor empty.
-        s.run("ClearCursor()").unwrap();
-        assert!(s.cursor_item().is_none());
-        assert!(!s.eval::<bool>("return PickupInventoryItem(1)").unwrap());
-        s.run("PickupContainerItem(0, 1)").unwrap();
-        assert_eq!(
-            s.take_item_picks(),
-            vec![(EQUIPMENT_BAG, 1), (0, 1)],
-            "the doll reports in the ONE bag space; the bag reports its own id"
-        );
-        assert!(s.cursor_item().is_none(), "a bind never stages a payload");
+            // Armed with an empty cursor: both seams bind and leave the cursor empty.
+            s.run("ClearCursor()").unwrap();
+            assert!(s.cursor_item().is_none());
+            assert!(!s.eval::<bool>("return PickupInventoryItem(1)").unwrap());
+            s.run("PickupContainerItem(0, 1)").unwrap();
+            assert_eq!(
+                s.take_item_picks(),
+                vec![(EQUIPMENT_BAG, 1), (0, 1)],
+                "the doll reports in the ONE bag space; the bag reports its own id"
+            );
+            assert!(s.cursor_item().is_none(), "a bind never stages a payload");
+        });
     }
 }

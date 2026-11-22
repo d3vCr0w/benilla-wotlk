@@ -359,6 +359,8 @@ pub enum SessionEvent {
     TransferPending {
         map_id: u32,
         transport_entry: Option<u32>,
+        /// The map the transport leaves, sent with the entry: the ship loading screen's leg.
+        transport_map: Option<u32>,
     },
     /// `SMSG_TRANSFER_ABORTED`: the transfer to `map` is off (map full, no instance), with the
     /// third byte reasons 7 to 9 carry.
@@ -447,6 +449,9 @@ pub enum SessionEvent {
         spell_id: u32,
         cast_flags: u32,
         runes: crate::messages::CastRunes,
+        /// Off `SMSG_SPELL_START`, whose prediction alone is gated on the caster's
+        /// `UNIT_FIELD_FLAGS_2 & 0x100` (`0x8068a1`-`0x8068b3`); else off `SMSG_SPELL_GO`.
+        start: bool,
     },
     /// The saved equipment sets, whole (`SMSG_EQUIPMENT_SET_LIST`).
     EquipmentSetList(Vec<crate::messages::EquipmentSet>),
@@ -466,8 +471,6 @@ pub enum SessionEvent {
     CriteriaDeleted(u32),
     /// One completed achievement is gone (`SMSG_ACHIEVEMENT_DELETED`).
     AchievementDeleted(u32),
-    /// `SMSG_PET_UNLEARN_CONFIRM`: accept with `CMSG_PET_UNLEARN`; declining sends nothing.
-    PetUnlearnConfirm { trainer: u64, cost: u32 },
     /// The instance-boot clock (`SMSG_RAID_GROUP_ONLY`): a positive delay arms it
     /// (`INSTANCE_BOOT_START`), zero clears it (`INSTANCE_BOOT_STOP`) and shows `reason` 1 or 2.
     RaidGroupOnly { delay_ms: u32, reason: u32 },
@@ -587,6 +590,8 @@ pub enum SessionEvent {
         racial_leader: bool,
         /// The health and power multipliers, 0.0 on a miss.
         modifiers: (f32, f32),
+        /// `CreatureMovementInfo.dbc` id; 0 is none, and on a miss.
+        movement_id: u32,
     },
     /// `SMSG_GAMEOBJECT_QUERY_RESPONSE`, keyed by template `entry`; `data` is the type-specific
     /// raw tail. An unknown entry still fires, every field zero or empty.

@@ -12,6 +12,10 @@ use std::f32::consts::PI;
 
 use crate::taxi::TaxiPathNode;
 
+mod physics;
+pub(crate) use physics::transport_physics_schema;
+pub use physics::{load_transport_physics, Rocking, TransportPhysics, TransportPhysicsTable};
+
 /// A transport's position and heading at one instant of its cycle, in WoW coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TransportSample {
@@ -20,9 +24,25 @@ pub struct TransportSample {
     pub pos: [f32; 3],
     /// Radians in `[0, 2π)`, `atan2(dir.y, dir.x) + π` (`Transport.cpp:347`).
     pub heading: f32,
+    /// A full orientation `(x, y, z, w)` that replaces the heading's yaw: a type-11 transport's
+    /// turned keys (`0x70dc10`). `None` draws the heading.
+    pub rotation: Option<[f32; 4]>,
     /// False while parked at a stop or on a keyframe's zero-width instant.
     pub moving: bool,
+    /// The `AnimationData.dbc` id the ship hands its world object's props: [`SHIP_STAND`] at a
+    /// stop, [`SHIP_START`] on the ramp up, [`SHIP_MOVING`] at cruise, [`SHIP_STOP`] on the ramp
+    /// down (`0x7f82b0`).
+    pub sequence: u16,
 }
+
+/// A ship at rest (`0x7f82b0`'s default, and a stop's delay).
+pub const SHIP_STAND: u16 = 0;
+/// Accelerating out of a stop (`0x7f76f0`, the last leg's tail at `0x7f82b0`).
+pub const SHIP_START: u16 = 162;
+/// At cruise speed between the ramps.
+pub const SHIP_MOVING: u16 = 163;
+/// Decelerating into a stop (`0x7f7660`, `0x7f76f0`).
+pub const SHIP_STOP: u16 = 164;
 
 /// A keyframe that survives the map-change skip (`TransportMgr.cpp:128-152`), with what `sample`
 /// needs. Stop and teleport are implicit: a non-stop window is zero-width, and a teleport's
@@ -36,6 +56,8 @@ struct Frame {
     dist_until_stop: f32,
     /// Arc length to the next frame; 0 for a teleport frame and the last frame.
     next_dist_from_prev: f32,
+    /// Arc length from its [`Leg`]'s first frame to this one.
+    leg_dist: f32,
     time_from: f32,
     time_to: f32,
     departure_time: u32,
@@ -43,6 +65,8 @@ struct Frame {
     /// The [`Leg`] and control index of this frame's outbound segment.
     leg: usize,
     local_index: usize,
+    /// The reference's leg of this frame's node ([`ship_legs`]).
+    ship_leg: u32,
 }
 
 /// A kept node before the derived quantities.
@@ -54,6 +78,27 @@ struct RawFrame {
     delay_secs: f32,
     initial_orientation: f32,
     teleport: bool,
+    ship_leg: u32,
+}
+
+/// Each node's leg in the reference's own ship path (`0x7f90f0`): a leg opens at the first node,
+/// at a node on another map than its leg's, and after a teleport node (flag 1). It is the index
+/// the reference compares to spot a leg change (`0x7134a0`), which vmangos's legs do not keep:
+/// those never visit the path's end nodes.
+fn ship_legs(nodes: &[TaxiPathNode]) -> Vec<u32> {
+    let mut legs = Vec::with_capacity(nodes.len());
+    let mut leg: Option<(u32, u32)> = None; // (index, map)
+    let mut teleport = false;
+    for node in nodes {
+        leg = match leg {
+            Some((i, map)) if map == node.map_id && !teleport => Some((i, map)),
+            Some((i, _)) => Some((i + 1, node.map_id)),
+            None => Some((0, node.map_id)),
+        };
+        legs.push(leg.map_or(0, |(i, _)| i));
+        teleport = node.flags & 1 != 0;
+    }
+    legs
 }
 
 /// A run of keyframes ending at a teleport or the path's end: a non-cyclic Catmull-Rom spline
@@ -385,6 +430,8 @@ pub struct TransportTimetable {
     pub period_ms: u32,
     frames: Vec<Frame>,
     legs: Vec<Leg>,
+    /// Per [`Leg`], its travelled frames (`next_dist_from_prev > 0`) in order of `leg_dist`.
+    leg_frames: Vec<Vec<usize>>,
     move_speed: f32,
     accel_rate: f32,
     accel_time: f32,
@@ -453,6 +500,7 @@ impl TransportTimetable {
         }
 
         // Phase A: the map-change skip (`TransportMgr.cpp:128-152`), end nodes never visited.
+        let ship_leg_of = ship_legs(nodes);
         let mut raws: Vec<RawFrame> = Vec::new();
         let mut map_change = false;
         for i in 1..n_raw - 1 {
@@ -481,6 +529,7 @@ impl TransportTimetable {
                     delay_secs: node.delay as f32,
                     initial_orientation,
                     teleport: false,
+                    ship_leg: ship_leg_of[i],
                 });
             }
         }
@@ -606,6 +655,20 @@ impl TransportTimetable {
             }
         };
 
+        // Legs are contiguous in frame order, so a running sum restarts at each leg's first frame.
+        let mut leg_dist = vec![0.0f32; n];
+        let mut leg_frames = vec![Vec::new(); legs.len()];
+        for j in 1..n {
+            if leg_of[j] == leg_of[j - 1] {
+                leg_dist[j] = leg_dist[j - 1] + next_dist_from_prev[j - 1];
+            }
+        }
+        for j in 0..n {
+            if next_dist_from_prev[j] > 0.0 {
+                leg_frames[leg_of[j]].push(j);
+            }
+        }
+
         let frames: Vec<Frame> = (0..n)
             .map(|j| Frame {
                 map_id: raws[j].map_id,
@@ -614,12 +677,14 @@ impl TransportTimetable {
                 dist_since_stop: dist_since_stop[j],
                 dist_until_stop: dist_until_stop[j],
                 next_dist_from_prev: next_dist_from_prev[j],
+                leg_dist: leg_dist[j],
                 time_from: time_from[j],
                 time_to: time_to[j],
                 departure_time: departure_time[j],
                 next_arrive_time: next_arrive_time[j],
                 leg: leg_of[j],
                 local_index: local_index_of[j],
+                ship_leg: raws[j].ship_leg,
             })
             .collect();
 
@@ -627,6 +692,7 @@ impl TransportTimetable {
             period_ms,
             frames,
             legs,
+            leg_frames,
             move_speed,
             accel_rate,
             accel_time,
@@ -659,17 +725,112 @@ impl TransportTimetable {
         self.period_ms = period_ms;
     }
 
+    /// The reference's ship-path leg at `cycle_ms`: the leg of the frame the cycle is in. The
+    /// reference switches legs at its own leg end times (`0x7f82b0`); these are vmangos's frame
+    /// windows, which put the switch at the same teleport.
+    pub fn ship_leg(&self, cycle_ms: u32) -> u32 {
+        let cycle_ms = cycle_ms.min(self.period_ms.saturating_sub(1));
+        self.frames
+            .iter()
+            .find(|f| cycle_ms < f.next_arrive_time)
+            .or(self.frames.last())
+            .map_or(0, |f| f.ship_leg)
+    }
+
     /// Position and heading at `cycle_ms` (`progress % period_ms`), as `ShipTransport::Update` and
     /// `CalculateSegmentPos` compute them (`Transport.cpp:283-380`), with no state between calls.
     pub fn sample(&self, cycle_ms: u32) -> TransportSample {
+        self.locate(cycle_ms).sample
+    }
+
+    /// [`Self::sample`] rocked by its `TransportPhysics` row (`0x7f82b0`): the wave lifts the
+    /// position, and the roll and pitch turn the ship under its heading (`0x7134a0`). The bank's
+    /// turn estimate is `0x7f7dd0`'s: the heading at four points behind the ship on its leg,
+    /// `0.45 s` apart at its speed, each change from the one before scaled by `2.2222223`, then
+    /// the sum by `0.2`; a ship under `0.15` of `speed_damp_thresh` turns not at all, one under
+    /// `0.3` of it at a speed eased by the square of its place between the two. The look-back runs
+    /// on benilla's vmangos legs, which split at teleports as the reference's do, but its arc
+    /// lengths are vmangos's, not the reference's per-leg spline's (not ported, see the top).
+    pub fn sample_rocked(&self, cycle_ms: u32, physics: &TransportPhysics) -> TransportSample {
+        let located = self.locate(cycle_ms);
+        let mut sample = located.sample;
+        let mut speed = located.speed;
+        let mut turn = 0.0f32;
+        if speed > 0.0 {
+            if let Some(on) = located.on_leg {
+                let low = physics.speed_damp_thresh * 0.15;
+                let high = physics.speed_damp_thresh * 0.3;
+                if speed < low {
+                    speed = 0.0;
+                } else if speed < high {
+                    let scale = (speed - low) / (high - low);
+                    speed *= scale * scale;
+                }
+                let mut facing = sample.heading;
+                for i in 1..5 {
+                    let back = (on.leg_dist - speed * i as f32 * 0.45).max(0.0);
+                    let heading = self.leg_heading_at(on.leg, back);
+                    let mut delta = facing - heading;
+                    if delta > PI {
+                        delta -= std::f32::consts::TAU;
+                    } else if delta < -PI {
+                        delta += std::f32::consts::TAU;
+                    }
+                    turn += delta * 2.222_222_3;
+                    facing = heading;
+                }
+                turn *= 0.2;
+            }
+        }
+        let time = cycle_ms.min(self.period_ms.saturating_sub(1));
+        let rocking = physics.rocking(time, speed, turn);
+        sample.pos[2] += rocking.wave;
+        sample.rotation = Some(physics::yaw_pitch_roll(
+            sample.heading,
+            rocking.pitch,
+            rocking.roll,
+        ));
+        sample
+    }
+
+    /// The heading on leg `leg` at arc length `dist` from its first frame, clamped to the leg.
+    fn leg_heading_at(&self, leg: usize, dist: f32) -> f32 {
+        let Some(on) = self.leg_frames.get(leg) else {
+            return 0.0;
+        };
+        // The first segment whose far end reaches `dist`; past the last, its end.
+        let k = on.partition_point(|&i| {
+            let f = &self.frames[i];
+            f.leg_dist + f.next_dist_from_prev < dist
+        });
+        match on.get(k).or(on.last()) {
+            Some(&i) => {
+                let f = &self.frames[i];
+                self.heading_on(f, (dist - f.leg_dist) / f.next_dist_from_prev)
+            }
+            None => 0.0,
+        }
+    }
+
+    /// The heading on `frame`'s outbound segment at `t`, `atan2(dir.y, dir.x) + π`.
+    fn heading_on(&self, frame: &Frame, t: f32) -> f32 {
+        let dir = self.legs[frame.leg].evaluate_derivative(frame.local_index, t.clamp(0.0, 1.0));
+        normalize_orientation(dir[1].atan2(dir[0]) + PI)
+    }
+
+    /// The sample at `cycle_ms`, its speed (yd/s, 0 at a stop) and, while it travels a segment,
+    /// its arc length from its leg's first frame.
+    fn locate(&self, cycle_ms: u32) -> Located {
         let n = self.frames.len();
         if n == 0 {
-            return TransportSample {
+            return Located::still(TransportSample {
                 map: 0,
                 pos: [0.0; 3],
                 heading: 0.0,
+                rotation: None,
                 moving: false,
-            };
+                sequence: SHIP_STAND,
+            });
         }
         let cycle_ms = cycle_ms.min(self.period_ms.saturating_sub(1));
 
@@ -683,12 +844,20 @@ impl TransportTimetable {
 
         if cycle_ms < frame.departure_time || frame.next_dist_from_prev <= 0.0 {
             // At a stop, on a keyframe's instant, or on a teleport's zero-length travel.
-            return TransportSample {
+            return Located::still(TransportSample {
                 map: frame.map_id,
                 pos: frame.pos,
                 heading: frame.initial_orientation,
+                rotation: None,
                 moving: false,
-            };
+                // Only a stop's delay is Stand: a teleport frame's zero-width instant, the cycle's
+                // wrap among them, is passed through at speed, as the reference's tail is.
+                sequence: if cycle_ms < frame.departure_time {
+                    SHIP_STAND
+                } else {
+                    SHIP_MOVING
+                },
+            });
         }
 
         // Moving: distance from the nearer stop under the same trapezoid as `TimeTo`
@@ -697,20 +866,35 @@ impl TransportTimetable {
         let since_departure = now - frame.departure_time as f32 * 0.001;
         let time_since_stop = frame.time_from + since_departure;
         let time_until_stop = frame.time_to - since_departure;
-        let dist = if time_since_stop < time_until_stop {
-            let d = if time_since_stop < self.accel_time {
-                0.5 * self.accel_rate * time_since_stop * time_since_stop
+        // The reference's ramps are `min(v/a, segment/2)` wide (`0x7f76f0`): the nearer stop's
+        // side of the segment, within the acceleration time of it.
+        let sequence = if time_since_stop < time_until_stop {
+            if time_since_stop < self.accel_time {
+                SHIP_START
             } else {
-                self.accel_dist + (time_since_stop - self.accel_time) * self.move_speed
-            };
-            d - frame.dist_since_stop
+                SHIP_MOVING
+            }
+        } else if time_until_stop < self.accel_time {
+            SHIP_STOP
         } else {
-            let d = if time_until_stop < self.accel_time {
-                0.5 * self.accel_rate * time_until_stop * time_until_stop
+            SHIP_MOVING
+        };
+        let ramp = |t: f32| {
+            if t < self.accel_time {
+                (0.5 * self.accel_rate * t * t, self.accel_rate * t)
             } else {
-                self.accel_dist + (time_until_stop - self.accel_time) * self.move_speed
-            };
-            frame.dist_until_stop - d
+                (
+                    self.accel_dist + (t - self.accel_time) * self.move_speed,
+                    self.move_speed,
+                )
+            }
+        };
+        let (dist, speed) = if time_since_stop < time_until_stop {
+            let (d, v) = ramp(time_since_stop);
+            (d - frame.dist_since_stop, v)
+        } else {
+            let (d, v) = ramp(time_until_stop);
+            (frame.dist_until_stop - d, v)
         };
         let t = (dist / frame.next_dist_from_prev).clamp(0.0, 1.0);
 
@@ -719,13 +903,45 @@ impl TransportTimetable {
         let dir = leg.evaluate_derivative(frame.local_index, t);
         let heading = normalize_orientation(dir[1].atan2(dir[0]) + PI);
 
-        TransportSample {
-            map: frame.map_id,
-            pos,
-            heading,
-            moving: true,
+        Located {
+            sample: TransportSample {
+                map: frame.map_id,
+                pos,
+                heading,
+                rotation: None,
+                moving: true,
+                sequence,
+            },
+            speed: speed.max(0.0),
+            on_leg: Some(OnLeg {
+                leg: frame.leg,
+                leg_dist: frame.leg_dist + t * frame.next_dist_from_prev,
+            }),
         }
     }
+}
+
+/// [`TransportTimetable::locate`]'s answer.
+struct Located {
+    sample: TransportSample,
+    speed: f32,
+    on_leg: Option<OnLeg>,
+}
+
+impl Located {
+    fn still(sample: TransportSample) -> Self {
+        Self {
+            sample,
+            speed: 0.0,
+            on_leg: None,
+        }
+    }
+}
+
+/// Where a travelling transport is on its leg.
+struct OnLeg {
+    leg: usize,
+    leg_dist: f32,
 }
 
 #[cfg(test)]

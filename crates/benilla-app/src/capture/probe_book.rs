@@ -16,7 +16,6 @@ use benilla_ui::script::UiScript;
 use super::probes::ProbeClock;
 use crate::net::{ChatKind, ClientCommand, Guid, NetCommands, NetEntity, ObjectStore, SelfPlayer};
 use crate::player::Player;
-use crate::ui_item_text::ItemTextOpen;
 use crate::ui_script::{UiCostWanted, UiFrameCost};
 
 /// A standing position beside the plaque.
@@ -37,7 +36,7 @@ pub(crate) struct ProbeBookPlugin;
 impl Plugin for ProbeBookPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<BookProbe>()
-            .add_systems(Update, book_probe);
+            .add_systems(Update, (book_probe, book_reader).chain());
     }
 }
 
@@ -201,13 +200,42 @@ fn report(label: &str, s: &[Sample]) {
     );
 }
 
+/// The reader's paint, read with the `World` lent while the probe waits for it.
+fn book_reader(world: &mut World) {
+    let now = world
+        .resource::<Time<bevy::time::Real>>()
+        .elapsed_secs_f64();
+    let Phase::WaitReady { since } = world.resource::<BookProbe>().phase else {
+        return;
+    };
+    let read = super::probes::with_vm(world, |script| {
+        let script = script?;
+        let (shown, chars) = reader_state(script);
+        let fails = (shown && chars > 0).then(|| report_render(script));
+        Some((shown, chars, fails))
+    });
+    let Some((shown, chars, fails)) = read else {
+        return; // no UI VM in this build
+    };
+    let mut probe = world.resource_mut::<BookProbe>();
+    if let Some(fails) = fails {
+        probe.page_chars = chars;
+        probe.fails += fails;
+        info!("PROBE_BOOK: reader painted a {chars}-char body — sampling {SAMPLE_FRAMES} frames with it OPEN");
+        probe.phase = Phase::Open;
+    } else if now - since > READY_TIMEOUT_SECS {
+        error!("PROBE_BOOK: FAIL — reader never painted a page within {READY_TIMEOUT_SECS}s (shown={shown} chars={chars})");
+        probe.fails += 1;
+        probe.phase = Phase::Done;
+    }
+}
+
 fn book_probe(
     time: ProbeClock,
     mut probe: ResMut<BookProbe>,
     mut wanted: ResMut<UiCostWanted>,
     cost: Res<UiFrameCost>,
-    mut reader: ResMut<ItemTextOpen>,
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut commands: Commands,
     self_player: Query<(), With<SelfPlayer>>,
     player: Res<Player>,
     objects: Query<(&Guid, &NetEntity, &ObjectStore, &Transform), Without<SelfPlayer>>,
@@ -217,9 +245,6 @@ fn book_probe(
     if self_player.is_empty() {
         return; // not in-world yet
     }
-    let Some(script) = script else {
-        return; // no UI VM in this build
-    };
     let now = time.elapsed_secs_f64();
     let sample = Sample {
         convert: cost.convert,
@@ -269,24 +294,13 @@ fn book_probe(
             probe.closed.push(sample);
             if probe.closed.len() >= SAMPLE_FRAMES {
                 let guid = probe.plaque.unwrap_or_default();
-                info!("PROBE_BOOK: opening the reader on {guid:#x} (the right-click's own route — `ItemTextOpen::open_pages`)");
-                reader.open_pages(guid);
+                info!("PROBE_BOOK: opening the reader on {guid:#x} (the right-click's own route)");
+                crate::ui_item_text::read_from_click(&mut commands, guid);
                 probe.phase = Phase::WaitReady { since: now };
             }
         }
-        Phase::WaitReady { since } => {
-            let (shown, chars) = reader_state(&script);
-            if shown && chars > 0 {
-                probe.page_chars = chars;
-                probe.fails += report_render(&script);
-                info!("PROBE_BOOK: reader painted a {chars}-char body — sampling {SAMPLE_FRAMES} frames with it OPEN");
-                probe.phase = Phase::Open;
-            } else if now - since > READY_TIMEOUT_SECS {
-                error!("PROBE_BOOK: FAIL — reader never painted a page within {READY_TIMEOUT_SECS}s (shown={shown} chars={chars})");
-                probe.fails += 1;
-                probe.phase = Phase::Done;
-            }
-        }
+        // Read by `book_reader`, with the `World` lent.
+        Phase::WaitReady { .. } => {}
         Phase::Open => {
             probe.open.push(sample);
             if probe.open.len() >= SAMPLE_FRAMES {

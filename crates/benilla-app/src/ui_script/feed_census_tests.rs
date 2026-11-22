@@ -18,18 +18,12 @@ const FEEDS: &[&str] = &[
     "benilla_app::minimap::feed_minimap_player_facing",
     "benilla_app::minimap::ping::drive_minimap_ping",
     "benilla_app::screenshot::report_captures",
-    "benilla_app::spell::targeting::feed_targeting_to_vm",
     "benilla_app::tutorial::feed_tutorials",
     "benilla_app::ui_achievement::feed_achievements",
     "benilla_app::ui_action::feed::feed_actions",
-    "benilla_app::ui_action::state::feed_action_state",
-    "benilla_app::ui_action::state::fire_combat_edges",
     "benilla_app::ui_auction::feed_auction",
     "benilla_app::ui_aura::feed_auras",
-    "benilla_app::ui_barber::feed_barber",
-    "benilla_app::ui_binder::feed_binder",
     "benilla_app::ui_calendar::feed_calendar",
-    "benilla_app::ui_cast::feed_cast_bar",
     "benilla_app::ui_char::feed_char",
     "benilla_app::ui_char::feed_skills",
     "benilla_app::ui_char::watch_skill_ups",
@@ -38,18 +32,14 @@ const FEEDS: &[&str] = &[
     "benilla_app::ui_chat::feed::feed_chat",
     "benilla_app::ui_chat::feed::played_time_bridge",
     "benilla_app::ui_chat::net::feed_channel_roster_names",
-    "benilla_app::ui_dialog_verbs::feed_dialog_verbs",
-    "benilla_app::ui_dressup::feed_dressup",
     "benilla_app::ui_focus::feed_focus",
     "benilla_app::ui_follow::feed_follow",
     "benilla_app::ui_glyph::feed_glyphs",
     "benilla_app::ui_gm_ticket::feed_gm_ticket",
-    "benilla_app::ui_gossip::feed_gossip",
     "benilla_app::ui_guild::event_log::feed_guild_event_log",
     "benilla_app::ui_guild::feed::feed_guild",
     "benilla_app::ui_inspect::feed_inspect",
     "benilla_app::ui_instance::feed_instance",
-    "benilla_app::ui_item_text::feed_item_text",
     "benilla_app::ui_layout::load_layout",
     "benilla_app::ui_lfg::feed_lfg",
     "benilla_app::ui_logout::feed_logout",
@@ -59,8 +49,6 @@ const FEEDS: &[&str] = &[
     "benilla_app::ui_macro::load_macros",
     "benilla_app::ui_macro::rebind_macro_spells",
     "benilla_app::ui_mail::feed_mail",
-    "benilla_app::ui_merchant::feed_merchant",
-    "benilla_app::ui_merchant::feed_repair_costs",
     "benilla_app::ui_mirror::feed_mirror_timers",
     "benilla_app::ui_models::forget_dead_vm_tiles",
     "benilla_app::ui_movie::feed_movie",
@@ -73,29 +61,17 @@ const FEEDS: &[&str] = &[
     "benilla_app::ui_pet::unit::feed_pet_unit",
     // The pet page's stat fan-out under `"pet"`, the units' (#1289).
     "benilla_app::ui_pet_doll::feed_pet_doll",
-    "benilla_app::ui_petition::feed::feed_petition",
     "benilla_app::ui_reputation::feed_reputation",
-    "benilla_app::ui_rune::feed_runes",
     "benilla_app::ui_script::demo_unit_feed",
     "benilla_app::ui_script::feed_framerate",
-    "benilla_app::ui_shapeshift::feed_shapeshift_bar",
     "benilla_app::ui_social::feed::feed_social",
-    "benilla_app::ui_spell_info::feed_spell_info",
-    "benilla_app::ui_spellbook::feed_spellbook",
-    "benilla_app::ui_tabard::feed_tabard",
     "benilla_app::ui_talent::feed_inspect_talents",
     "benilla_app::ui_talent::feed_talents",
-    "benilla_app::ui_talent_wipe::feed_talent_wipe",
-    "benilla_app::ui_taxi::feed_taxi",
     "benilla_app::ui_threat::feed_threat",
     "benilla_app::ui_title::feed_titles",
     "benilla_app::ui_tooltip::drive_mouseover_tooltip",
-    "benilla_app::ui_tooltip::spell_feed::feed_spell_tooltips",
-    "benilla_app::ui_totem::feed_multicast",
-    "benilla_app::ui_totem::feed_totems",
     "benilla_app::ui_trade::feed_trade",
     "benilla_app::ui_tradeskill::feed_trade_skill",
-    "benilla_app::ui_trainer::feed_trainer",
     "benilla_app::ui_transfer::feed_difficulty_notices",
     "benilla_app::ui_transfer::feed_transfer_aborts",
     "benilla_app::ui_unit::feed_combo_points",
@@ -128,12 +104,21 @@ const KEPT: &[(&str, &str)] = &[
         "12340 tests the corpse distance on every world-frame update (0x4fa040 -> 0x51f5c0) and fires the corpse range events from that test (0x512c40), not from a packet",
     ),
     (
+        "benilla_app::ui_dressup::sync_dressup_booth",
+        "rendering, no event: the DressUpModel verbs edit their pane's model inside their call through the live view, as 12340's do (0x597e90, 0x597ed0, 0x598830), a record miss asking in the call and landing by the pane's record callback (0x5980fa -> 0x5980b0); this system only mirrors the shown pane's model and facing into the booth, as the model frame draws them on every frame render (0x960240), reading the caches with no ask and writing no game state",
+    ),
+    (
         "benilla_app::ui_pet_doll::sync_pet_booth",
+        "rendering, no event: 12340's model frame reads its facing and model on every frame render (0x960240), the facing its rotate buttons write (0x9606e0)",
+    ),
+    (
+        "benilla_app::ui_tabard::sync_tabard_booth",
         "rendering, no event: 12340's model frame reads its facing and model on every frame render (0x960240), the facing its rotate buttons write (0x9606e0)",
     ),
 ];
 
-/// Every system in [`super::UiFeed`] that holds the VM, off the built `Update` schedule.
+/// Every system in [`super::UiFeed`] that holds the VM or is exclusive, off the built `Update`
+/// schedule.
 fn scheduled_feeds() -> Vec<String> {
     use bevy::ecs::schedule::graph::Direction;
     use bevy::ecs::schedule::NodeId;
@@ -150,14 +135,14 @@ fn scheduled_feeds() -> Vec<String> {
             let feed_set = format!("{:?}", super::UiFeed);
             let graph = schedule.graph();
             for (key, system, _) in graph.systems.iter() {
-                if system.is_exclusive() {
-                    continue;
-                }
+                // An exclusive system in the set reaches the VM through the `World` it lends.
                 let Some(with_access) = graph.systems.get(key) else {
                     continue;
                 };
                 let access = with_access.access.combined_access();
-                if !(access.has_resource_read(vm) || access.has_resource_write(vm)) {
+                if !system.is_exclusive()
+                    && !(access.has_resource_read(vm) || access.has_resource_write(vm))
+                {
                     continue;
                 }
                 // Its sets, walked up the hierarchy to the outermost.

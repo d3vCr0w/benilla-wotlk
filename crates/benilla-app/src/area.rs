@@ -25,13 +25,11 @@
 //! Deviation: the indoor dedup keys `(WMOID, MOGP uniqueID)`, not the client's raw per-WMO group
 //! index, because the raw index can alias across adjacent buildings.
 //!
-use bevy::ecs::system::NonSendMut;
 use bevy::prelude::*;
 
 use crate::console::ConsoleCommandApp;
 
 use benilla_formats::{AreaGroupCatalog, AreaTableCatalog};
-use benilla_ui::script::UiScript;
 
 use crate::net::{ObjectStore, SelfPlayer};
 use crate::target::Factions;
@@ -162,6 +160,14 @@ pub(crate) struct PlayerPlace {
     pub(crate) flyable_area: bool,
 }
 
+/// The client's zone and area ids (`0xbd080c`, `0xbd0810`), 0 for none: written as the zone update
+/// resolves (`0x5204e4`, `0x5204ea`) and zeroed for each session (`0x52928a`).
+#[derive(Resource, Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct ZoneIds {
+    pub(crate) zone: u32,
+    pub(crate) area: u32,
+}
+
 /// The client's zone-text cache: the compare targets, the minimap line's cache and the indoor dedup
 /// pair. It lives per VM, so every login starts zeroed and its first resolve is a NEW_AREA.
 #[derive(Default)]
@@ -209,22 +215,23 @@ fn territory_visible(realm_pvp: bool, zone_flags: u32) -> bool {
 
 /// Resolves the texts and PvP info, pushes the zone caches, then fires the elected zone event.
 fn feed_zone_events(
-    (script, _live): (
-        Option<NonSendMut<UiScript>>,
-        crate::ui_script::LendLive<crate::ui_script::OwnsPlace>,
-    ),
+    mut vm: crate::ui_script::InTurn,
     world: benilla_world::world_point::WorldPoint,
     areas: Option<Res<AreaTableRes>>,
     factions: Option<Res<Factions>>,
     self_store: Query<&ObjectStore, With<SelfPlayer>>,
     roster: Option<Res<crate::char_select::Roster>>,
     mut cache: Local<crate::ui_script::VmMemo<ZoneCache>>,
-    mut place: crate::ui_script::OwnedMut<PlayerPlace>,
+    mut place: ResMut<PlayerPlace>,
+    mut ids: ResMut<ZoneIds>,
 ) {
-    let (Some(mut script), Some(areas)) = (script, areas) else {
+    let (Some(mut script), Some(areas)) = (vm.turn(), areas) else {
         return;
     };
-    let cache = cache.get(&script);
+    let (cache, fresh_vm) = cache.get_reset(&script);
+    if fresh_vm {
+        *ids = ZoneIds::default();
+    }
     let Some(leaf) = world.area() else { return };
     let Some(leaf_row) = areas.0.get(leaf) else {
         // An unknown id keeps the last state, as the resolver does for areaId 0.
@@ -235,6 +242,10 @@ fn feed_zone_events(
     } else {
         leaf_row.zone_id
     };
+    let now = ZoneIds { zone, area: leaf };
+    if *ids != now {
+        *ids = now;
+    }
     let real_zone_text = areas.0.name(zone).unwrap_or_default().to_string();
     let indoor = world.area_interior().is_some();
     let fresh = PlayerPlace {
@@ -244,8 +255,8 @@ fn feed_zone_events(
         },
         flyable_area: leaf_row.flags & 0x400 != 0 && leaf_row.flags & 0x2000_0000 == 0,
     };
-    if *place.read() != fresh {
-        *place.write() = fresh;
+    if *place != fresh {
+        *place = fresh;
     }
 
     // The outdoor texts the indoor naming starts from.
@@ -390,6 +401,13 @@ fn feed_zone_events(
     if minimap_changed {
         debug!("area: minimap zone text → {minimap_text:?}");
     }
+    // The zone feedback ends in the usable update (`0x5206d9`), a step in turn after its events:
+    // it reads the place written above.
+    if let Some(ui) = script.queue() {
+        ui.world(crate::ui_action::usable_cache::step(
+            crate::ui_action::usable_cache::Pass::Full,
+        ));
+    }
     cache.zone_id = Some(signal.zone_id);
     cache.zone_text = signal.zone_text;
     cache.subzone_text = signal.subzone_text;
@@ -404,6 +422,7 @@ pub(crate) struct AreaPlugin;
 impl Plugin for AreaPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<PlayerPlace>()
+            .init_resource::<ZoneIds>()
             .add_systems(
                 Startup,
                 (load_area_table, load_area_groups).after(AssetSet::Open),
@@ -412,12 +431,15 @@ impl Plugin for AreaPlugin {
                 Update,
                 // After the leaf authority: leaf, indoor bit and names must come from one frame, as
                 // in the client's single-pass resolve, or a stale leaf fires a spurious splash.
-                feed_zone_events
-                    // The selection and the pet's words its lent view reads are the clicks'.
-                    .after(crate::target::TargetUpdate)
-                    .after(crate::char_select::RealmEntrySet)
-                    .after(crate::ui_script::UiInput)
-                    .after(benilla_world::terrain_stream::AreaAuthoritySet),
+                crate::ui_script::raises::then_fire(
+                    feed_zone_events
+                        // The usable update it runs reads the clicks' selection.
+                        .after(crate::target::TargetUpdate)
+                        .after(crate::char_select::RealmEntrySet)
+                        .after(crate::ui_script::UiInput)
+                        .after(benilla_world::terrain_stream::AreaAuthoritySet),
+                )
+                .in_set(crate::ui_script::UiPaint),
             )
             .add_systems(
                 Update,

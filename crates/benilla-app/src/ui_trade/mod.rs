@@ -3,9 +3,11 @@
 //! [`answer_trade_request`] answers an incoming request.
 
 use benilla_protocol::messages::{TradeItem, TradeStatusExtended, TRADE_SLOT_COUNT};
+#[cfg(test)]
+use benilla_ui::script::UiScript;
 use bevy::prelude::*;
 
-use benilla_ui::script::{ScriptValue, TradeSideState, TradeSlotItem, TradeState, UiScript};
+use benilla_ui::script::{ScriptValue, TradeSideState, TradeSlotItem, TradeState};
 
 use crate::entities::ItemDisplays;
 use crate::items::Items;
@@ -355,6 +357,16 @@ impl NpcSession for TradeSession {
     }
 }
 
+/// The interaction close's trade leg (`0x512ea4`): the partner setter with none, its target already zeroed, so its clear finds none (`0x5870f7`); the window closes and `CMSG_CANCEL_TRADE` goes out (`0x587116` -> `0x704040`).
+pub(crate) fn close_by_interaction(world: &mut World) {
+    if let Some(mut trade) = world.get_resource_mut::<TradeSession>() {
+        trade.close_window();
+    }
+    if let Some(net) = world.get_resource::<NetCommands>() {
+        let _ = net.0.send(ClientCommand::CancelTrade);
+    }
+}
+
 pub(crate) struct UiTradePlugin;
 
 /// Mirrors the `blockTrades` CVar into [`BlockTrades`].
@@ -411,7 +423,7 @@ impl Plugin for UiTradePlugin {
                     trim_offer_to_purse
                         .after(crate::ui_unit::UnitFeed)
                         .before(feed_trade),
-                    drain_trade.in_set(UiDrain),
+                    crate::ui_script::raises::then_fire(drain_trade).in_set(UiDrain),
                 ),
             );
     }
@@ -631,7 +643,7 @@ fn snapshot(
 /// Push the trade into the VM and fire its events on a change, diffed against `Local` memory;
 /// `TRADE_ACCEPT_UPDATE` fires after `TRADE_SHOW`, whose handler hides the highlights.
 fn feed_trade(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut script: crate::ui_script::InTurn,
     mut trade: ResMut<TradeSession>,
     items: Res<Items>,
     icons: Option<Res<ItemDisplays>>,
@@ -647,7 +659,7 @@ fn feed_trade(
     mut last_player_gold: Local<crate::ui_script::VmMemo<u32>>,
     mut last_their_gold: Local<crate::ui_script::VmMemo<u32>>,
 ) {
-    let Some(mut script) = script else {
+    let Some(mut script) = script.turn() else {
         return;
     };
     let last = last.get(&script);
@@ -760,7 +772,7 @@ fn feed_trade(
 /// Drain the Lua intents into the trade `CMSG`s. `CloseTrade` clears the session, sending
 /// `CMSG_CANCEL_TRADE` only while one is live.
 fn drain_trade(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut script: crate::ui_script::InTurn,
     mut trade: ResMut<TradeSession>,
     commands: Res<NetCommands>,
     selection: Res<Selection>,
@@ -768,8 +780,9 @@ fn drain_trade(
     objects: Objects,
     items: Res<Items>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
+    mut queue: Commands,
 ) {
-    let Some(mut script) = script else {
+    let Some(mut script) = script.turn() else {
         return;
     };
     // Our bag contents, for the own-column item resolve.
@@ -854,6 +867,13 @@ fn drain_trade(
     if script.take_trade_close() {
         if trade.is_open() || trade.partner.is_some() {
             let _ = commands.0.send(ClientCommand::CancelTrade);
+        }
+        // The partner setter with none clears the interact target on the partner (`0x5870f7`).
+        if let Some(partner) = trade.npc() {
+            queue.queue(move |w: &mut World| {
+                crate::ui_session::clear_interact_target(w, partner);
+                crate::ui_script::live::fire_handler_events(w);
+            });
         }
         trade.close_window();
     }

@@ -247,7 +247,7 @@ impl Default for RangeInputs {
 #[derive(SystemParam)]
 pub(crate) struct CastTargeting<'w, 's> {
     /// Read beside the press appliers' own write of it, at each call.
-    selection: crate::ui_script::LentRef<'w, Selection>,
+    selection: Option<Res<'w, Selection>>,
     pub(crate) self_store: Query<'w, 's, &'static ObjectStore, With<SelfPlayer>>,
     pub(crate) self_auras: Query<'w, 's, &'static UnitAuras, With<SelfPlayer>>,
     /// Any caster's auras, for a cast as the pet.
@@ -282,13 +282,13 @@ impl CastTargeting<'_, '_> {
     /// The selection as it stands now: `(entity, guid)`.
     pub(crate) fn selected(&self) -> (Option<Entity>, Option<u64>) {
         self.selection
-            .get()
+            .as_deref()
             .map_or((None, None), |s| (s.target, s.guid))
     }
 
     /// The selection as it stands now, for a token's resolve.
     pub(crate) fn selection(&self) -> Selection {
-        self.selection.get().map(|s| s.clone()).unwrap_or_default()
+        self.selection.as_deref().cloned().unwrap_or_default()
     }
 
     /// This frame's [`CastContext`].
@@ -387,21 +387,6 @@ impl CastTargeting<'_, '_> {
         ctx.range.target = entity.and_then(|e| self.range_units.unit(e));
         ctx.target_auras = entity.and_then(|e| self.unit_auras.get(e).ok());
         ctx
-    }
-
-    /// The unit `guid` as the range check reads it ([`super::range_check::RangeFacts`]), `None`
-    /// before it streams.
-    pub(crate) fn range_facts(&self, guid: u64) -> Option<super::range_check::RangeFacts> {
-        let ctx = self.context_at(Aim::Unit(Some(guid)));
-        let rel = &ctx.rel;
-        let store = rel.target_store?;
-        let is_self = self.self_guid.0 == Some(guid);
-        Some(range_facts_of(
-            rel,
-            store,
-            (ctx.range.target?, ctx.range.target_pos?),
-            is_self,
-        ))
     }
 
     /// The [`CastContext`] of a cast with the pet as caster (the spell-cast entry `0x80cce0` called
@@ -1193,8 +1178,21 @@ pub(crate) struct RangeFactsView<'w, 's> {
 }
 
 impl RangeFactsView<'_, '_> {
+    /// The units' reaches, motion and auto-attack targets.
+    pub(crate) fn range_units(&self) -> &super::RangeUnits<'_, '_> {
+        &self.range_units
+    }
+
+    /// The unit `entity`'s reach and position now, `None` before it streams.
+    pub(crate) fn at(&self, entity: Entity) -> Option<(benilla_formats::RangeUnit, Vec3)> {
+        Some((
+            self.range_units.unit(entity)?,
+            self.transforms.get(entity).ok()?.translation,
+        ))
+    }
+
     /// The unit `guid` as the range check reads it now, as [`CastTargeting::range_facts`] builds it; `None` before it streams.
-    fn facts(&self, guid: u64) -> Option<super::range_check::RangeFacts> {
+    pub(crate) fn facts(&self, guid: u64) -> Option<super::range_check::RangeFacts> {
         let entity = *self.index.as_deref()?.0.get(&guid)?;
         let store = self.stores.get(entity).ok()?;
         let self_guid = self.self_guid.as_deref().and_then(|g| g.0);

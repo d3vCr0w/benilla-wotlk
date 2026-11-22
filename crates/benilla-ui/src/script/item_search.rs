@@ -254,21 +254,13 @@ fn use_spell(model: &Model, item_id: u32) -> Option<u32> {
         .map(|s| s.spell)
 }
 
-/// The item's use spell, as `GetItemSpell` picks it, and the VM's spell source.
-#[allow(clippy::type_complexity)]
-fn item_range_spell(
-    lua: &Lua,
-    item: &Value,
-) -> mlua::Result<(
-    Option<u32>,
-    Option<std::rc::Rc<dyn super::spell_info::SpellInfoSource>>,
-)> {
+/// The item's use spell, as `GetItemSpell` picks it.
+fn item_range_spell(lua: &Lua, item: &Value) -> mlua::Result<Option<u32>> {
     let model = lua
         .app_data_ref::<crate::script::ModelCell>()
         .expect("model app_data");
     let id = item_id_of(lua, &model, item)?;
-    let spell = use_spell(&model, id).or_else(|| enchant_use_spell(&model, id));
-    Ok((spell, model.spell_info.clone()))
+    Ok(use_spell(&model, id).or_else(|| enchant_use_spell(&model, id)))
 }
 
 /// With no on-use spell, the use spell of an enchant on the worn item (`0x5a86b0`, `0x707c60`).
@@ -322,16 +314,20 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let Some(at) = super::calls::cast_at_arg(lua, Some(&unit)) else {
                 return Ok(());
             };
-            let mut model = crate::script::model_mut_of(lua);
-            if model.unit_guids.player == 0 {
+            let model = crate::script::model_mut_of(lua);
+            if model.player_guid() == 0 {
                 return Ok(());
             }
             if let Some(held) = find_item(&model, &query, 0) {
-                model.script_calls.push(ScriptCall::UseItemAt {
-                    bag: held.bag,
-                    slot: held.slot,
-                    at,
-                });
+                drop(model);
+                super::calls::make(
+                    lua,
+                    ScriptCall::UseItemAt {
+                        bag: held.bag,
+                        slot: held.slot,
+                        at,
+                    },
+                );
             }
             Ok(())
         })?,
@@ -342,8 +338,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "EquipItemByName",
         lua.create_function(|lua, (item, slot): (Value, Value)| {
-            let mut model = crate::script::model_mut_of(lua);
-            if model.unit_guids.player == 0 {
+            let model = crate::script::model_mut_of(lua);
+            if model.player_guid() == 0 {
                 return Ok(());
             }
             let dst = match slot {
@@ -363,11 +359,15 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 None => worn,
             };
             if !stays {
-                model.script_calls.push(ScriptCall::EquipItem {
-                    bag: held.bag,
-                    slot: held.slot,
-                    dst: dst.map(|d| d as u8),
-                });
+                drop(model);
+                super::calls::make(
+                    lua,
+                    ScriptCall::EquipItem {
+                        bag: held.bag,
+                        slot: held.slot,
+                        dst: dst.map(|d| d as u8),
+                    },
+                );
             }
             Ok(())
         })?,
@@ -416,10 +416,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "ItemHasRange",
         lua.create_function(|lua, item: Value| {
-            let (spell, source) = item_range_spell(lua, &item)?;
-            let has = spell
-                .zip(source)
-                .is_some_and(|(id, s)| s.spell_has_range(id, false));
+            let spell = item_range_spell(lua, &item)?;
+            let has = spell.is_some_and(|id| {
+                super::spell_info::with_spell_source(lua, |s| s.spell_has_range(id, false))
+                    == Some(true)
+            });
             Ok(if has { Value::Integer(1) } else { Value::Nil })
         })?,
     )?;
@@ -428,12 +429,12 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     g.set(
         "IsItemInRange",
         lua.create_function(|lua, (item, unit): (Value, Value)| {
-            let (spell, source) = item_range_spell(lua, &item)?;
+            let spell = item_range_spell(lua, &item)?;
             let target = super::spell_info::range_unit(lua, &unit);
-            let near = spell
-                .zip(source)
-                .zip(target)
-                .and_then(|((id, s), guid)| s.spell_in_range(id, false, guid));
+            let near = spell.zip(target).and_then(|(id, guid)| {
+                super::spell_info::with_spell_source(lua, |s| s.spell_in_range(id, false, guid))
+                    .flatten()
+            });
             Ok(super::spell_info::range_answer(near))
         })?,
     )?;
@@ -503,7 +504,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let model = lua
                 .app_data_ref::<crate::script::ModelCell>()
                 .expect("model app_data");
-            if model.unit_guids.player == 0
+            if model.player_guid() == 0
                 || !(-1..=11).contains(&bag)
                 || (bag == BANK as i32 && !super::bank::bank_open())
             {

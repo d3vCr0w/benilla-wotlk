@@ -93,6 +93,74 @@ pub(crate) fn fire_lock_edge_now(
     }
 }
 
+/// One lock or unlock a step makes (`0x706fe0`, `0x707020`), with its edge's arguments; `None`
+/// arguments write only.
+pub(crate) struct LockStep {
+    pub(crate) guid: u64,
+    pub(crate) locked: bool,
+    pub(crate) args: Option<Vec<ScriptValue>>,
+}
+
+/// Write `lock` and, on the bit's edge, signal at its place with the `World` lent before anything
+/// after it runs (`0x706feb`, `0x70702b`), so its listener reads the later locks still unwritten.
+pub(crate) fn lock_now(world: &mut World, lock: LockStep) {
+    let LockStep { guid, locked, args } = lock;
+    let changed = world
+        .get_resource_mut::<PendingItemOps>()
+        .is_some_and(|mut p| if locked { p.lock(guid) } else { p.unlock(guid) });
+    if let (true, Some(args)) = (changed, args) {
+        crate::ui_script::safe_world::lend(world, |s| fire_lock_edge_now(s, locked, args));
+    }
+}
+
+/// Run `step`, a send that raises in turn, then fire what it raised and write each lock it made,
+/// each lock's edge signalled before the next is written (`0x706fe0` -> `0x706feb`).
+pub(crate) fn run_lock_step<I: Send + 'static, M>(
+    world: &mut World,
+    step: impl IntoSystem<In<I>, Vec<LockStep>, M> + 'static,
+    input: I,
+) {
+    let locks = world
+        .run_system_cached_with(step, input)
+        .unwrap_or_default();
+    crate::ui_script::live::fire_handler_events(world);
+    for lock in locks {
+        lock_now(world, lock);
+    }
+}
+
+/// Run `step` on the lent `World` in the caller's turn: for a step that holds the `World` while it
+/// raises in turn (an applier inside its call), behind the raises made so far; at once otherwise.
+pub(crate) fn world_in_turn(
+    script: &mut benilla_ui::script::UiScript,
+    step: impl FnOnce(&mut World) + Send + Sync + 'static,
+) {
+    benilla_ui::script::world_loan::in_turn_or_now(script, move |_| {
+        crate::ui_script::safe_world::with_world(step)
+            .expect("a step in turn runs where the `World` is lent");
+    });
+}
+
+/// The lock and its edge, then the send it guards, both in the caller's turn (`0x6e0136` before
+/// `0x6e016e`).
+pub(crate) fn lock_then_send_in_turn(
+    script: &mut benilla_ui::script::UiScript,
+    lock: LockStep,
+    send: crate::net::ClientCommand,
+) {
+    world_in_turn(script, move |w| {
+        lock_now(w, lock);
+        send_now(w, send);
+    });
+}
+
+/// Put `send` on the wire.
+pub(crate) fn send_now(world: &World, send: crate::net::ClientCommand) {
+    if let Some(commands) = world.get_resource::<crate::net::NetCommands>() {
+        let _ = commands.0.send(send);
+    }
+}
+
 /// The item unlock (`0x513770` -> `0x707020`): a locked item unlocks and signals at its place; an unlocked or absent one does nothing.
 pub(crate) fn unlock_item(world: &mut World, guid: u64) {
     let unlocked = world
@@ -179,6 +247,8 @@ fn unlock_items_of_type(world: &mut World, entry: u32, bank: bool) {
 
 /// `BAG_UPDATE` for a container's guid (`0x5d7070`): ours is the backpack, keyring and tokens (`0x5d7098`-`0x5d70ba`), a watched bag its id (`0x5d70ff`), anything else nothing.
 fn contents_update(world: &mut World, guid: u64) {
+    // The bar's refresh first (`0x5d7074`).
+    crate::ui_action::usable_cache::step(crate::ui_action::usable_cache::Pass::Bar)(world);
     let me = world
         .get_resource::<crate::net::SelfGuid>()
         .and_then(|s| s.0);
@@ -261,6 +331,12 @@ pub(crate) fn inv_slot_changed(world: &mut World, slot: u8, old: u64, new: u64) 
         if old != new {
             unlock_item(world, new);
         }
+        // The bar's weapon faces (`0x6dee53`, `0x6dee5d`).
+        match slot {
+            15 | 16 => crate::ui_action::slots::update_weapon_faces(world, false),
+            17 => crate::ui_action::slots::update_weapon_faces(world, true),
+            _ => {}
+        }
         if let (0..=18, Some(mut ui)) = (slot, world.get_resource_mut::<UiEvents>()) {
             let id = i64::from(slot) + 1;
             if new != 0 {
@@ -282,15 +358,25 @@ pub(crate) fn inv_slot_changed(world: &mut World, slot: u8, old: u64, new: u64) 
         }
     }
     match slot {
-        // The bag slots' watch (`0x5d9b40`): our contents, then the watched bags (`0x5d9bf9`, `0x5d9bfe`).
+        // The bag slots' watch (`0x5d9b40`): the bar's item update for each item the bag holds
+        // (`0x5d9be3`), our contents, then the watched bags (`0x5d9bf9`, `0x5d9bfe`).
         19..=22 | 67..=73 => {
+            for entry in bag_entries(world, new) {
+                crate::ui_action::slots::update_item(world, entry);
+            }
             if let Some(me) = me {
                 contents_update(world, me);
             }
             update_containers(world);
         }
-        // The pack, keyring and token slots' watch (`0x5d9790`): the new item unlocks (`0x5d9863`), then our contents (`0x5d98e3`).
+        // The pack, keyring and token slots' watch (`0x5d9790`): a moved slot's old and new items'
+        // bar updates (`0x5d9839`, `0x5d984f`), the new item unlocks (`0x5d9863`), then our
+        // contents (`0x5d98e3`).
         23..=38 | 86..=149 => {
+            if old != new {
+                bar_item(world, old);
+                bar_item(world, new);
+            }
             unlock_item(world, new);
             if let Some(me) = me {
                 contents_update(world, me);
@@ -300,8 +386,16 @@ pub(crate) fn inv_slot_changed(world: &mut World, slot: u8, old: u64, new: u64) 
     }
 }
 
-/// A watched bag's slot `j` moved (`0x5d9600`), registered on each of its slots (`0x5d9af8`): the slot's new item unlocks (`0x5d96c6`), then the bag's `BAG_UPDATE` (`0x5d9746`).
-pub(crate) fn bag_slot_changed(world: &mut World, bag: u64, j: u8) {
+/// A watched bag's slot `j` moved (`0x5d9600`), registered on each of its slots (`0x5d9af8`), the
+/// slot guid's old halves `old` where they moved: a moved slot's old and new items' bar updates
+/// (`0x5d969c`, `0x5d96b2`), the slot's new item unlocks (`0x5d96c6`), then the bag's `BAG_UPDATE`
+/// (`0x5d9746`).
+pub(crate) fn bag_slot_changed(
+    world: &mut World,
+    bag: u64,
+    j: u8,
+    old: (Option<u32>, Option<u32>),
+) {
     let watched = world
         .get_resource::<WatchedBags>()
         .is_some_and(|w| bag != 0 && w.0.contains(&bag));
@@ -322,8 +416,38 @@ pub(crate) fn bag_slot_changed(world: &mut World, bag: u64, j: u8) {
     let Some(new) = new else {
         return;
     };
+    let (lo, hi) = old;
+    let old =
+        (u64::from(hi.unwrap_or((new >> 32) as u32)) << 32) | u64::from(lo.unwrap_or(new as u32));
+    if old != new {
+        bar_item(world, old);
+        bar_item(world, new);
+    }
     unlock_item(world, new);
     contents_update(world, bag);
+}
+
+/// The entries of the items bag `bag` holds, in slot order.
+fn bag_entries(world: &mut World, bag: u64) -> Vec<u32> {
+    if bag == 0 {
+        return Vec::new();
+    }
+    world
+        .run_system_cached_with(
+            |In(bag): In<u64>, objects: Objects| {
+                let Some(b) = objects.object(bag) else {
+                    return Vec::new();
+                };
+                let n = b.container_num_slots().unwrap_or(0).min(36) as u8;
+                (0..n)
+                    .filter_map(|j| b.container_slot(j))
+                    .filter(|&g| g != 0)
+                    .filter_map(|g| objects.object(g)?.object_entry())
+                    .collect()
+            },
+            bag,
+        )
+        .unwrap_or_default()
 }
 
 /// The item's entry and container when we own it, read as the watches read them.
@@ -342,6 +466,44 @@ fn owned_item(world: &mut World, item: u64) -> Option<(u32, u64)> {
         )
         .ok()
         .flatten()
+}
+
+/// An item's entry, and the player slot it is worn in, if any.
+fn entry_and_slot(world: &mut World, item: u64) -> Option<(u32, Option<u8>)> {
+    world
+        .run_system_cached_with(
+            |In(item): In<u64>, objects: Objects| {
+                let fields = objects.object(item)?;
+                let me = objects.player_object();
+                let slot = me.and_then(|me| (0..19u8).find(|&s| me.player_slot(s) == Some(item)));
+                Some((fields.object_entry().unwrap_or(0), slot))
+            },
+            item,
+        )
+        .ok()
+        .flatten()
+}
+
+/// The bar's updates for an item of ours: the melee faces when it is worn in a hand, the ranged
+/// face in the ranged slot (`0x70792d`, `0x707934`; `0x70add6`, `0x70addd`), then its entry's item
+/// update (`0x5aa5c0`).
+fn bar_item_with_faces(world: &mut World, item: u64) {
+    let Some((entry, slot)) = entry_and_slot(world, item) else {
+        return;
+    };
+    match slot {
+        Some(15 | 16) => crate::ui_action::slots::update_weapon_faces(world, false),
+        Some(17) => crate::ui_action::slots::update_weapon_faces(world, true),
+        _ => {}
+    }
+    crate::ui_action::slots::update_item(world, entry);
+}
+
+/// The bar's item update (`0x5aa5c0`) for the entry of item `guid`, 0 or an unknown guid none.
+fn bar_item(world: &mut World, item: u64) {
+    if let Some((entry, _)) = entry_and_slot(world, item) {
+        crate::ui_action::slots::update_item(world, entry);
+    }
 }
 
 /// The containers' item refresh (`0x5d7320`): an item we own fires its container's `BAG_UPDATE`.
@@ -376,8 +538,9 @@ fn character_item_updated(world: &mut World, item: u64) {
     }
 }
 
-/// The entry watch's record callback (`0x7078e0`): its container's `BAG_UPDATE` (`0x707949`) and the character page's slot event (`0x707955`).
+/// The entry watch's record callback (`0x7078e0`): the bar's faces and item update (`0x70792d`-`0x70793d`), its container's `BAG_UPDATE` (`0x707949`) and the character page's slot event (`0x707955`).
 pub(crate) fn entry_record(world: &mut World, item: u64) {
+    bar_item_with_faces(world, item);
     item_updated(world, item);
     character_item_updated(world, item);
 }
@@ -390,7 +553,7 @@ fn template_of(world: &World, entry: u32) -> Option<(u32, u32)> {
         .map(|t| (t.stackable, t.flags))
 }
 
-/// An item's stack count moved (`0x707720`), on an item we own (`0x707757`): a stackable kind unlocks every item of it, the bank's too (`0x7077c1`), anything else the item alone (`0x7077d2`); then its container's `BAG_UPDATE` (`0x707805`) and the character page's slot event (`0x707814`).
+/// An item's stack count moved (`0x707720`), on an item we own (`0x707757`): a stackable kind unlocks every item of it, the bank's too (`0x7077c1`), anything else the item alone (`0x7077d2`); then the bar's item update (`0x7077e7`), its container's `BAG_UPDATE` (`0x707805`) and the character page's slot event (`0x707814`).
 pub(crate) fn stack_changed(world: &mut World, item: u64) {
     let Some((entry, _)) = owned_item(world, item) else {
         return;
@@ -399,11 +562,33 @@ pub(crate) fn stack_changed(world: &mut World, item: u64) {
         Some((stackable, _)) if stackable > 1 => unlock_items_of_type(world, entry, true),
         _ => unlock_item(world, item),
     }
+    crate::ui_action::slots::update_item(world, entry);
     item_updated(world, item);
     character_item_updated(world, item);
 }
 
-/// An item's enchants moved (`0x708bd0` -> `0x707f50`): a charter returns (`0x707f6b`), an unheld owner too (`0x707f9e`); on ours (`0x707fb8`), no unlock, its container's `BAG_UPDATE` (`0x707fe4`) and the character page's slot event (`0x707ff3`).
+/// An item's spell charges moved (`0x707880`): on an item we own, the bar's item update
+/// (`0x7078c3`), then the bags' cooldown signal (`0x7078cb`).
+pub(crate) fn charges_changed(world: &mut World, item: u64) {
+    let ours = world
+        .run_system_cached_with(
+            |In(item): In<u64>, objects: Objects, self_guid: Option<Res<crate::net::SelfGuid>>| {
+                let me = self_guid.and_then(|s| s.0);
+                me.is_some() && objects.object(item).and_then(|f| f.item_owner()) == me
+            },
+            item,
+        )
+        .unwrap_or(false);
+    if !ours {
+        return;
+    }
+    bar_item(world, item);
+    if let Some(mut ui) = world.get_resource_mut::<crate::ui_script::live::UiEvents>() {
+        ui.fire("BAG_UPDATE_COOLDOWN", Vec::new());
+    }
+}
+
+/// An item's enchants moved (`0x708bd0` -> `0x707f50`): a charter returns (`0x707f6b`), an unheld owner too (`0x707f9e`); on ours (`0x707fb8`), no unlock, the bar's item update (`0x707fc6`), its container's `BAG_UPDATE` (`0x707fe4`) and the character page's slot event (`0x707ff3`).
 pub(crate) fn enchants_changed(world: &mut World, item: u64) {
     let found = world
         .run_system_cached_with(
@@ -430,11 +615,12 @@ pub(crate) fn enchants_changed(world: &mut World, item: u64) {
     if Some(owner) != me {
         return;
     }
+    crate::ui_action::slots::update_item(world, entry);
     item_updated(world, item);
     character_item_updated(world, item);
 }
 
-/// The post-init's unlock on an item we own (`0x70ad20`): a single item unlocks itself (`0x70ad9e`), a stackable kind every item of it outside the bank (`0x70ad8d`).
+/// The post-init's unlock on an item we own (`0x70ad20`): a single item unlocks itself (`0x70ad9e`), a stackable kind every item of it outside the bank (`0x70ad8d`); then the bar's faces and item update (`0x70add6`-`0x70adf0`).
 pub(crate) fn post_init_unlock(world: &mut World, item: u64) {
     let Some((entry, _)) = owned_item(world, item) else {
         return;
@@ -443,6 +629,7 @@ pub(crate) fn post_init_unlock(world: &mut World, item: u64) {
         Some((stackable, _)) if stackable > 1 => unlock_items_of_type(world, entry, false),
         _ => unlock_item(world, item),
     }
+    bar_item_with_faces(world, item);
 }
 
 /// `SMSG_OPEN_CONTAINER` (`0x6e32d0` -> `0x5d7110`): `BAG_OPEN` with 0 for our own guid, a watched bag's id for one of them, nothing else.
@@ -471,5 +658,66 @@ pub(crate) fn open_container(world: &mut World, item: u64) {
         for id in ids {
             ui.fire("BAG_OPEN", vec![ScriptValue::Int(id)]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use benilla_ui::script::UiScript;
+
+    const A: u64 = 0x4000_0000_0000_0A01;
+    const B: u64 = 0x4000_0000_0000_0B02;
+
+    /// A step that locks both ends of a swap.
+    fn swap_locks(In(()): In<()>) -> Vec<LockStep> {
+        [A, B]
+            .into_iter()
+            .map(|guid| LockStep {
+                guid,
+                locked: true,
+                args: Some(vec![ScriptValue::Int(guid as i64 & 0xff)]),
+            })
+            .collect()
+    }
+
+    /// Each lock's listener runs before the next lock is written, and the drain's later reads see
+    /// every lock (`0x706fe0` -> `0x706feb`, once per end).
+    #[test]
+    fn each_locks_listener_reads_the_later_lock_unwritten() {
+        let mut world = World::new();
+        world.init_resource::<PendingItemOps>();
+        world.init_resource::<UiEvents>();
+        let script = UiScript::new().expect("a VM");
+        let locked = script
+            .lua()
+            .create_function(|_, guid: i64| {
+                Ok(crate::ui_script::safe_world::with_world(|w| {
+                    w.resource::<PendingItemOps>()
+                        .is_locked(guid as u64 | 0x4000_0000_0000_0000)
+                }))
+            })
+            .unwrap();
+        script.lua().globals().set("ProbeLocked", locked).unwrap();
+        script
+            .run(
+                r#"SEEN = {}
+                   local f = CreateFrame("Frame")
+                   f:RegisterEvent("ITEM_LOCKED")
+                   f:SetScript("OnEvent", function(_, _, id)
+                       SEEN[#SEEN + 1] = id .. ":" .. tostring(ProbeLocked(0x0A01))
+                           .. "/" .. tostring(ProbeLocked(0x0B02))
+                   end)"#,
+            )
+            .unwrap();
+        world.insert_non_send_resource(script);
+        run_lock_step(&mut world, swap_locks, ());
+        let seen = world
+            .non_send_resource::<UiScript>()
+            .eval::<Vec<String>>("return SEEN")
+            .unwrap();
+        assert_eq!(seen, ["1:true/false", "2:true/true"]);
+        let ops = world.resource::<PendingItemOps>();
+        assert!(ops.is_locked(A) && ops.is_locked(B));
     }
 }

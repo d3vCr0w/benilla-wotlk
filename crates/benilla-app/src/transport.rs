@@ -6,9 +6,9 @@
 //!   template's `(taxiPathId, moveSpeed, accelRate)` ([`benilla_formats::TransportTimetable`]),
 //!   sampled at `(anchor + elapsed) % period`.
 //! - Type 11 (`TRANSPORT`, elevators and trams): the `TransportAnimation.dbc` keyframe path keyed
-//!   by template entry, at `spawn + R(spawn_quat)·lerp(keyframes, (anchor + elapsed) % period)`
-//!   ([`benilla_formats::elevator_sample`], vmangos does the same in `ElevatorTransport::Update`,
-//!   `Transport.cpp:396`).
+//!   by template entry, at `spawn + R(parent)·lerp(keyframes, (anchor + elapsed) % period)`
+//!   ([`benilla_formats::elevator_sample`], `0x70daa0`), turned by its `TransportRotation.dbc`
+//!   keys where it has two or more ([`benilla_formats::elevator_rotation`], `0x70dc10`).
 //!
 //! This module only moves the streamed GameObject; riding keys on [`Transport`], not the drive.
 
@@ -18,8 +18,10 @@ use std::time::Instant;
 
 use avian3d::prelude::{Position, RigidBody, Rotation};
 use benilla_formats::{
-    elevator_period_ms, elevator_sample, load_elevator_paths, load_taxi_path_nodes,
-    ElevatorKeyframe, ElevatorPaths, TaxiPathNodes, TransportSample, TransportTimetable,
+    elevator_period_ms, elevator_rotation, elevator_sample, load_elevator_paths,
+    load_rotation_paths, load_taxi_path_nodes, load_transport_physics, ElevatorKeyframe,
+    ElevatorPaths, RotationKey, RotationPaths, TaxiPathNodes, TransportPhysics,
+    TransportPhysicsTable, TransportSample, TransportTimetable,
 };
 // The collider AABB and collider-tree refresh, run a second time each frame in the chain below.
 use benilla_world::collision::refit_changed_collider_aabbs;
@@ -55,6 +57,7 @@ impl Plugin for TransportPlugin {
                     arm_transports,
                     reseek_ridden_transport_at_worldport,
                     tick_transports,
+                    drive_ship_props,
                     watch_ridden_transport_map,
                     refit_changed_collider_aabbs::<With<Transport>>,
                     compose_riders,
@@ -94,11 +97,13 @@ pub(crate) struct ElevatorSeed {
     pub(crate) entry: u32,
     /// Spawn position (raw WoW coords), from the movement block: no descriptor field holds it.
     pub(crate) base_pos: [f32; 3],
-    /// Spawn facing (WoW radians), the car's constant heading.
+    /// Spawn facing (WoW radians), the car's heading when it has no rotation of its own.
     pub(crate) yaw: f32,
-    /// `GAMEOBJECT_ROTATION`, the spawn quaternion the keyframe offsets rotate through; `None`
-    /// falls back to the pure-yaw quat, which is what spawn rows encode.
+    /// The movement block's own rotation, the car's orientation under two `TransportRotation`
+    /// keys (`0x70dc10`); `None` draws the facing.
     pub(crate) quat: Option<[f32; 4]>,
+    /// `GAMEOBJECT_PARENTROTATION`, the basis its keyframe offsets and rotation keys turn by.
+    pub(crate) parent: [f32; 4],
 }
 
 /// A ticking transport, armed by [`arm_transports`].
@@ -112,8 +117,8 @@ pub(crate) struct Transport {
 
 /// The two cycle evaluators; consumers key on [`Transport`], never on the drive.
 enum Drive {
-    /// Type 15: the client-computed taxi-path timetable.
-    Taxi(Arc<TransportTimetable>),
+    /// Type 15: the client-computed taxi-path timetable, rocked by its `TransportPhysics` row.
+    Taxi(Arc<TransportTimetable>, Option<TransportPhysics>),
     /// Type 11: the authored `TransportAnimation` keyframe path.
     Lift(Lift),
 }
@@ -123,10 +128,15 @@ enum Drive {
 /// `CurrentMap` is still the startup seed when lifts arm, so a stamped map would hide them.
 struct Lift {
     frames: Arc<Vec<ElevatorKeyframe>>,
+    /// Its `TransportRotation` keys; empty for a car without.
+    rotations: Arc<Vec<RotationKey>>,
     period_ms: u32,
     base_pos: [f32; 3],
-    quat: [f32; 4],
-    /// Constant rendered heading (wire orientation, WoW radians).
+    /// `GAMEOBJECT_PARENTROTATION`.
+    parent: [f32; 4],
+    /// Its own rotation, drawn under two rotation keys; `None` draws `yaw`.
+    own: Option<[f32; 4]>,
+    /// The wire orientation (WoW radians).
     yaw: f32,
 }
 
@@ -143,14 +153,14 @@ impl Transport {
     /// Which drive is underneath, for the instruments only (`WOW_LIFT_CENSUS`).
     pub(crate) fn drive_label(&self) -> &'static str {
         match &self.drive {
-            Drive::Taxi(_) => "taxi",
+            Drive::Taxi(..) => "taxi",
             Drive::Lift(_) => "lift",
         }
     }
 
     pub(crate) fn period_ms(&self) -> u32 {
         match &self.drive {
-            Drive::Taxi(t) => t.period_ms,
+            Drive::Taxi(t, _) => t.period_ms,
             Drive::Lift(l) => l.period_ms,
         }
     }
@@ -169,19 +179,19 @@ impl Transport {
         anchor: &mut TransportAnchor,
         map_id: u32,
     ) -> Option<(TransportSample, Option<u32>)> {
-        let Drive::Taxi(t) = &self.drive else {
+        let Drive::Taxi(t, _) = &self.drive else {
             return None;
         };
         let cycle = self.cycle_ms(anchor);
         // Already there: seeking would rewind to the leg's head and jerk the deck backwards.
-        let here = t.sample(cycle);
+        let here = self.sample(cycle, map_id);
         if here.map == map_id {
             return Some((here, None));
         }
         let target = t.first_cycle_on_map(cycle, map_id)?;
         anchor.progress_ms = target;
         anchor.at = Instant::now();
-        Some((t.sample(target), Some(target)))
+        Some((self.sample(target, map_id), Some(target)))
     }
 
     /// Whether any leg of the cycle lies on `map_id`, the cross-map worldport's spare predicate. A
@@ -189,7 +199,7 @@ impl Transport {
     /// (`SendInitTransports`), so a lift despawns and streams back like any object.
     pub(crate) fn touches_map(&self, map_id: u32) -> bool {
         match &self.drive {
-            Drive::Taxi(t) => t.touches_map(map_id),
+            Drive::Taxi(t, _) => t.touches_map(map_id),
             Drive::Lift(_) => false,
         }
     }
@@ -198,16 +208,40 @@ impl Transport {
     /// knows each leg's map), a lift reports it, as a type-11 exists only on the viewer's map.
     fn sample(&self, cycle_ms: u32, here: u32) -> TransportSample {
         match &self.drive {
-            Drive::Taxi(t) => t.sample(cycle_ms),
+            Drive::Taxi(t, None) => t.sample(cycle_ms),
+            Drive::Taxi(t, Some(physics)) => t.sample_rocked(cycle_ms, physics),
             Drive::Lift(l) => {
-                let (pos, moving) = elevator_sample(&l.frames, l.base_pos, l.quat, cycle_ms);
+                let (pos, moving) = elevator_sample(&l.frames, l.base_pos, l.parent, cycle_ms);
+                let rotation =
+                    elevator_rotation(&l.rotations, l.period_ms, l.parent, cycle_ms).or(l.own);
                 TransportSample {
                     map: here,
                     pos,
                     heading: l.yaw,
+                    rotation,
                     moving,
+                    // A lift's props keep their own arm; only a ship path hands one out.
+                    sequence: benilla_formats::SHIP_STAND,
                 }
             }
+        }
+    }
+
+    /// The ship state a boat hands its props this frame (`0x7134a0`), `None` for a lift or a boat
+    /// on another map's leg, where the reference returns before setting it.
+    fn ship_sequence(&self, anchor: &TransportAnchor, here: u32) -> Option<u16> {
+        let Drive::Taxi(t, _) = &self.drive else {
+            return None;
+        };
+        let sample = t.sample(self.cycle_ms(anchor));
+        (sample.map == here).then_some(sample.sequence)
+    }
+
+    /// The reference's ship-path leg the cycle is on, for a type 15 (`0x7f82b0`); a lift has none.
+    pub(crate) fn ship_leg_at(&self, anchor: &TransportAnchor) -> Option<u32> {
+        match &self.drive {
+            Drive::Taxi(t, _) => Some(t.ship_leg(self.cycle_ms(anchor))),
+            Drive::Lift(_) => None,
         }
     }
 
@@ -225,6 +259,11 @@ struct Timetables {
     built: HashMap<(u32, u32), Option<Arc<TransportTimetable>>>,
     elevators: Option<ElevatorPaths>,
     lifts: HashMap<u32, Arc<Vec<ElevatorKeyframe>>>,
+    /// `TransportPhysics.dbc`; without it every ship sails level.
+    physics: Option<TransportPhysicsTable>,
+    /// `TransportRotation.dbc`; without it every car keeps its own rotation.
+    rotations: Option<RotationPaths>,
+    turns: HashMap<u32, Arc<Vec<RotationKey>>>,
 }
 
 fn setup_taxi_nodes(mut timetables: ResMut<Timetables>, world_assets: Option<Res<WorldAssets>>) {
@@ -247,6 +286,20 @@ fn setup_taxi_nodes(mut timetables: ResMut<Timetables>, world_assets: Option<Res
         }
         // Without keyframes cars stay at their spawn point.
         Err(e) => warn!("TransportAnimation unavailable, lifts stay put: {e:#}"),
+    }
+    match load_transport_physics(&mut chain) {
+        Ok(physics) => {
+            info!("transport physics: {} rows", physics.len());
+            timetables.physics = Some(physics);
+        }
+        Err(e) => warn!("TransportPhysics unavailable, ships sail level: {e:#}"),
+    }
+    match load_rotation_paths(&mut chain) {
+        Ok(rotations) => {
+            info!("transport rotations: {} turning cars", rotations.len());
+            timetables.rotations = Some(rotations);
+        }
+        Err(e) => warn!("TransportRotation unavailable, cars keep their spawn rotation: {e:#}"),
     }
 }
 
@@ -274,7 +327,11 @@ fn arm_transports(
         // The lift arm.
         if let Some(seed) = seed {
             let Timetables {
-                elevators, lifts, ..
+                elevators,
+                lifts,
+                rotations,
+                turns,
+                ..
             } = &mut *timetables;
             let Some(paths) = elevators.as_ref() else {
                 continue; // no client data: stays frozen
@@ -300,11 +357,17 @@ fn arm_transports(
                 .or_insert_with(|| Arc::new(frames.to_vec()))
                 .clone();
             let period_ms = elevator_period_ms(&frames);
-            // No rotation on the wire: the pure-yaw quat, the encoding 1.12 spawn rows use.
-            let quat = seed.quat.unwrap_or_else(|| {
-                let (s, c) = (seed.yaw * 0.5).sin_cos();
-                [0.0, 0.0, s, c]
-            });
+            let keys = turns
+                .entry(seed.entry)
+                .or_insert_with(|| {
+                    Arc::new(
+                        rotations
+                            .as_ref()
+                            .and_then(|r| r.entry(seed.entry))
+                            .map_or_else(Vec::new, <[RotationKey]>::to_vec),
+                    )
+                })
+                .clone();
             debug!(
                 "transport: lift entry {} armed — period {period_ms} ms (guid {:#x})",
                 seed.entry, guid.0
@@ -313,9 +376,11 @@ fn arm_transports(
                 Transport {
                     drive: Drive::Lift(Lift {
                         frames,
+                        rotations: keys,
                         period_ms,
                         base_pos: seed.base_pos,
-                        quat,
+                        parent: parent_or_identity(seed.parent),
+                        own: seed.quat.filter(|q| is_rotation(*q)),
                         yaw: seed.yaw,
                     }),
                     was_moving: false,
@@ -330,7 +395,14 @@ fn arm_transports(
         let Some(mo) = templates.get(guid.0).and_then(|t| t.mo_transport) else {
             continue; // template answer not in yet: next frame
         };
-        let Timetables { nodes, built, .. } = &mut *timetables;
+        let Timetables {
+            nodes,
+            built,
+            physics,
+            ..
+        } = &mut *timetables;
+        // Property 99 names the rocking row (`0x711b50`); none sails level.
+        let physics = physics.as_ref().and_then(|p| p.get(mo.physics_id)).copied();
         let Some(nodes) = nodes.as_ref() else {
             continue; // no client data: stays frozen
         };
@@ -363,12 +435,27 @@ fn arm_transports(
             // tree is tuned for immobile geometry.
             commands.entity(entity).insert((
                 Transport {
-                    drive: Drive::Taxi(timetable),
+                    drive: Drive::Taxi(timetable, physics),
                     was_moving: false,
                 },
                 RigidBody::Kinematic,
             ));
         }
+    }
+}
+
+/// Whether `q` can orient a model: an absent field folds to zero, which would normalize to `NaN`.
+fn is_rotation(q: [f32; 4]) -> bool {
+    q.iter().map(|c| c * c).sum::<f32>() > 0.5
+}
+
+/// The parent rotation as sent, or the identity for an absent (all-zero) one, the basis the
+/// reference's 3×3 builds from a zero quaternion (`0x4c5100`).
+fn parent_or_identity(q: [f32; 4]) -> [f32; 4] {
+    if q == [0.0; 4] {
+        [0.0, 0.0, 0.0, 1.0]
+    } else {
+        q
     }
 }
 
@@ -419,6 +506,99 @@ fn tick_transports(
     }
 }
 
+/// The anim roots of a WMO transport's set-0 props that author a ship sequence, recorded as the
+/// props spawn ([`crate::entities`]'s WMO prop lane).
+#[derive(Component, Default)]
+#[component(storage = "SparseSet")]
+pub(crate) struct ShipProps(pub(crate) Vec<Entity>);
+
+/// Hand each boat's ship state to its props: the reference sets it on every set-0 doodad of the
+/// world object when the state changes (`0x7134a0` -> `0x7b45f0`), each prop resolving the id
+/// through its `AnimationData.dbc` fallback (`0x832ab0` -> `0x826350`), so a prop that lacks the
+/// ship sequences plays Stand.
+#[allow(clippy::type_complexity)] // one Bevy system's full input set
+fn drive_ship_props(
+    current_map: Option<Res<CurrentMap>>,
+    anim_data: Option<Res<crate::creature_anim::AnimData>>,
+    transports: Query<(Entity, &Transport, &TransportAnchor, &ShipProps, &Transform)>,
+    mut hosts: Query<(
+        &benilla_assets::ModelAnimations,
+        Option<&mut benilla_world::doodad_anim::HostSequence>,
+        Option<&AnimationPlayer>,
+        Option<&benilla_world::doodad_anim::DoodadAnimHost>,
+    )>,
+    time: Res<Time>,
+    mut next_sample: Local<f32>,
+    mut commands: Commands,
+) {
+    let Some(current_map) = current_map else {
+        return;
+    };
+    let tracing = benilla_assets::trace::enabled_for("ship");
+    // Once a second, each prop's playing clips, for the instrument.
+    let sampling = tracing && time.elapsed_secs() >= *next_sample;
+    if sampling {
+        *next_sample = time.elapsed_secs() + 1.0;
+    }
+    for (boat, transport, anchor, props, boat_tf) in &transports {
+        let Some(sequence) = transport.ship_sequence(anchor, current_map.0) else {
+            continue;
+        };
+        for &root in &props.0 {
+            // Absent until the prop's spawn commands apply: next frame.
+            let Ok((anims, current, player, host)) = hosts.get_mut(root) else {
+                continue;
+            };
+            let id = match anim_data.as_deref() {
+                Some(data) => anims.resolve(sequence, &data.0).id,
+                None if anims.find(sequence).is_some() => sequence,
+                None => benilla_formats::SHIP_STAND,
+            };
+            let want = benilla_world::doodad_anim::HostSequence(id);
+            let changed = match current {
+                Some(mut c) => c.set_if_neq(want),
+                None => {
+                    commands.entity(root).insert(want);
+                    true
+                }
+            };
+            if tracing && changed {
+                benilla_assets::trace::line(
+                    "ship",
+                    &format!(
+                        "boat {boat} cycle={} state={sequence} prop {root} plays {id}",
+                        transport.cycle_ms(anchor)
+                    ),
+                );
+            }
+            if sampling {
+                let at = benilla_assets::coords::bevy_to_wow(boat_tf.translation);
+                let clips: Vec<String> = player
+                    .map(|p| {
+                        p.playing_animations()
+                            .map(|(n, a)| {
+                                format!("{}:w{:.2}:t{:.2}", n.index(), a.weight(), a.seek_time())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                benilla_assets::trace::line(
+                    "ship",
+                    &format!(
+                        "sample boat {boat} at=[{:.0},{:.0},{:.0}] state={sequence} prop {root} \
+                         plays {id} drawn={} clips=[{}]",
+                        at[0],
+                        at[1],
+                        at[2],
+                        host.is_some_and(|h| h.active),
+                        clips.join(" ")
+                    ),
+                );
+            }
+        }
+    }
+}
+
 /// Write a sampled pose into the transform and avian's `Position`/`Rotation`: avian syncs
 /// `Transform` before `Update`, so without the mirror this frame's casts see last frame's deck.
 /// Takes `&mut Mut<Transform>` so the change flag is set only on a real change; a plain
@@ -430,7 +610,10 @@ fn write_deck_pose(
     rotation: Option<Mut<Rotation>>,
 ) {
     let translation = benilla_assets::coords::wow_to_bevy(sample.pos);
-    let heading = Quat::from_rotation_y(sample.heading);
+    let heading = sample.rotation.map_or_else(
+        || Quat::from_rotation_y(sample.heading),
+        benilla_assets::coords::wow_rotation_to_bevy,
+    );
     // Read through `Deref` (no flag), write through `DerefMut` (flag), only on a change.
     if transform.translation != translation || transform.rotation != heading {
         transform.translation = translation;
@@ -1032,7 +1215,7 @@ mod tests {
         let nodes = cat.path(241).expect("taxi path 241 (Ratchet–Booty Bay)");
         let tt = TransportTimetable::build(nodes, 30.0, 1.0).expect("path 241 builds");
         Transport {
-            drive: Drive::Taxi(Arc::new(tt)),
+            drive: Drive::Taxi(Arc::new(tt), None),
             was_moving: false,
         }
     }
@@ -1117,6 +1300,64 @@ mod tests {
         assert!(lift.reseek_to_map(&mut anchor, 1).is_none());
     }
 
+    /// A car's path offset turns by its parent rotation, not its own: the Deeprun Tram's cars
+    /// face 90° but their path runs along the parent's 180° (`0x70daa0`). Its own rotation orients
+    /// it while it has no rotation keys; with keys, the slerped key times the parent does.
+    #[test]
+    fn a_lift_moves_by_its_parent_rotation_and_turns_by_its_keys() {
+        let quarter = std::f32::consts::FRAC_PI_4.sin_cos();
+        let own = [0.0, 0.0, quarter.0, quarter.1];
+        let half_turn = [0.0, 0.0, 1.0, 0.0];
+        let mut lift = parked_lift();
+        lift.frames = Arc::new(vec![
+            ElevatorKeyframe {
+                time_ms: 0,
+                pos: [0.0; 3],
+            },
+            ElevatorKeyframe {
+                time_ms: 1000,
+                pos: [0.0, -100.0, 0.0],
+            },
+        ]);
+        lift.parent = half_turn;
+        lift.own = Some(own);
+        let transport = Transport {
+            drive: Drive::Lift(lift),
+            was_moving: false,
+        };
+        let s = transport.sample(500, 0);
+        let want = [10.0, 70.0, 30.0];
+        assert!(
+            s.pos.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-3),
+            "along the parent's +y: {:?}",
+            s.pos
+        );
+        assert_eq!(s.rotation, Some(own), "no keys: its own rotation");
+
+        let Drive::Lift(mut lift) = transport.drive else {
+            unreachable!()
+        };
+        lift.rotations = Arc::new(vec![
+            RotationKey {
+                time_ms: 0,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+            RotationKey {
+                time_ms: 1000,
+                rotation: [0.0, 0.0, 0.0, 1.0],
+            },
+        ]);
+        let transport = Transport {
+            drive: Drive::Lift(lift),
+            was_moving: false,
+        };
+        let r = transport.sample(500, 0).rotation.expect("keyed");
+        assert!(
+            r.iter().zip(half_turn).all(|(a, b)| (a - b).abs() < 1e-5),
+            "the key times the parent: {r:?}"
+        );
+    }
+
     /// A two-frame pause path at `base_pos`.
     pub(super) fn parked_lift() -> Lift {
         Lift {
@@ -1130,9 +1371,11 @@ mod tests {
                     pos: [0.0; 3],
                 },
             ]),
+            rotations: Arc::new(Vec::new()),
             period_ms: 1000,
             base_pos: [10.0, 20.0, 30.0],
-            quat: [0.0, 0.0, 0.0, 1.0],
+            parent: [0.0, 0.0, 0.0, 1.0],
+            own: None,
             yaw: 0.5,
         }
     }

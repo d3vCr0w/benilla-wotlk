@@ -1,41 +1,27 @@
 //! The world-mouseover tooltip and the spell tooltip views. The world tooltip rebuilds once per
 //! hover-target change and a lost hover arms a fade; the pick is [`Hovered`] or
-//! [`HoveredObject`], arbitrated by [`go_is_nearest`] as the click router does. The spell views
-//! are built and pushed ahead of a hover by [`spell_feed`].
+//! [`HoveredObject`], arbitrated by [`go_is_nearest`] as the click router does. A spell view is
+//! built at the hover by [`spell_view`].
 
+#[cfg(test)]
+use benilla_ui::script::UiScript;
 use bevy::prelude::*;
 
-use benilla_ui::script::{TooltipTint, UiScript, UnitState};
+use benilla_ui::script::{TooltipTint, UnitState};
 use benilla_ui::strings::Arg;
 
 use crate::names::NameCache;
 use crate::net::{NetCommands, ObjectStore, SelfPlayer};
 use crate::target::{go_is_nearest, Hovered, HoveredObject, GO_FLAG_LOCKED};
-use crate::ui_script::UiFeed;
-use crate::ui_trainer::TrainerFeed;
 use crate::ui_unit::{enrich_unit, snapshot, unit_reaction, SnapshotTables, UnitFeed};
 
-mod spell_deps;
-mod spell_feed;
-use spell_feed::feed_spell_tooltips;
+pub(crate) mod spell_view;
 
 pub struct UiTooltipPlugin;
 
 impl Plugin for UiTooltipPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
-            Update,
-            (
-                drive_mouseover_tooltip.in_set(UnitFeed),
-                // After the trainer feed, so a list that lands this frame is hoverable
-                // in its tick; outside `UnitFeed`, which the trainer feed follows, so it takes that
-                // set's gate.
-                feed_spell_tooltips
-                    .in_set(UiFeed)
-                    .after(TrainerFeed)
-                    .run_if(crate::ui_script::ingame_ui_up),
-            ),
-        );
+        app.add_systems(Update, drive_mouseover_tooltip.in_set(UnitFeed));
     }
 }
 
@@ -120,8 +106,10 @@ fn skill_lock_line(
     }
 }
 
+use benilla_ui::script::world_loan::in_turn_or_now;
+
 fn drive_mouseover_tooltip(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut script: crate::ui_script::InTurn,
     hovered: Res<Hovered>,
     hovered_go: Res<HoveredObject>,
     stores: Query<&ObjectStore>,
@@ -143,7 +131,7 @@ fn drive_mouseover_tooltip(
     // The meeting stone's area line.
     areas: Option<Res<crate::area::AreaTableRes>>,
 ) {
-    let Some(mut script) = script else {
+    let Some(mut script) = script.turn() else {
         return;
     };
     let (last, last_lines, trace) = (&mut memo.last, &mut memo.last_lines, &mut *memo.trace);
@@ -194,7 +182,10 @@ fn drive_mouseover_tooltip(
         script.set_unit("mouseover", Some(state));
         *published = true;
         if *last != LastHover::Unit(guid) || last_lines.as_ref() != Some(&key) {
-            script.world_tooltip_unit("mouseover");
+            // The builder runs Lua: at the raise step after the feed, with the `World` lent.
+            in_turn_or_now(&mut script, |s| {
+                s.world_tooltip_unit("mouseover");
+            });
             *last = LastHover::Unit(guid);
             *last_lines = Some(key);
         }
@@ -221,7 +212,7 @@ fn drive_mouseover_tooltip(
         // A bone pile with nothing to take publishes no mouseover: no plate, no brighten.
         if !crate::target::corpse_mouseover_eligible(store) {
             if !matches!(*last, LastHover::None) {
-                script.world_tooltip_fade();
+                in_turn_or_now(&mut script, |s| s.world_tooltip_fade());
                 *last = LastHover::None;
             }
             return;
@@ -244,7 +235,9 @@ fn drive_mouseover_tooltip(
         ) else {
             return;
         };
-        script.world_tooltip_gameobject(&plate, &[], false);
+        in_turn_or_now(&mut script, move |s| {
+            s.world_tooltip_gameobject(&plate, &[], false);
+        });
         *last = LastHover::Corpse(guid);
         return;
     }
@@ -360,22 +353,19 @@ fn drive_mouseover_tooltip(
                 _ => {}
             }
         }
-        script.world_tooltip_gameobject(&template.name, &lines, cursor_seated);
+        let name = template.name.clone();
+        in_turn_or_now(&mut script, move |s| {
+            s.world_tooltip_gameobject(&name, &lines, cursor_seated);
+        });
         *last = LastHover::Go(guid);
         return;
     }
     if !matches!(*last, LastHover::None) {
         // Hover lost: arm the fade.
-        script.world_tooltip_fade();
+        in_turn_or_now(&mut script, |s| s.world_tooltip_fade());
         *last = LastHover::None;
     }
 }
 
-#[cfg(test)]
-mod bench;
-#[cfg(test)]
-mod deps_tests;
-#[cfg(test)]
-mod feed_tests;
 #[cfg(test)]
 mod tests;

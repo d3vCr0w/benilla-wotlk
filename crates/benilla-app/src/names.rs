@@ -100,6 +100,8 @@ pub(crate) struct CreatureRecord {
     /// The template's health and power multipliers (`0x71b8d0`, `0x71b960`).
     pub(crate) health_modifier: f32,
     pub(crate) power_modifier: f32,
+    /// `CreatureMovementInfo.dbc` id, the smooth-facing chase rate's row (`0x735f60`).
+    pub(crate) movement_id: u32,
 }
 
 /// The 1.12 client's creature-rank getter: 0 before the record is queried and 0 for any unit with a
@@ -496,6 +498,7 @@ pub(crate) mod net {
             names.set_player_realm(guid, realm);
             // The record's callbacks run once it is cached (`0x5a47d0`).
             ui.world(move |world| crate::ui_guild_bank::name_landed(world, guid));
+            ui.world(move |world| crate::ui_item_text::name_landed(world, guid));
         }
     }
 
@@ -510,6 +513,7 @@ pub(crate) mod net {
             // A placeholder or a denial ends the ask, its callbacks told (`0x635849`, `0x63583f`); a retry asks again.
             if miss != benilla_protocol::messages::NameQueryMiss::Retry {
                 ui.world(move |world| crate::ui_guild_bank::name_landed(world, guid));
+                ui.world(move |world| crate::ui_item_text::name_landed(world, guid));
             }
         }
     }
@@ -545,6 +549,7 @@ pub(crate) mod net {
             civilian,
             racial_leader,
             modifiers,
+            movement_id,
         } = ev
         {
             creature_name(
@@ -558,7 +563,7 @@ pub(crate) mod net {
                 type_flags,
                 civilian,
                 racial_leader,
-                (display_id, modifiers),
+                (display_id, modifiers, movement_id),
                 &mut names,
             );
         }
@@ -617,7 +622,7 @@ pub(crate) mod net {
         type_flags: u32,
         civilian: bool,
         racial_leader: bool,
-        (display_id, (health_modifier, power_modifier)): (u32, (f32, f32)),
+        (display_id, (health_modifier, power_modifier), movement_id): (u32, (f32, f32), u32),
         names: &mut NameCache,
     ) {
         names.insert_creature(
@@ -635,6 +640,7 @@ pub(crate) mod net {
                 display_id,
                 health_modifier,
                 power_modifier,
+                movement_id,
             }),
         );
     }

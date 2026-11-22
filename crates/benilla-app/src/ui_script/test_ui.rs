@@ -448,22 +448,6 @@ pub(crate) fn read(req: &str) -> Option<Vec<u8>> {
     std::fs::read(dir.join(req)).ok()
 }
 
-/// Stock `GossipFrame.xml`'s dependencies in the production order, shared with `ui_gossip`'s feed
-/// tests. The greeting pane inherits `UIPanelScrollFrameTemplate`, and a missing template only
-/// warns, losing the scrollbar silently. Needs client data.
-pub(crate) const GOSSIP_UI: &[&str] = &[
-    r"Interface\FrameXML\GlobalStrings.lua",
-    r"Interface\FrameXML\BasicControls.xml",
-    r"Interface\FrameXML\Constants.lua",
-    r"Interface\FrameXML\UIParent.xml",
-    r"Interface\FrameXML\MoneyFrame.lua",
-    r"Interface\FrameXML\MoneyFrame.xml",
-    r"Interface\FrameXML\UIPanelTemplates.lua",
-    r"Interface\FrameXML\UIPanelTemplates.xml",
-    r"Interface\FrameXML\StaticPopup.xml",
-    "ScrollTemplates.xml",
-];
-
 /// What stock `LootFrame.xml` needs to load and behave. `GlobalStrings.lua` because a bare VM
 /// lacks what the app loads at setup (the master-loot menu reads `GROUP` and `GIVE_LOOT`),
 /// `ItemButtonTemplate.xml` because a missing template only warns, and `PartyFrame.xml` because
@@ -989,34 +973,29 @@ impl benilla_ui::script::LiveState for GuildBankTestView {
     }
 }
 
-/// Lend `bank` with `money` copper in it until the loan drops.
+/// A view of `bank` with `money` copper in it, to lend around a test's calls into Lua.
 pub(crate) fn lend_guild_bank(
     bank: benilla_ui::script::GuildBankView,
     money: u64,
-) -> benilla_ui::script::LiveLoan<GuildBankTestView> {
-    // SAFETY: a test drops its loans on its own thread, the latest first.
-    unsafe {
-        benilla_ui::script::LiveLoan::new(GuildBankTestView {
-            bank,
-            locks: Vec::new(),
-            tab: 0,
-            money,
-            withdraw_money: -1,
-        })
+) -> GuildBankTestView {
+    GuildBankTestView {
+        bank,
+        locks: Vec::new(),
+        tab: 0,
+        money,
+        withdraw_money: -1,
     }
 }
 
-/// Lend an open bank with `slots` purchased and the next slot at `cost` until the loan drops.
-pub(crate) fn lend_bank(slots: u8, cost: u32) -> benilla_ui::script::LiveLoan<BankView> {
-    // SAFETY: a test drops its loans on its own thread, the latest first.
-    unsafe {
-        benilla_ui::script::LiveLoan::new(BankView {
-            slots,
-            cost,
-            banker: Some(0x42),
-            interacting: true,
-            purchases: std::cell::Cell::new(0),
-        })
+/// A view of an open bank with `slots` purchased and the next slot at `cost`, to lend around a
+/// test's calls into Lua.
+pub(crate) fn lend_bank(slots: u8, cost: u32) -> BankView {
+    BankView {
+        slots,
+        cost,
+        banker: Some(0x42),
+        interacting: true,
+        purchases: std::cell::Cell::new(0),
     }
 }
 

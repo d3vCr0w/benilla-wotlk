@@ -17,6 +17,8 @@ use benilla_protocol::ObjectFields;
 use benilla_ui::script::{ItemLinkFields, EQUIPMENT_BAG};
 use bevy::prelude::*;
 
+use crate::ui_action::signals::SignalSink;
+
 use crate::items::Items;
 use crate::net::{NetCommands, ObjectStore, Objects};
 use crate::pending_item_ops::PendingItemOps;
@@ -32,6 +34,8 @@ pub(crate) use container_live::{BagRead, ContainerLent, ContainerLive};
 pub(crate) mod feed;
 mod net;
 
+#[cfg(test)]
+pub(crate) use drain::drain_bind_confirm_answers;
 pub(crate) use drain::send_auto_equip;
 use drain::{
     drain_bag_autostores, drain_container_autoequips, drain_container_destroys,
@@ -251,23 +255,8 @@ impl InventoryScope {
     };
 }
 
-/// The reference's inventory walk: one ascending pass over the player's slot array, recursing into
-/// each container as it is passed, `scope` gating the sections. `visit` gets the wire
-/// `(bag_index, slot)` and the guid, and returns `Some` to stop. The order is the reference's and
-/// load-bearing: equipment 0-18, each bag slot 19-22 then its contents, backpack 23-38, bank 39-66,
-/// each bank bag 67-73 then its contents, keyring. The first carried item (the backpack and the
-/// bags' contents) `pick` accepts, by guid: the arena charter turn-in's scan (`0x6dd680`).
-pub(crate) fn find_carried(
-    store: &ObjectFields,
-    objects: &Objects,
-    mut pick: impl FnMut(u64) -> bool,
-) -> Option<u64> {
-    walk_inventory(store, objects, InventoryScope::CARRIED, |_, _, guid| {
-        pick(guid).then_some(guid)
-    })
-}
-
-/// [`find_carried`] with the item's Lua `(bag, slot)`, the backpack as bag 0; equipped bags
+/// The first carried item (the backpack and the bags' contents) `pick` accepts, with the item's
+/// Lua `(bag, slot)`, the backpack as bag 0, in the inventory walk's order; equipped bags
 /// themselves are skipped.
 pub(crate) fn find_carried_at(
     store: &ObjectFields,
@@ -289,6 +278,11 @@ pub(crate) fn find_carried_at(
     )
 }
 
+/// The reference's inventory walk: one ascending pass over the player's slot array, recursing into
+/// each container as it is passed, `scope` gating the sections. `visit` gets the wire
+/// `(bag_index, slot)` and the guid, and returns `Some` to stop. The order is the reference's and
+/// load-bearing: equipment 0-18, each bag slot 19-22 then its contents, backpack 23-38, bank 39-66,
+/// each bank bag 67-73 then its contents, keyring.
 fn walk_inventory<T>(
     store: &ObjectFields,
     objects: &Objects,
@@ -393,6 +387,21 @@ pub(crate) fn count_of(
         if let Some(fields) = objects.object(guid) {
             if fields.object_entry() == Some(entry) {
                 total += fields.item_stack_count().unwrap_or(1);
+            }
+        }
+        None
+    });
+    total
+}
+
+/// The charges left on the player's copies of `entry` (`0x754d50` with mask 0): each copy's first
+/// spell charges, negative ones counted as their size.
+pub(crate) fn charges_of(store: &ObjectFields, objects: &Objects, entry: u32) -> u32 {
+    let mut total = 0u32;
+    walk_inventory::<()>(store, objects, InventoryScope::DEFAULT, |_, _, guid| {
+        if let Some(fields) = objects.object(guid) {
+            if fields.object_entry() == Some(entry) {
+                total += fields.item_spell_charges(0).unwrap_or(0).unsigned_abs();
             }
         }
         None
@@ -584,7 +593,7 @@ impl TestObjects {
 pub(crate) const PLAYER_ARRAY: u8 = 255;
 
 /// One resolved item-use click, as [`send_item_use`] needs it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ItemUse {
     /// The live instance's guid; `None` falls through to a plain use.
     pub(crate) guid: Option<u64>,
@@ -606,25 +615,43 @@ pub(crate) struct ItemUse {
     pub(crate) is_charter: bool,
 }
 
+/// The requirement check's reads at the use: the item's refusal key (`0x6dc3f0`) and our value in a
+/// skill, `None` before our level is pushed.
+pub(crate) trait UseRefusal {
+    fn refusal(&self, entry: u32) -> Option<&'static str>;
+    fn skill_value(&self, skill: u32) -> Option<u32>;
+}
+
+/// The VM's own fixtures, for the check's tests.
+#[cfg(test)]
+impl UseRefusal for benilla_ui::script::UiScript {
+    fn refusal(&self, entry: u32) -> Option<&'static str> {
+        self.item_use_refusal(entry)
+    }
+    fn skill_value(&self, skill: u32) -> Option<u32> {
+        benilla_ui::script::UiScript::skill_value(self, skill)
+    }
+}
+
 /// The item use's requirement check (`0x6dc3f0` at `0x708eb9`): a refused item shows the check's
 /// message and sends nothing (`0x708ec2`-`0x708ef6`). Then the use enchant's skill, `enchant_skill`
 /// as [`crate::items::use_enchant_skill`] reads it: under its rank shows inventory result 2's line
 /// (`0x708f2c`-`0x708f39`).
 pub(crate) fn refuse_item_use(
-    script: &benilla_ui::script::UiScript,
+    reqs: &impl UseRefusal,
     entry: u32,
     enchant_skill: Option<(u32, u32)>,
-    ui_errors: &mut crate::ui_action::UiErrorKeys,
+    sink: &mut dyn crate::ui_action::signals::SignalSink,
 ) -> bool {
-    let refusal = script.item_use_refusal(entry).or_else(|| {
+    let refusal = reqs.refusal(entry).or_else(|| {
         let (skill, rank) = enchant_skill?;
-        (script.skill_value(skill)? < rank).then(|| equip_error_key(2))
+        (reqs.skill_value(skill)? < rank).then(|| equip_error_key(2))
     });
     let Some(key) = refusal else {
         return false;
     };
     debug!("ui_items: item {entry} use refused — {key}");
-    ui_errors.0.push(crate::ui_action::UiError::key(key));
+    sink.line(crate::ui_action::UiError::key(key));
     true
 }
 
@@ -706,8 +733,6 @@ pub(crate) fn send_item_use(
     script: &mut benilla_ui::script::UiScript,
     gate: &mut crate::ui_bind_confirm::BindGate,
     suppress: bool,
-    // Passed in, not carried on `CastLadder`, so no system reaches it twice.
-    ui_errors: &mut crate::ui_action::UiErrorKeys,
 ) -> bool {
     // A quest-starter offers its quest ahead of the requirement check; every other use is refused
     // with nothing sent.
@@ -715,7 +740,9 @@ pub(crate) fn send_item_use(
         .guid
         .and_then(|guid| ladder.objects.object(guid))
         .and_then(|f| crate::items::use_enchant_skill(f, ladder.trade_window.1.as_deref()));
-    if it.start_quest == 0 && refuse_item_use(script, it.entry, enchant_skill, ui_errors) {
+    if it.start_quest == 0
+        && refuse_item_use(&ladder.use_reqs, it.entry, enchant_skill, &mut ladder.press)
+    {
         return false;
     }
     // The toggle predicate over the caster's live aura slots.
@@ -731,8 +758,20 @@ pub(crate) fn send_item_use(
         )
     });
     let route = item_use_route(it, aura_cancels, disarmed_slots);
-    if matches!(route, ItemUseRoute::Cast(_)) && !leave_form_to_use(&it, ctx, ladder, ui_errors) {
-        return false;
+    if let ItemUseRoute::Cast(spell) = route {
+        match leave_form_to_use(&it, ctx, ladder) {
+            FormLeave::Refused => return false,
+            FormLeave::AtStep => {
+                ladder.press.item_use_rest(ItemUseRest {
+                    it,
+                    spell,
+                    unit: ctx.selection_guid,
+                    suppress,
+                });
+                return true;
+            }
+            FormLeave::Kept => {}
+        }
     }
     match route {
         ItemUseRoute::CantUseDisarmed => {
@@ -740,9 +779,9 @@ pub(crate) fn send_item_use(
                 "ui_items: item use refused — that hand is disarmed (slot {})",
                 it.slot
             );
-            ui_errors
-                .0
-                .push(crate::ui_action::UiError::key("ERR_CANT_USE_DISARMED"));
+            ladder
+                .press
+                .line(crate::ui_action::UiError::key("ERR_CANT_USE_DISARMED"));
             false
         }
         ItemUseRoute::ToggleCancel(spell) => {
@@ -764,16 +803,8 @@ pub(crate) fn send_item_use(
                 .send(crate::net::ClientCommand::PetitionShowSignatures { item });
             true
         }
-        // The bind-on-use deferral, the last rung: every arm above has claimed the click first, so
-        // re-pressing a bind-on-use trinket to cancel its aura never asks. It covers `Nothing` too:
-        // four of the five paths into the deferral are on-use spell lookup failures, so the
-        // reference asks with no usable on-use spell.
-        ItemUseRoute::Nothing | ItemUseRoute::Cast(_)
-            if !suppress
-                && it.guid.is_some_and(|g| {
-                    gate.use_binds(&ladder.objects, &ladder.items, &ladder.commands, g)
-                }) =>
-        {
+        // The bind-on-use deferral covers `Nothing` too: four of the five paths into it are on-use spell lookup failures.
+        ItemUseRoute::Nothing if !suppress && binds_on_use(&it, ladder, gate) => {
             gate.defer_use(script, it);
             false
         }
@@ -785,34 +816,100 @@ pub(crate) fn send_item_use(
             false
         }
         ItemUseRoute::Cast(spell) => {
-            ladder.send(
-                spell,
-                ctx,
-                crate::spell::CastCommit::Item {
-                    bag_index: it.bag_index,
-                    slot: it.slot,
-                    entry: it.entry,
-                    item_guid: it.guid.unwrap_or(0),
-                    on_object: it.on_object,
-                },
-            );
-            true
+            use_past_the_form(it, spell, ctx, ladder, script, gate, suppress)
         }
     }
 }
 
-/// The item use's form leg (`0x708c20`): a shapeshifted player leaves the form unless the form
-/// (flag `0x80`, or `0x40` for gear) or the item (flag `0x800000`) allows it; `false` is refused.
+/// The bind-on-use deferral's test: the item binds when used.
+fn binds_on_use(
+    it: &ItemUse,
+    ladder: &crate::spell::CastLadder,
+    gate: &crate::ui_bind_confirm::BindGate,
+) -> bool {
+    it.guid
+        .is_some_and(|g| gate.use_binds(&ladder.objects, &ladder.items, &ladder.commands, g))
+}
+
+/// The item use past its form leave (`0x70933d`): the bind-on-use deferral, the last rung (`0x709387`), else the cast.
+fn use_past_the_form(
+    it: ItemUse,
+    spell: u32,
+    ctx: &crate::spell::cast_target::CastContext,
+    ladder: &mut crate::spell::CastLadder,
+    script: &mut benilla_ui::script::UiScript,
+    gate: &mut crate::ui_bind_confirm::BindGate,
+    suppress: bool,
+) -> bool {
+    if !suppress && binds_on_use(&it, ladder, gate) {
+        gate.defer_use(script, it);
+        return false;
+    }
+    ladder.send(
+        spell,
+        ctx,
+        crate::spell::CastCommit::Item {
+            bag_index: it.bag_index,
+            slot: it.slot,
+            entry: it.entry,
+            item_guid: it.guid.unwrap_or(0),
+            on_object: it.on_object,
+        },
+    );
+    true
+}
+
+/// The item use's rest after its form leave (`0x709338` -> `0x726ce0`), at the unit the use was given, after the drop's listeners.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ItemUseRest {
+    it: ItemUse,
+    spell: u32,
+    unit: Option<u64>,
+    suppress: bool,
+}
+
+/// [`ItemUseRest`] at its step, with the `World` lent: its edges queue behind it on `ui`.
+pub(crate) fn run_item_use_rest(
+    In(rest): In<ItemUseRest>,
+    mut script: NonSendMut<benilla_ui::script::UiScript>,
+    targeting: crate::spell::cast_target::CastTargeting,
+    mut ladder: crate::spell::CastLadder,
+    mut gate: crate::ui_bind_confirm::BindGate,
+    mut ui: ResMut<crate::ui_script::live::UiEvents>,
+) {
+    let ctx = targeting.context_at(crate::spell::cast_target::Aim::Unit(rest.unit));
+    use_past_the_form(
+        rest.it,
+        rest.spell,
+        &ctx,
+        &mut ladder,
+        &mut script,
+        &mut gate,
+        rest.suppress,
+    );
+    ladder.press.defer(&mut ui);
+}
+
+/// The item use's form leg's outcome.
+enum FormLeave {
+    /// No form to leave, or its cancels went out in place.
+    Kept,
+    /// The form may not be left (`0x709391`).
+    Refused,
+    /// The drop raises at a step: the rest of the use waits for its listeners.
+    AtStep,
+}
+
+/// The item use's form leg (`0x7092e8`-`0x709338`): a shapeshifted player leaves the form unless the form (flag `0x80`, or `0x40` for gear) or the item (flag `0x800000`) allows it.
 fn leave_form_to_use(
     it: &ItemUse,
     ctx: &crate::spell::cast_target::CastContext,
-    ladder: &crate::spell::CastLadder,
-    ui_errors: &mut crate::ui_action::UiErrorKeys,
-) -> bool {
+    ladder: &mut crate::spell::CastLadder,
+) -> FormLeave {
     let (Some(store), Some(template)) =
         (ctx.rel.self_store, ladder.items.template_cached(it.entry))
     else {
-        return true;
+        return FormLeave::Kept;
     };
     let form = store.0.unit_shapeshift_form();
     let row = ctx.rel.types.forms.and_then(|f| f.get(&u32::from(form)));
@@ -821,24 +918,31 @@ fn leave_form_to_use(
         || (flags & 0x40 != 0 && template.inventory_type != 0)
         || template.flags & 0x80_0000 != 0;
     if !crate::spell::validator::is_shapeshifted(form, flags) || row.is_none() || exempt {
-        return true;
+        return FormLeave::Kept;
     }
     if !ctx.auto_unshift {
         debug!("ui_items: item use refused — shapeshifted");
-        ui_errors.0.push(crate::ui_action::UiError::key(
+        ladder.press.line(crate::ui_action::UiError::key(
             "ERR_NO_ITEMS_WHILE_SHAPESHIFTED",
         ));
-        return false;
+        return FormLeave::Refused;
     }
-    if let (Some(auras), Some(spells)) = (ctx.self_auras, ladder.spells.as_ref()) {
-        for spell_id in crate::ui_shapeshift::form_auras(form, auras, &spells.catalog) {
-            let _ = ladder
-                .commands
-                .0
-                .send(crate::net::ClientCommand::CancelAura { spell_id });
+    let cancels = match (ctx.self_auras, ladder.spells.as_ref()) {
+        (Some(auras), Some(spells)) => {
+            crate::ui_shapeshift::form_auras(form, auras, &spells.catalog)
         }
+        _ => Vec::new(),
+    };
+    // Each aura cancel drops the form and sends after the drop's listeners (`0x726ce0` -> `0x802f80`).
+    let at_step = !cancels.is_empty() && ladder.press.raises_at_step();
+    for spell_id in cancels {
+        ladder.cancel_aura(spell_id);
     }
-    true
+    if at_step {
+        FormLeave::AtStep
+    } else {
+        FormLeave::Kept
+    }
 }
 
 /// The active player's level, which the link builder stamps on every link (`0x61e290`), kept by
@@ -1076,20 +1180,21 @@ impl Plugin for UiItemsPlugin {
                     track_link_level.before(UnitFeed),
                     // After the input pass, so a repair-mode click goes out the same frame; a
                     // plain `UseContainerItem` is a script call.
-                    drain_container_repairs.in_set(UiDrain),
+                    crate::ui_script::raises::then_fire(drain_container_repairs).in_set(UiDrain),
                     // Pick, place and split: `CMSG_SWAP_INV_ITEM`, `CMSG_SWAP_ITEM` or
                     // `CMSG_SPLIT_ITEM`.
                     drain_container_moves.in_set(UiDrain),
                     // The delete-confirm popup's accept: `CMSG_DESTROYITEM`.
                     drain_container_destroys.in_set(UiDrain),
                     // `AutoEquipCursorItem`: `CMSG_AUTOEQUIP_ITEM`.
-                    drain_container_autoequips.in_set(UiDrain),
-                    drain_bag_autostores.in_set(UiDrain),
+                    crate::ui_script::raises::then_fire(drain_container_autoequips).in_set(UiDrain),
+                    crate::ui_script::raises::then_fire(drain_bag_autostores).in_set(UiDrain),
                     // The soulbind confirmations' answers (`EquipPendingItem`,
                     // `CancelPendingEquip`, `ConfirmBindOnUse`). A dialog is answered in a later
                     // frame than it was raised, so no order against the other drains is needed.
                     drain::drain_bind_confirm_answers.in_set(UiDrain),
-                    drain::drain_bind_on_use_confirms.in_set(UiDrain),
+                    crate::ui_script::raises::then_fire(drain::drain_bind_on_use_confirms)
+                        .in_set(UiDrain),
                 ),
             );
     }
@@ -1120,7 +1225,7 @@ mod tests {
         };
         script.set_item_template(929, potion(22));
         script.set_item_template(118, potion(1));
-        let mut errors = crate::ui_action::UiErrorKeys::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         assert!(super::refuse_item_use(&script, 929, None, &mut errors));
         assert_eq!(
             errors.0,
@@ -1144,7 +1249,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut errors = crate::ui_action::UiErrorKeys::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         assert!(!super::refuse_item_use(
             &script,
             118,
@@ -1159,7 +1264,7 @@ mod tests {
                 skills: skills.iter().copied().collect(),
                 ..Default::default()
             });
-            let mut errors = crate::ui_action::UiErrorKeys::default();
+            let mut errors = crate::ui_action::signals::LinesSeen::default();
             let refused = super::refuse_item_use(&script, 118, Some((202, 400)), &mut errors);
             (refused, errors.0)
         };

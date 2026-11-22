@@ -6,9 +6,11 @@ use benilla_protocol::messages::{
     member_status, GroupLootInfo, GroupMemberEntry, PartyMemberStatsInfo, GROUP_MEMBER_ASSISTANT,
     GROUP_MEMBER_MAIN_ASSIST, GROUP_MEMBER_MAIN_TANK,
 };
+#[cfg(test)]
+use benilla_ui::script::UiScript;
 use benilla_ui::script::{
     PartyMemberInfo, PartyRequest, PartyState, RaidMemberInfo, SavedInstanceInfo, ScriptValue,
-    UiScript, UnitState,
+    UnitState,
 };
 use bevy::prelude::*;
 
@@ -133,7 +135,7 @@ pub(super) fn feed_party(
     // `ChrClasses.dbc` field 16, `UnitHasRelicSlot`'s input, and the form table the creature type
     // reads.
     tables: crate::ui_unit::SnapshotTables,
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut script: crate::ui_script::InTurn,
     group: Res<GroupState>,
     index: Res<GuidIndex>,
     stores: Query<&ObjectStore>,
@@ -157,7 +159,7 @@ pub(super) fn feed_party(
     mut fed: Local<crate::ui_script::VmMemo<FedParty>>,
     mut chat: ResMut<crate::ui_chat::ChatLog>,
 ) {
-    let Some(mut script) = script else {
+    let Some(mut script) = script.turn() else {
         return;
     };
     let (fed, vm_reset) = fed.get_reset(&script);
@@ -367,7 +369,9 @@ pub(super) fn feed_party(
     };
     if fed.pushed_party.as_ref() != Some(&fresh) {
         gate.audit("feed_party", "the roster snapshot");
-        script.set_party(fresh.clone());
+        // Each write after a raise lands once that raise's listeners have run.
+        let party = fresh.clone();
+        script.after_raises(move |s| s.set_party(party));
         fed.pushed_party = Some(fresh);
     }
 
@@ -388,7 +392,8 @@ pub(super) fn feed_party(
         });
         if fed.units[i] != snap {
             gate.audit("feed_party", "a party-token snapshot");
-            script.set_unit(token, snap.clone());
+            let unit = snap.clone();
+            script.after_raises(move |s| s.set_unit(token, unit));
             if let Some(cur) = &snap {
                 crate::ui_unit::fire_transitions(
                     &mut script,
@@ -478,7 +483,8 @@ pub(super) fn feed_party(
         });
         if fed.raid_units[i] != snap {
             gate.audit("feed_party", "a raid-token snapshot");
-            script.set_unit(token, snap.clone());
+            let unit = snap.clone();
+            script.after_raises(move |s| s.set_unit(token, unit));
             if let Some(cur) = &snap {
                 crate::ui_unit::fire_transitions(
                     &mut script,
@@ -579,20 +585,25 @@ pub(super) fn feed_party(
     }
     for &wire in &group.ready_checks[fed.ready_checks_fed..] {
         gate.audit("feed_party", "a ready-check packet");
+        // Each with the `World` lent: a confirm's `READY_CHECK_CONFIRM` names the tokens naming
+        // the member at its packet (`0x60bb70`).
         match wire {
             ReadyCheckWire::Started { initiator } => {
-                script.ready_check_armed(initiator);
+                script.lent(move |s| s.ready_check_armed(initiator));
                 fed.initiator_unnamed = Some(initiator);
             }
-            ReadyCheckWire::Confirm { guid, ready } => script.ready_check_confirmed(guid, ready),
-            ReadyCheckWire::Finished => script.ready_check_finished(),
+            ReadyCheckWire::Confirm { guid, ready } => {
+                script.lent(move |s| s.ready_check_confirmed(guid, ready));
+            }
+            ReadyCheckWire::Finished => script.lent(|s| s.ready_check_finished()),
         }
     }
     fed.ready_checks_fed = group.ready_checks.len();
     if let Some(guid) = fed.initiator_unnamed {
         if let Some(name) = names.player(guid) {
             fed.initiator_unnamed = None;
-            script.ready_check_initiated(name.unwrap_or(""));
+            let name = name.unwrap_or("").to_string();
+            script.lent(move |s| s.ready_check_initiated(&name));
         }
     }
 
@@ -636,7 +647,7 @@ pub(super) fn feed_party(
         gate.audit("feed_party", "the saved-instance edge");
         fed.saved = saved.clone();
         fed.saved_answers = group.saved_instances_answers;
-        script.set_saved_instances(saved);
+        script.after_raises(move |s| s.set_saved_instances(saved));
         if !vm_reset {
             script.fire_event("UPDATE_INSTANCE_INFO", vec![]);
         }
@@ -665,13 +676,13 @@ pub(super) fn feed_party(
 /// setter's name twice, the icon's number and the target's name, `UNKNOWNOBJECT` while it
 /// resolves.
 pub(super) fn feed_marks(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut script: crate::ui_script::InTurn,
     group: Res<GroupState>,
     mut notices: ResMut<super::GroupNotices>,
     mut chat: ResMut<crate::ui_chat::ChatLog>,
     mut fed: Local<crate::ui_script::VmMemo<FedMarks>>,
 ) {
-    let Some(mut script) = script else {
+    let Some(mut script) = script.turn() else {
         notices.target_icons.clear();
         return;
     };
@@ -762,13 +773,21 @@ pub(super) fn raid_rows(
     )
 }
 
-/// The guid at a 1-based raid row, [`raid_row_guids`]`[index - 1]` without the allocation.
+/// The guid at a 1-based raid row, [`raid_row_guids`]`[index - 1]` by index, with no walk.
 pub(crate) fn raid_row_guid(
     group: &GroupState,
     self_guid: Option<u64>,
     index: usize,
 ) -> Option<u64> {
-    raid_rows(group, self_guid).nth(index.checked_sub(1)?)
+    if group.group_type != GROUPTYPE_RAID {
+        return None;
+    }
+    let row = index.checked_sub(1)?;
+    match self_guid {
+        Some(me) if row == 0 => Some(me),
+        Some(_) => group.members.get(row - 1).map(|m| m.guid),
+        None => group.members.get(row).map(|m| m.guid),
+    }
 }
 
 /// A 1-based raid row index to its guid; row 0, a row past the end or no raid gives `None`.
@@ -1077,11 +1096,8 @@ pub(crate) struct PartyDrain<'w, 's> {
 }
 
 /// Drain the Lua party intents into sends, through the command queue, since the lent view reads the group.
-pub(crate) fn drain_party(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
-    mut deferred: Commands,
-) {
-    let Some(mut script) = script else {
+pub(crate) fn drain_party(mut script: crate::ui_script::InTurn, mut deferred: Commands) {
+    let Some(mut script) = script.turn() else {
         return;
     };
     let requests = script.take_party_requests();
@@ -1810,6 +1826,47 @@ mod roster_update_tests;
 mod tests {
     use super::super::pets::tests::{app, app_with, flag, frame, member, party, stream, ME};
     use super::*;
+
+    /// `MSG_RAID_READY_CHECK_CONFIRM`'s `READY_CHECK_CONFIRM` names each token naming the member
+    /// at the packet's step, read through the `World` it lends (`0x60bb70`), with no unit fixture.
+    #[test]
+    fn a_ready_check_confirm_names_the_members_token_off_the_world() {
+        let mut app = app();
+        app.init_resource::<crate::ui_script::live::UiEvents>()
+            .add_systems(
+                Update,
+                crate::ui_script::live::fire_handler_events.after(feed_party),
+            );
+        super::super::pets::tests::party(&mut app, 2, true);
+        // The feed's first run is the VM's reset, which skips what came before it.
+        frame(&mut app);
+        app.world_mut()
+            .non_send_resource::<UiScript>()
+            .run(
+                r#"READY = {}
+                   local f = CreateFrame("Frame")
+                   f:RegisterEvent("READY_CHECK_CONFIRM")
+                   f:SetScript("OnEvent", function(_, _, unit, ready)
+                       table.insert(READY, unit .. ":" .. tostring(ready))
+                   end)"#,
+            )
+            .unwrap();
+        {
+            let mut group = app.world_mut().resource_mut::<GroupState>();
+            group.apply_ready_check(ReadyCheckWire::Started { initiator: ME });
+            group.apply_ready_check(ReadyCheckWire::Confirm {
+                guid: member(2),
+                ready: true,
+            });
+        }
+        frame(&mut app);
+        let seen: Vec<String> = app
+            .world()
+            .non_send_resource::<UiScript>()
+            .eval("return READY")
+            .unwrap();
+        assert_eq!(seen, ["party2:true"]);
+    }
 
     /// A member or pet selected by guid alone snapshots as `"target"` off the records: the member
     /// as `partyN`'s unstreamed leg, the pet off its owner's pet block; a stranger has none.

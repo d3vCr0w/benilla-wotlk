@@ -20,14 +20,11 @@ use bevy::prelude::*;
 use benilla_protocol::EntityKind;
 use benilla_ui::script::UiScript;
 
-use super::probes::ProbeClock;
 use crate::area::AreaTableRes;
-use crate::net::SelfPlayer;
-use crate::net::{ChatKind, ClientCommand, Guid, HomeBind, NetCommands, NetEntity, ObjectStore};
+use crate::net::{ChatKind, ClientCommand, HomeBind, NetCommands};
 use crate::player::Player;
 use crate::ui_binder::BinderState;
 use crate::ui_gossip::GossipState;
-use crate::ui_session::NpcSession;
 
 /// Innkeeper Keldamyr's spawn (vmangos `creature` guid 46343), the `.go xyz` target.
 const INNKEEPER_AT: [f32; 3] = [9802.21, 982.608, 1313.98];
@@ -164,12 +161,26 @@ fn vm_icon_type(script: &UiScript, pos: usize) -> String {
         .unwrap_or_default()
 }
 
-/// `BENILLA_GOSSIP_ICONS.binder` in the live VM, `""` when absent. The stock
-/// `GossipFrame.lua:123` builds the icon path from the type string and defines no such table.
-fn vm_binder_texture(script: &UiScript) -> String {
-    script
-        .eval::<String>("return (BENILLA_GOSSIP_ICONS and BENILLA_GOSSIP_ICONS.binder) or \"\"")
-        .unwrap_or_default()
+/// The icon texture the stock gossip frame drew beside the shown title button reading `label`,
+/// `""` when no button reads it: `GossipFrame.lua` sets it from the row's type string.
+fn vm_row_icon(script: &UiScript, label: &str) -> String {
+    let chunk = format!(
+        "for i = 1, NUMGOSSIPBUTTONS or 32 do \
+           local b = _G['GossipTitleButton' .. i] \
+           if b and b:IsShown() and b:GetText() == {label:?} then \
+             local t = _G[b:GetName() .. 'GossipIcon'] \
+             return (t and t:GetTexture()) or '' \
+           end \
+         end \
+         return ''"
+    );
+    script.eval::<String>(&chunk).unwrap_or_default()
+}
+
+/// Whether `texture` is the stock icon for gossip type `ty`, `Interface\GossipFrame\<Type>GossipIcon`.
+fn is_type_icon(texture: &str, ty: &str) -> bool {
+    let want = format!("interface\\gossipframe\\{ty}gossipicon");
+    texture.to_ascii_lowercase().replace('/', "\\") == want
 }
 
 /// The live VM's `GetBindLocation()`, the hearthstone's own answer.
@@ -179,27 +190,83 @@ fn vm_bind_location(script: &UiScript) -> String {
         .unwrap_or_default()
 }
 
-fn binder_probe(
-    time: ProbeClock,
-    mut probe: ResMut<BinderProbe>,
-    gossip: Res<GossipState>,
-    binder: Res<BinderState>,
-    mut home: ResMut<HomeBind>,
-    areas: Option<Res<AreaTableRes>>,
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
-    self_player: Query<(), With<SelfPlayer>>,
-    player: Res<Player>,
-    units: Query<(&Guid, &NetEntity, &ObjectStore, &Transform), Without<SelfPlayer>>,
-    net: Res<NetCommands>,
-    mut exit: MessageWriter<AppExit>,
-) {
-    if self_player.is_empty() {
+/// What a frame of the binder probe reads off the `World` before its calls into Lua.
+struct BinderCtx {
+    now: f64,
+    /// The gossip globals as the verbs read them.
+    gossip: GossipState,
+    binder_npc: Option<u64>,
+    home_area: Option<u32>,
+    home_changed: bool,
+    home_name: String,
+    units: super::probes::Seen,
+    pos: Vec3,
+    net: NetCommands,
+}
+
+fn binder_probe(world: &mut World, home: &mut bevy::ecs::system::SystemState<Res<HomeBind>>) {
+    if !super::probes::in_world(world) {
         return; // not in-world yet
     }
-    let Some(script) = script else {
-        return; // no UI VM in this build, so nothing to drive
+    let (home_area, home_changed) = {
+        let home = home.get(world);
+        (home.0, home.is_changed())
     };
-    let now = time.elapsed_secs_f64();
+    let cx = BinderCtx {
+        now: f64::from(super::probes::probe_secs(world)),
+        gossip: world
+            .get_resource::<GossipState>()
+            .cloned()
+            .unwrap_or_default(),
+        binder_npc: world.resource::<BinderState>().npc(),
+        home_area,
+        home_changed,
+        home_name: home_area
+            .and_then(|id| world.get_resource::<AreaTableRes>()?.0.name(id))
+            .unwrap_or_default()
+            .to_string(),
+        units: super::probes::seen(world),
+        pos: world.resource::<Player>().pos,
+        net: NetCommands(world.resource::<NetCommands>().0.clone()),
+    };
+    let Some(mut probe) = world.remove_resource::<BinderProbe>() else {
+        return;
+    };
+    let mut exit = Vec::new();
+    super::probes::with_vm(world, |script| {
+        // No UI VM in this build, so nothing to drive.
+        if let Some(script) = script {
+            binder_step(&mut probe, script, &cx, &mut exit);
+        }
+    });
+    world.insert_resource(probe);
+    for e in exit {
+        world.write_message(e);
+    }
+}
+
+/// One frame of the probe on the VM, the `World` lent.
+fn binder_step(
+    probe: &mut BinderProbe,
+    script: &mut UiScript,
+    cx: &BinderCtx,
+    exit: &mut Vec<AppExit>,
+) {
+    let &BinderCtx {
+        now,
+        binder_npc,
+        home_area,
+        home_changed,
+        pos,
+        ..
+    } = cx;
+    let BinderCtx {
+        gossip,
+        home_name,
+        units,
+        net,
+        ..
+    } = cx;
     let phase = probe.phase;
 
     match phase {
@@ -243,7 +310,7 @@ fn binder_probe(
             if now - sent_at < SETTLE_SECS {
                 return;
             }
-            let me = player.pos;
+            let me = pos;
             let found = units.iter().find(|(_, net_e, store, tf)| {
                 net_e.kind == EntityKind::Unit
                     && (store.0.object_entry() == Some(INNKEEPER_ENTRY)
@@ -278,7 +345,11 @@ fn binder_probe(
             let open = gossip.npc == Some(innkeeper) && !gossip.options.is_empty();
             // Wait for the feed's push as well as the parse: step 3 reads the icon type back out
             // of the VM, so the snapshot must already be there.
-            let pushed = vm_gossip_values(&script) as usize == gossip.options.len() * 2;
+            // The rows are drawn once the frame is shown (`GOSSIP_SHOW`), not when the menu reads.
+            let pushed = vm_gossip_values(script) as usize == gossip.options.len() * 2
+                && script
+                    .eval::<bool>("return GossipFrame and GossipFrame:IsShown() and true or false")
+                    .unwrap_or(false);
             if open && pushed {
                 info!(
                     "PROBE_BINDER: PASS (2 menu) — {} option(s) open on {innkeeper:#x}: {}",
@@ -291,14 +362,14 @@ fn binder_probe(
                         .join(" ")
                 );
                 probe.passes += 1;
-                assert_icon_and_select(&mut probe, &gossip, &script, &net, innkeeper, now);
+                assert_icon_and_select(probe, gossip, script, net, innkeeper, now);
             } else if now - sent_at > MENU_TIMEOUT_SECS {
                 error!(
                     "PROBE_BINDER: FAIL (2 menu) — no gossip menu for {innkeeper:#x} within \
                      {MENU_TIMEOUT_SECS}s (parsed npc={:?} options={} vm_values={})",
                     gossip.npc,
                     gossip.options.len(),
-                    vm_gossip_values(&script)
+                    vm_gossip_values(script)
                 );
                 probe.fails += 1;
                 probe.phase = Phase::Done;
@@ -312,9 +383,9 @@ fn binder_probe(
                 probe.phase = Phase::Done;
                 return;
             };
-            let pending = binder.npc() == Some(innkeeper);
-            let fired = events_len(&script) > events_baseline;
-            let area = last_event(&script);
+            let pending = binder_npc == Some(innkeeper);
+            let fired = events_len(script) > events_baseline;
+            let area = last_event(script);
             if pending && fired && !area.is_empty() {
                 info!(
                     "PROBE_BINDER: PASS (5 confirm) — SMSG_BINDER_CONFIRM parked on \
@@ -333,7 +404,7 @@ fn binder_probe(
                      {innkeeper:#x}), CONFIRM_BINDER fired={fired}, arg1={area:?}. A packet with \
                      no parse arm at all falls through to \
                      ServerPacket::Other — that is what this reading looks like.",
-                    binder.npc()
+                    binder_npc
                 );
                 probe.fails += 1;
                 probe.phase = Phase::Done;
@@ -341,10 +412,9 @@ fn binder_probe(
         }
         Phase::Accept { since, sent } => {
             if !sent {
-                // Clear the bind before answering: a rebind to the same area re-sends an
-                // identical `SMSG_BINDPOINTUPDATE`, so only None → Some proves a fresh packet.
-                probe.baseline_area = home.0;
-                home.0 = None;
+                // A rebind to the same area re-sends an identical `SMSG_BINDPOINTUPDATE`, so the
+                // write after the answer, not the value, proves a fresh packet.
+                probe.baseline_area = home_area;
                 if let Err(e) = script.run("ConfirmBinder()") {
                     warn!(
                         "PROBE_BINDER: SKIP (6 bind) — ConfirmBinder() would not run in the live \
@@ -354,8 +424,8 @@ fn binder_probe(
                     return;
                 }
                 info!(
-                    "PROBE_BINDER: (6 bind) ConfirmBinder() run in the live VM — HomeBind cleared \
-                     from {:?}, waiting for a fresh SMSG_BINDPOINTUPDATE",
+                    "PROBE_BINDER: (6 bind) ConfirmBinder() run in the live VM — HomeBind was \
+                     {:?}, waiting for a fresh SMSG_BINDPOINTUPDATE",
                     probe.baseline_area
                 );
                 probe.phase = Phase::Accept {
@@ -364,17 +434,13 @@ fn binder_probe(
                 };
                 return;
             }
-            let name = home
-                .0
-                .and_then(|id| areas.as_deref()?.0.name(id))
-                .unwrap_or_default()
-                .to_string();
-            let vm = vm_bind_location(&script);
-            if !name.is_empty() && vm == name {
+            let name = home_name.clone();
+            let vm = vm_bind_location(script);
+            if home_changed && !name.is_empty() && vm == name {
                 info!(
                     "PROBE_BINDER: PASS (6 bind) — HomeBind repopulated to area {:?} = {name:?} \
                      (was {:?}), and the VM's GetBindLocation() agrees: {vm:?}",
-                    home.0, probe.baseline_area
+                    home_area, probe.baseline_area
                 );
                 probe.passes += 1;
                 probe.bound_name = name;
@@ -384,7 +450,7 @@ fn binder_probe(
                     "PROBE_BINDER: FAIL (6 bind) — the hearthstone did not take within \
                      {BIND_TIMEOUT_SECS}s of ConfirmBinder(): HomeBind={:?} AreaTable name={name:?} \
                      GetBindLocation()={vm:?} (was area {:?} before the clear)",
-                    home.0, probe.baseline_area
+                    home_area, probe.baseline_area
                 );
                 probe.fails += 1;
                 probe.phase = Phase::Done;
@@ -393,7 +459,7 @@ fn binder_probe(
         Phase::Line { since } => {
             // `SMSG_PLAYERBOUND` prints `ERR_DEATHBIND_SUCCESS_S` as a system line.
             let want = bound_line(&probe.bound_name);
-            let lines = system_lines(&script);
+            let lines = system_lines(script);
             if lines.iter().any(|l| l == &want) {
                 info!("PROBE_BINDER: PASS (7 line) — the bind announced itself: {want:?}");
                 probe.passes += 1;
@@ -418,7 +484,7 @@ fn binder_probe(
             );
             // `ProbeExitPlugin::fire_probe_exit`'s pattern: `AppExit` plus a hard backstop, so a
             // teardown hang cannot leave a client holding the probe account.
-            exit.write(AppExit::Success);
+            exit.push(AppExit::Success);
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 warn!("PROBE_BINDER: still alive 5s after AppExit — hard exit");
@@ -455,7 +521,7 @@ fn assert_icon_and_select(
         return;
     };
     let ty = vm_icon_type(script, pos + 1);
-    let texture = vm_binder_texture(script);
+    let texture = vm_row_icon(script, &opt.message);
     if ty == ICON_TYPE_REGRESSION {
         error!(
             "PROBE_BINDER: FAIL (3 icon) — the innkeeper's row {:?} (wire icon={ICON_INNKEEPER}) \
@@ -477,11 +543,10 @@ fn assert_icon_and_select(
         probe.phase = Phase::Done;
         return;
     }
-    if texture.is_empty() {
+    if !is_type_icon(&texture, ICON_TYPE_BINDER) {
         error!(
             "PROBE_BINDER: FAIL (3 icon) — the app maps the row to {ICON_TYPE_BINDER:?} but \
-             BENILLA_GOSSIP_ICONS.binder resolves to nothing in the live VM, so the row would \
-             still draw the fallback bubble"
+             the stock frame drew {texture:?} beside the row"
         );
         probe.fails += 1;
         probe.phase = Phase::Done;
@@ -489,7 +554,7 @@ fn assert_icon_and_select(
     }
     info!(
         "PROBE_BINDER: PASS (3 icon) — row {} {:?}: wire icon={ICON_INNKEEPER} index={} → type \
-         {ty:?}, BENILLA_GOSSIP_ICONS.binder = {texture:?}",
+         {ty:?}, the stock frame drew {texture:?}",
         pos + 1,
         opt.message,
         opt.index

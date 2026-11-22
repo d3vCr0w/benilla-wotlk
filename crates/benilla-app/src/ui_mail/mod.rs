@@ -24,7 +24,7 @@ use crate::items::Items;
 use crate::names::NameCache;
 use crate::net::{ClientCommand, NetCommands, ObjectStore, Objects, SelfPlayer};
 use crate::ui_script::{UiDrain, UiFeed};
-use crate::ui_session::{close_npc_session_out_of_range, NpcSession};
+use crate::ui_session::NpcSession;
 
 mod invoice;
 mod net;
@@ -55,6 +55,7 @@ fn package_view(row: &benilla_formats::PackageRow) -> benilla_ui::script::Packag
 }
 
 /// One inbox row: the wire row, its attachments filed by slot, and the client's own mark.
+#[derive(Clone)]
 pub(crate) struct MailRow {
     pub(crate) entry: MailListEntry,
     /// Sixteen slots; the list handler files each attachment as `0x571e29` does.
@@ -129,6 +130,7 @@ fn leading_u64(s: &str) -> u64 {
 }
 
 /// One step of a result's or list's effect on the window, applied by [`feed_mail`] in order.
+#[derive(Clone)]
 pub(crate) enum MailEffect {
     /// A message line by key.
     Message(&'static str),
@@ -148,7 +150,7 @@ pub(crate) enum MailEffect {
 
 /// The mail session: the open mailbox, the inbox rows (kept past a close, as the reference keeps
 /// them until a world change, `0x571730`), and the queued effects.
-#[derive(Resource, Default)]
+#[derive(Resource, Default, Clone)]
 pub(crate) struct MailOpen {
     /// The open mailbox.
     pub(crate) mailbox: Option<u64>,
@@ -203,6 +205,23 @@ impl NpcSession for MailOpen {
     }
 }
 
+/// The mailbox open (`0x56da60`, `0x56dbc0`): the interact target set on the mailbox first (`0x56da67`, `0x56dbe2`), whose interaction close takes the window bound to the old one, then the mailbox stored and `MAIL_SHOW` owed.
+pub(crate) fn talk_to_mailbox(world: &mut World, mailbox: u64) {
+    crate::ui_session::set_interact_target(world, mailbox);
+    crate::ui_script::live::in_turn(world, move |w| {
+        if let Some(mut mail) = w.get_resource_mut::<MailOpen>() {
+            mail.click(mailbox);
+        }
+    });
+}
+
+/// The interaction close's mail leg (`0x51302d` -> `0x571730` with 0), its target already zeroed: the window closes and `MAIL_CLOSED` is owed.
+pub(crate) fn close_by_interaction(world: &mut World) {
+    if let Some(mut mail) = world.get_resource_mut::<MailOpen>() {
+        NpcSession::close(&mut *mail);
+    }
+}
+
 pub(crate) struct UiMailPlugin;
 
 impl Plugin for UiMailPlugin {
@@ -215,9 +234,8 @@ impl Plugin for UiMailPlugin {
                 (
                     // Range-close, feed, then drain after input, so each edge lands the same
                     // frame; the feed runs after `UnitFeed` so a row's tooltip reads the template.
-                    close_npc_session_out_of_range::<MailOpen>.before(feed_mail),
                     feed_mail.after(crate::ui_unit::UnitFeed).in_set(UiFeed),
-                    drain_mail
+                    crate::ui_script::raises::then_fire(drain_mail)
                         .in_set(UiDrain)
                         .before(crate::ui_social::drain_social),
                     // The cascade's order: the time query, this, then the battlefield status.
@@ -661,7 +679,7 @@ struct MailMemos {
 }
 
 fn feed_mail(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut script: crate::ui_script::InTurn,
     mut mail: ResMut<MailOpen>,
     mut pending: ResMut<MailPending>,
     look: MailLookups,
@@ -670,7 +688,7 @@ fn feed_mail(
     mut cascades: MessageReader<crate::net::WorldEnterCascadeMessage>,
     mut memos: Local<crate::ui_script::VmMemo<MailMemos>>,
 ) {
-    let Some(mut script) = script else {
+    let Some(mut script) = script.turn() else {
         return;
     };
     let memo = memos.get(&script);
@@ -705,12 +723,17 @@ fn feed_mail(
     }
 
     if std::mem::take(&mut mail.open_requested) {
-        // The mailbox open takes the interact target before `MAIL_SHOW` (`0x56da67`).
-        script.close_bank_interaction();
-        script.open_mailbox();
+        // The mailbox open takes the interact target before `MAIL_SHOW` (`0x56da67`), through the
+        // lent `World` in its turn.
+        benilla_ui::script::world_loan::in_turn_or_now(&mut script, |script| {
+            script.close_bank_interaction();
+            script.open_mailbox();
+        });
     }
     if std::mem::take(&mut mail.close_requested) {
-        script.close_mailbox();
+        benilla_ui::script::world_loan::in_turn_or_now(&mut script, |script| {
+            script.close_mailbox()
+        });
     }
 
     // `None` until the player is named; a letter body re-substitutes when it lands.
@@ -736,7 +759,8 @@ fn feed_mail(
     };
 
     // The results' effects, in the reference's order: the message, the row's change with its
-    // events, the pending flags, then `MAIL_SUCCESS` or `MAIL_FAILED`.
+    // events, the pending flags, then `MAIL_SUCCESS` or `MAIL_FAILED`; each write after a raise
+    // lands once that raise's listeners have run.
     let mut inbox_fired = false;
     for effect in std::mem::take(&mut mail.effects) {
         match effect {
@@ -750,18 +774,18 @@ fn feed_mail(
                 let line = crate::ui_action::keyed_line(&script, key);
                 crate::ui_action::show_messages(&mut script, &mut sink, "ui_mail", line);
             }
-            MailEffect::Sent => script.mail_sent(),
+            MailEffect::Sent => script.after_raises(|s| s.mail_sent()),
             MailEffect::CloseInboxItem(index) => {
                 script.fire_event("CLOSE_INBOX_ITEM", vec![ScriptValue::Int(i64::from(index))]);
             }
             MailEffect::InboxUpdate => {
                 let fresh = snapshot(&script, &mail);
-                script.set_mail(fresh.clone());
-                memo.inbox = Some(fresh);
+                memo.inbox = Some(fresh.clone());
+                script.after_raises(move |s| s.set_mail(fresh));
                 script.fire_event("MAIL_INBOX_UPDATE", vec![]);
                 inbox_fired = true;
             }
-            MailEffect::Done { send } => script.mail_command_done(send),
+            MailEffect::Done { send } => script.after_raises(move |s| s.mail_command_done(send)),
             MailEffect::Result { ok } => {
                 script.fire_event(if ok { "MAIL_SUCCESS" } else { "MAIL_FAILED" }, vec![]);
             }
@@ -772,8 +796,8 @@ fn feed_mail(
     // signal `MAIL_INBOX_UPDATE` (`0x56d4b0`, `0x56d460`).
     let fresh = snapshot(&script, &mail);
     if memo.inbox.as_ref() != Some(&fresh) {
-        script.set_mail(fresh.clone());
-        memo.inbox = Some(fresh);
+        memo.inbox = Some(fresh.clone());
+        script.after_raises(move |s| s.set_mail(fresh));
         if !inbox_fired {
             script.fire_event("MAIL_INBOX_UPDATE", vec![]);
         }
@@ -782,7 +806,7 @@ fn feed_mail(
     pending.step(time.delta_secs());
     let has_new_mail = pending.has_new_mail();
     if memo.has_new_mail != Some(has_new_mail) {
-        script.set_has_new_mail(has_new_mail);
+        script.after_raises(move |s| s.set_has_new_mail(has_new_mail));
         memo.has_new_mail = Some(has_new_mail);
     }
     let senders: Vec<Option<String>> = {
@@ -797,8 +821,8 @@ fn feed_mail(
         if memo.senders.is_some() {
             pending.notify_senders();
         }
-        script.set_mail_latest_senders(senders.clone());
-        memo.senders = Some(senders);
+        memo.senders = Some(senders.clone());
+        script.after_raises(move |s| s.set_mail_latest_senders(senders));
     }
     if pending.take_notify() {
         script.fire_event("UPDATE_PENDING_MAIL", vec![]);
@@ -841,10 +865,10 @@ fn complain(
 
 /// The VM's mail packets out, each as its verb's reference send does.
 fn drain_mail(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut script: crate::ui_script::InTurn,
     mut mail: ResMut<MailOpen>,
     mut pending: ResMut<MailPending>,
-    commands: Res<NetCommands>,
+    (commands, mut queue): (Res<NetCommands>, Commands),
     (social, mut complaints): (
         Res<crate::ui_social::SocialState>,
         MessageWriter<crate::ui_social::Complained>,
@@ -854,13 +878,20 @@ fn drain_mail(
 ) {
     use benilla_protocol::messages::mail_delete_reason;
     use benilla_ui::script::MailCommand;
-    let Some(mut script) = script else {
+    let Some(mut script) = script.turn() else {
         return;
     };
     for command in script.take_mail_commands() {
         if let MailCommand::Close = command {
             // `CloseMail(false)`'s tail (`0x571a99`): a read or an arrival while open re-asks.
             debug!("ui_mail: the window closed");
+            // The close clears the interact target on the mailbox (`0x571778`).
+            if let Some(mailbox) = mail.mailbox {
+                queue.queue(move |w: &mut World| {
+                    crate::ui_session::clear_interact_target(w, mailbox);
+                    crate::ui_script::live::fire_handler_events(w);
+                });
+            }
             mail.mailbox = None;
             mail.auto_looting = None;
             if pending.take_do_pending_query() {
@@ -992,4 +1023,59 @@ fn mark_read(mail: &mut MailOpen, pending: &mut MailPending, message_id: u32) {
         .all(|r| r.entry.flags & mail_flags::READ != 0);
     pending.on_mail_read(all_read);
     mail.effects.push(MailEffect::InboxUpdate);
+}
+
+#[cfg(test)]
+mod split_tests {
+    use super::*;
+
+    /// A result's listener reads the model as of its raise: the feed's later new-mail write lands
+    /// once the listener has run.
+    #[test]
+    fn a_results_listener_does_not_see_the_feeds_later_new_mail_write() {
+        let mut app = App::new();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        app.insert_resource(NetCommands(tx))
+            .init_resource::<MailOpen>()
+            .init_resource::<MailPending>()
+            .init_resource::<Items>()
+            .init_resource::<NameCache>()
+            .init_resource::<crate::go_templates::GameObjectTemplates>()
+            .init_resource::<crate::ui_social::SocialState>()
+            .init_resource::<crate::world_state::WorldStates>()
+            .init_resource::<crate::net::GuidIndex>()
+            .init_resource::<crate::ui_chat::ChatLog>()
+            .init_resource::<crate::sound::MessageSounds>()
+            .init_resource::<Time>()
+            .init_resource::<crate::ui_script::live::UiEvents>()
+            .add_message::<crate::net::WorldEnterCascadeMessage>()
+            .add_systems(Update, feed_mail);
+        let script = UiScript::new().expect("VM");
+        script
+            .run(
+                "SEEN = {} local f = CreateFrame('Frame') f:RegisterEvent('MAIL_SUCCESS')
+                 f:SetScript('OnEvent', function() SEEN[#SEEN + 1] = tostring(HasNewMail()) end)",
+            )
+            .unwrap();
+        app.insert_non_send_resource(script);
+        app.update();
+        crate::ui_script::raises::fire_raises(app.world_mut());
+        app.world_mut()
+            .resource_mut::<MailPending>()
+            .apply_query_reply(0.0, &[]);
+        app.world_mut()
+            .resource_mut::<MailOpen>()
+            .effects
+            .push(MailEffect::Result { ok: true });
+        app.update();
+        crate::ui_script::raises::fire_raises(app.world_mut());
+        let script = app.world().non_send_resource::<UiScript>();
+        let seen: String = script.eval("return table.concat(SEEN, ',')").unwrap();
+        assert_eq!(
+            seen, "nil",
+            "the listener ran before the new mail was written"
+        );
+        let now: bool = script.eval("return HasNewMail() ~= nil").unwrap();
+        assert!(now, "the new mail is written after the listener");
+    }
 }

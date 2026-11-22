@@ -15,7 +15,7 @@ use benilla_assets::coords::wow_to_bevy;
 
 use super::PetBar;
 use crate::net::{GuidIndex, NetHandlerApp, PetDismissSoundMessage, PetTalkMessage};
-use crate::ui_action::{CastErrors, PetTameFailures, Spells, UiError};
+use crate::ui_action::{Spells, UiError};
 
 pub(super) fn register(app: &mut App) {
     use SessionEventKind as K;
@@ -147,7 +147,7 @@ pub(crate) fn player_dead(store: &crate::net::ObjectStore) -> bool {
     store.0.unit_health().is_some_and(|h| h as i32 <= 0)
 }
 
-/// The pet setter's tail (`0x5d6a2f`-`0x5d6b80`): on a new guid the latches drop, a held head's tests run, an empty head zeroes the pet's combo points (`0x5d6ab0`), then `UNIT_PET`; every call updates the temporary bar (`0x5d6ad2`); a new guid while we are `dead` fires `RAISED_AS_GHOUL` for a head (`0x5d6b80`), else refreshes the active player (`0x5d6b6f`); the modal-cast cancel (`0x5d6afb`-`0x5d6b24`) is #1337.
+/// The pet setter's tail (`0x5d6a2f`-`0x5d6b80`): on a new guid the latches drop, a held head's tests run, an empty head zeroes the pet's combo points (`0x5d6ab0`), then `UNIT_PET`; every call updates the temporary bar (`0x5d6ad2`); a new guid while we are `dead` fires `RAISED_AS_GHOUL` for a head (`0x5d6b80`), else refreshes the active player (`0x5d6b6f`); the modal test and cancel run after the temporary bar (`0x5d6afb`-`0x5d6b24`).
 pub(crate) fn set_pet_tail(
     changed: bool,
     bar: &mut PetBar,
@@ -177,7 +177,12 @@ pub(crate) fn set_pet_tail(
             vec![benilla_ui::script::ScriptValue::Str("player".into())],
         );
     }
-    ui.world(super::temp_bar::update_pet_temp_bar_step);
+    // The temporary bar, then the modal test and cancel on the guid the setter was handed (`0x5d6ad2`, `0x5d6afb`-`0x5d6b24`).
+    let handed = bar.spells.pet_guid;
+    ui.world(move |world| {
+        super::temp_bar::update_pet_temp_bar_step(world);
+        crate::spell::pet_setter_cancel(world, changed, handed);
+    });
     if changed && dead {
         if head {
             ui.fire("RAISED_AS_GHOUL", Vec::new());
@@ -235,17 +240,15 @@ fn on_action_feedback(
 /// The pet history's start-cooldown refund (`0x804780`): the spellbook's flush when a record matched (`0x80476d`), then the pet bar's (`0x804792`).
 fn pet_refund_start(bar: &mut PetBar, spell: u32, ui: &mut crate::ui_script::live::UiEvents) {
     if bar.cooldowns.clear_gcd(spell, Instant::now()) {
-        // `UPDATE_SHAPESHIFT_COOLDOWN` between the two while the stance bar holds forms (`0x53bac5`) is #577's.
-        ui.fire("ACTIONBAR_UPDATE_COOLDOWN", Vec::new());
-        ui.fire("SPELL_UPDATE_COOLDOWN", Vec::new());
+        crate::ui_action::signals::spellbook(ui);
     }
     ui.fire("PET_BAR_UPDATE_COOLDOWN", Vec::new());
 }
 
 fn on_cast_failed(
     In(ev): In<SessionEvent>,
-    mut errors: ResMut<CastErrors>,
     mut bar: ResMut<super::PetBar>,
+    mut pending: ResMut<crate::spell::PendingCast>,
     mut ends: PetCastEnd,
     mut ui: ResMut<crate::ui_script::live::UiEvents>,
 ) {
@@ -257,10 +260,11 @@ fn on_cast_failed(
         wire_reason,
     } = ev
     {
-        bar.pending_cast = None;
+        // The failure releases the record it names (`0x806d2e` -> `0x8051d0`).
+        pending.release(spell_id, cast_count);
         // The start cooldown the press armed refunds on the pet history, then the pet bar's flush (`0x806d41`, `0x806d46`).
         pet_refund_start(&mut bar, spell_id, &mut ui);
-        pet_cast_failed(spell_id, reason, arg, &mut errors);
+        pet_cast_failed(spell_id, reason, arg, &mut *ui);
         ends.end(spell_id, cast_count, wire_reason);
     }
 }
@@ -318,9 +322,9 @@ impl PetCastEnd<'_, '_> {
     }
 }
 
-fn on_tame_failure(In(ev): In<SessionEvent>, mut failures: ResMut<PetTameFailures>) {
+fn on_tame_failure(In(ev): In<SessionEvent>, mut ui: ResMut<crate::ui_script::live::UiEvents>) {
     if let SessionEvent::PetTameFailure { reason } = ev {
-        pet_tame_failure(reason, &mut failures);
+        crate::ui_action::show_in_turn(&mut ui, "ui_pet", tame_failure_line(reason));
     }
 }
 
@@ -546,14 +550,16 @@ fn pet_feedback_key(reason: u8, helpful: bool) -> Option<&'static str> {
     })
 }
 
-/// `SMSG_PET_TAME_FAILURE`: the reason byte, queued. vmangos also sends it for a summon while a
-/// pet or a charmed unit is out (`Spell.cpp:5467`).
-fn pet_tame_failure(reason: u8, failures: &mut PetTameFailures) {
-    debug!(
-        "net: pet tame failure {reason} ({})",
-        benilla_protocol::messages::pet_tame_failure_key(reason)
-    );
-    failures.0.push(reason);
+/// `SMSG_PET_TAME_FAILURE`: the reason's `PETTAME_*` string, read through the VM's string lookup,
+/// fills `ERR_TAME_FAILED` ("%s.", error id `0xee`), shown in the handler's turn. vmangos also
+/// sends it for a summon while a pet or a charmed unit is out (`Spell.cpp:5467`).
+pub(crate) fn tame_failure_line(reason: u8) -> UiError {
+    let key = benilla_protocol::messages::pet_tame_failure_key(reason);
+    debug!("net: pet tame failure {reason} ({key})");
+    UiError::args(
+        "ERR_TAME_FAILED",
+        vec![crate::ui_action::FillArg::Global(key.to_string())],
+    )
 }
 
 /// `SMSG_PET_NAME_INVALID`: the server's name code through the name-error display, as the client's
@@ -592,10 +598,15 @@ fn pet_dismiss_sound(
     });
 }
 
-/// `SMSG_PET_CAST_FAILED`: queued as the pet's, so the display uses the reference's pet table. Our
-/// cast state is untouched, and unlike the player's it writes no combat-log line and plays no error
-/// sound.
-fn pet_cast_failed(spell_id: u32, reason: u8, arg: Option<u32>, errors: &mut CastErrors) {
+/// `SMSG_PET_CAST_FAILED`: shown in the handler's turn as the pet's, so the display uses the
+/// reference's pet table. Our cast state is untouched, and unlike the player's it writes no
+/// combat-log line and plays no error sound.
+fn pet_cast_failed(
+    spell_id: u32,
+    reason: u8,
+    arg: Option<u32>,
+    errors: &mut impl crate::ui_action::CastRefusals,
+) {
     debug!("net: pet cast failed — spell {spell_id} reason {reason:#04x} arg {arg:?}");
     errors.push_pet(spell_id, reason, arg);
 }

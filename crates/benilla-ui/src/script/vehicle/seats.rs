@@ -183,7 +183,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 return Ok(());
             };
             let guid = model.unit(&token).map(|u| u.guid);
-            let player = model.unit_guids.player;
+            let player = model.player_guid();
             let Some(vehicle) = model
                 .vehicles
                 .player_vehicle
@@ -240,7 +240,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             if seat_flag_set(&model, 0x200_0000) {
                 model.vehicle_requests.push(VehicleRequest::Exit);
             } else {
-                model.ui_errors_s.push(("ERR_SPELL_FAILED_S", refusal));
+                {
+                    drop(model);
+                    crate::script::ui_errors::show_now_s(lua, "ERR_SPELL_FAILED_S", refusal);
+                }
             }
             Ok(())
         })?,
@@ -511,7 +514,7 @@ mod tests {
         s.run("VehicleNextSeat(); VehicleExit()").unwrap();
         assert_eq!(s.take_vehicle_requests(), [VehicleRequest::NextSeat]);
         assert_eq!(
-            s.model_ref().ui_errors_s,
+            s.take_shown_s(),
             [("ERR_SPELL_FAILED_S", String::new())],
             "no GlobalStrings loaded: the empty text"
         );

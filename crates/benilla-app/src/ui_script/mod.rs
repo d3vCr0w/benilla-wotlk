@@ -23,10 +23,9 @@ pub(crate) mod glue_mgr;
 pub(crate) mod glue_scene;
 mod input;
 pub(crate) mod live;
-pub(crate) use live::{
-    LendLive, LentRef, OwnedMut, OwnsActions, OwnsCooldowns, OwnsPending, OwnsPetitions, OwnsPlace,
-    OwnsSelection,
-};
+pub(crate) mod raises;
+pub(crate) mod safe_world;
+pub(crate) use raises::{InTurn, VmTurn};
 #[cfg(test)]
 pub(crate) mod live_tests;
 // The press-frame tests run the input pass as a system of their own.
@@ -35,11 +34,15 @@ pub(crate) use input::feed_ui_input;
 #[cfg(test)]
 mod characterization_tests;
 #[cfg(test)]
+mod demo_unit_tests;
+#[cfg(test)]
 mod feed_census_tests;
 #[cfg(test)]
 mod layer_tests;
 mod load_log;
 mod manifest;
+#[cfg(test)]
+mod raise_census_tests;
 /// The server alert's fetch and `LaunchURL`'s browser, for the stock glue screens.
 pub(crate) mod server_alert;
 #[cfg(test)]
@@ -258,6 +261,10 @@ pub(crate) struct PointerOverUiPanel(pub(crate) bool);
 /// `0x495320`) runs `OnUpdate` and the cooldown widgets.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiPress;
+
+/// [`PointerOverUi`]'s arbiter, in [`UiPress`] after the pointer feed.
+#[derive(SystemSet, Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct PointerArbiter;
 
 /// The player-UI feed phase, after [`UiPress`] and ungated (`UnitFeed` is the gated sub-phase):
 /// every push this frame's tick must see, as in the reference's frame, where packet dispatch
@@ -512,6 +519,8 @@ impl Plugin for UiScriptPlugin {
                 )
                     .chain(),
             )
+            // The raise steps between the phases.
+            .add_plugins(raises::schedule)
             // The area resolves after the input's calls drain and before the paint (`0x47f15b`, `0x47f163`).
             .configure_sets(
                 Update,
@@ -554,12 +563,13 @@ impl Plugin for UiScriptPlugin {
                     .after(crate::vplates::VPlateSet)
                     .before(crate::ui_pass::UiQuadAppend),
             )
-            // After the hover is known and before gameplay reads `PointerOverUi`.
+            // After the hover is known and before the world mouse latch reads `PointerOverUi`.
             .add_systems(
                 Update,
                 arbitrate_pointer_over_ui
-                    .after(UiInput)
-                    .before(WorldStage::Input),
+                    .in_set(PointerArbiter)
+                    .in_set(UiPress)
+                    .after(input::feed_ui_input),
             );
 
         // A UI capture's synthetic unit snapshots, after the real feed so they win.
@@ -612,11 +622,11 @@ pub(crate) use lifecycle::{
 /// `GetFramerate()`'s host half: FPS on `Time<Real>`, smoothed by a one-second pole; how the
 /// reference averages it is untraced.
 fn feed_framerate(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut script: crate::ui_script::InTurn,
     time: Res<Time<bevy::time::Real>>,
     mut smoothed: Local<f64>,
 ) {
-    let Some(mut script) = script else {
+    let Some(mut script) = script.turn() else {
         return;
     };
     let dt = time.delta_secs_f64();
@@ -635,18 +645,47 @@ fn feed_framerate(
 }
 
 /// Synthetic player and target snapshots for a server-less UI capture, and its first events once.
-fn demo_unit_feed(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
-    mut fired: Local<VmMemo<bool>>,
-) {
-    /// The synthetic target's guid: a creature high part; only its distinctness matters.
-    const DEMO_TARGET_GUID: u64 = 0xF130_0000_0000_0001;
+fn demo_unit_feed(world: &mut World, mut fired: Local<VmMemo<bool>>) {
+    // A fixture's own self player keeps its guid; else the stand-in's.
+    let player = world
+        .query_filtered::<&crate::net::Guid, With<crate::net::SelfPlayer>>()
+        .iter(world)
+        .next()
+        .map_or(DEMO_PLAYER_GUID, |g| g.0);
+    safe_world::lend(world, |script| demo_units(script, player, &mut fired));
+}
 
-    let Some(mut script) = script else {
-        return;
-    };
+/// The synthetic player's guid where the capture spawns no self player.
+const DEMO_PLAYER_GUID: u64 = 0x51;
+/// The synthetic target's guid: a creature high part; only its distinctness matters.
+const DEMO_TARGET_GUID: u64 = 0xF130_0000_0000_0001;
+/// The guid a tooltip fixture's hovered snapshot carries; only its distinctness matters.
+pub(crate) const DEMO_MOUSEOVER_GUID: u64 = 0xF130_0000_0000_0002;
+
+/// The resolver's stand-in tables for a capture's synthetic units: the World holds no selection
+/// or hover, so the tokens name the snapshots' guids, as `addon_harness` does for its own.
+fn demo_unit_guids(player: u64) -> benilla_ui::script::UnitGuids {
+    benilla_ui::script::UnitGuids {
+        player,
+        target: DEMO_TARGET_GUID,
+        mouseover: DEMO_MOUSEOVER_GUID,
+        held: [
+            (player, DEMO_TARGET_GUID),
+            (DEMO_TARGET_GUID, 0),
+            (DEMO_MOUSEOVER_GUID, 0),
+        ]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    }
+}
+
+/// [`demo_unit_feed`]'s body on the VM, with the `World` lent.
+fn demo_units(script: &mut UiScript, player: u64, fired: &mut VmMemo<bool>) {
     // Session-keyed: a fresh VM needs the one-shot events and bar seeds again.
-    let fired = fired.get(&script);
+    let fired = fired.get(script);
+    // Each frame, ahead of any read: the synthetic snapshots below are what the tokens name.
+    crate::dev::set_fixture_units(script, demo_unit_guids(player));
     // Debug (`WOW_CAPTURE_REHOVER=1`): re-fire the world hover every frame, a flapping raycast.
     if std::env::var("WOW_CAPTURE_REHOVER").as_deref() == Ok("1") {
         script.world_tooltip_unit("mouseover");
@@ -672,6 +711,7 @@ fn demo_unit_feed(
             sex: 2,
             is_player: true,
             player_controlled: true,
+            guid: player,
             ..Default::default()
         }),
     );
@@ -705,7 +745,7 @@ fn demo_unit_feed(
     // The combo dots need a rogue and banked points, seeded only for `ui-combopoints`.
     if std::env::var("WOW_CAPTURE").as_deref() == Ok("ui-combopoints") {
         crate::dev::set_fixture_player(
-            &mut script,
+            script,
             benilla_ui::script::PlayerReqState {
                 level: 12,
                 class_id: 4, // rogue
@@ -721,7 +761,7 @@ fn demo_unit_feed(
     if !*fired {
         // Battle-stance page slots (actions 73..); slot 80 is a consumable stack of 5, since stock
         // `ActionButton_UpdateCount` shows only a consumable's count (`ActionButton.lua:287`).
-        script.set_bonus_bar_offset(1);
+        crate::dev::set_fixture_bonus_bar_offset(script, 1);
         // A macro on button 4; a capture has no character for `ui_macro::load_macros` to read.
         script.set_macros(benilla_ui::script::MacroState {
             account: vec![benilla_ui::script::MacroView {
@@ -775,7 +815,8 @@ fn demo_unit_feed(
             (49, "Interface\\Icons\\Spell_Fire_FlameBolt", 0x00, 107, 0),
             (60, "Interface\\Icons\\Spell_Holy_Heal", 0x00, 108, 0),
         ] {
-            script.set_action(
+            crate::dev::set_fixture_action(
+                script,
                 action,
                 Some(ActionSlot {
                     texture: Some(icon.into()),
@@ -798,32 +839,35 @@ fn demo_unit_feed(
             );
         }
         // The stance bar: battle active (bonus offset 1), defensive uncastable, berserker cooling.
-        script.set_shapeshift_forms(vec![
-            benilla_ui::script::ShapeshiftFormView {
-                spell_id: 2457,
-                texture: Some("Interface\\Icons\\Ability_Warrior_OffensiveStance".into()),
-                name: "Battle Stance".into(),
-                active: true,
-                castable: true,
-                cooldown: None,
-            },
-            benilla_ui::script::ShapeshiftFormView {
-                spell_id: 71,
-                texture: Some("Interface\\Icons\\Ability_Warrior_DefensiveStance".into()),
-                name: "Defensive Stance".into(),
-                active: false,
-                castable: false,
-                cooldown: None,
-            },
-            benilla_ui::script::ShapeshiftFormView {
-                spell_id: 2458,
-                texture: Some("Interface\\Icons\\Ability_Racial_Avatar".into()),
-                name: "Berserker Stance".into(),
-                active: false,
-                castable: true,
-                cooldown: Some((900, 1500, true)),
-            },
-        ]);
+        crate::dev::set_fixture_shapeshift_forms(
+            script,
+            vec![
+                benilla_ui::script::ShapeshiftFormView {
+                    spell_id: 2457,
+                    texture: Some("Interface\\Icons\\Ability_Warrior_OffensiveStance".into()),
+                    name: "Battle Stance".into(),
+                    active: true,
+                    castable: true,
+                    cooldown: None,
+                },
+                benilla_ui::script::ShapeshiftFormView {
+                    spell_id: 71,
+                    texture: Some("Interface\\Icons\\Ability_Warrior_DefensiveStance".into()),
+                    name: "Defensive Stance".into(),
+                    active: false,
+                    castable: false,
+                    cooldown: None,
+                },
+                benilla_ui::script::ShapeshiftFormView {
+                    spell_id: 2458,
+                    texture: Some("Interface\\Icons\\Ability_Racial_Avatar".into()),
+                    name: "Berserker Stance".into(),
+                    active: false,
+                    castable: true,
+                    cooldown: Some((900, 1500, true)),
+                },
+            ],
+        );
         script.fire_event("UPDATE_SHAPESHIFT_FORMS", vec![]);
         // 70% XP, set before `PLAYER_ENTERING_WORLD` so the bar's first update reads it.
         script.set_player_xp(4200, 6000);
@@ -1093,15 +1137,11 @@ mod instance_tests;
 mod static_popup_tests;
 
 #[cfg(test)]
-mod binder_tests;
-
+mod npc_characterization_tests;
 #[cfg(test)]
 mod summon_tests;
 #[cfg(test)]
 pub(crate) mod test_live;
-
-#[cfg(test)]
-mod talent_wipe_tests;
 
 #[cfg(test)]
 mod death_tests;
@@ -1272,8 +1312,6 @@ mod quiver_tests;
 mod world_entry_tests;
 
 /// The guild tabard designer: the stock `TabardFrame.xml` off the chain.
-#[cfg(test)]
-mod tabard_tests;
 /// The stock world map: its POI pool, unit blips, player arrow and full-screen quads.
 #[cfg(test)]
 mod world_map_tests;

@@ -369,6 +369,15 @@ impl super::UiScript {
         super::tooltip_unit::on_unit_push(&self.lua, token);
     }
 
+    /// Whether `token`'s snapshot is `state` now (`None`: none held): what a feed diffs a push
+    /// against, whoever wrote the snapshot last.
+    pub fn holds_unit(&self, token: &str, state: Option<&UnitState>) -> bool {
+        self.model_ref()
+            .units_by_lower
+            .get(&token.to_ascii_lowercase())
+            == state
+    }
+
     /// Push, or clear with `None`, the snapshot of a unit a `target` chain can end on, by guid. A
     /// token with a hop that no push names (`"party1target"`, `"raid3targettarget"`) resolves
     /// through [`UnitGuids`] to a guid and reads that guid's entry, the reference's order (then
@@ -386,13 +395,11 @@ impl super::UiScript {
         }
     }
 
-    /// The guids the chains a script can spell end on ([`UnitGuids::chain_ends`]), each once: the
-    /// units whose snapshots [`Self::set_unit_by_guid`] serves.
+    /// The guids a fixture's chains end on, each once ([`Self::set_unit_guids`]); the game's are
+    /// walked by the app.
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn chain_end_guids(&self) -> Vec<u64> {
-        let mut ends: Vec<u64> = self.model_ref().unit_guids.chain_ends().collect();
-        ends.sort_unstable();
-        ends.dedup();
-        ends
+        self.model_ref().tokens().fixture_chain_ends()
     }
 
     /// Push the player's copper (`PLAYER_FIELD_COINAGE`), read by `GetMoney`.
@@ -571,7 +578,7 @@ fn pair_reaction(lua: &Lua, a: &str, b: &str) -> Option<u8> {
         .app_data_ref::<crate::script::ModelCell>()
         .expect("model app_data");
     let (ua, ub) = (model.unit(a)?, model.unit(b)?);
-    let player = model.unit_guids.player;
+    let player = model.player_guid();
     let is_player = |token: &str, u: &UnitState| {
         token.eq_ignore_ascii_case("player") || (player != 0 && u.guid == player)
     };
@@ -611,7 +618,9 @@ mod resolve;
 mod tests;
 
 pub use resolve::{
-    parse_unit_token, split_name, Hop, Hops, UnitBase, UnitGuids, UnitTokenParse, PET_OF_ANYONE,
+    parse_unit_token, split_name, Hop, Hops, HostBases, UnitBase, UnitCounts, UnitGuids,
+    UnitTokenParse, PET_OF_ANYONE,
 };
+pub(crate) use resolve::{NameAsk, Tokens};
 
 pub(super) use bindings::install;

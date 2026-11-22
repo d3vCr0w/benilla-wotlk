@@ -717,10 +717,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 .map(|s| s.to_string_lossy())
                 .unwrap_or_default();
             let model = model_ref(lua);
-            // The token resolves through the unit feed's guids, not at the call (#1289). A missing or empty token is the target (`0x60b029`).
-
+            // The token resolves at the call; a missing or empty one is the target (`0x60b029`).
             let target = if token.is_empty() {
-                Some(model.unit_guids.target).filter(|&g| g != 0)
+                Some(model.target_guid()).filter(|&g| g != 0)
             } else {
                 model.token_guid(&token)
             };
@@ -741,11 +740,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "UseQuestLogSpecialItem",
         lua.create_function(|lua, v: Value| {
             let index = number_arg(lua, v, "Usage: UseQuestLogSpecialItem(index)")?;
-            let mut model = super::model_mut_of(lua);
-            if let Some((bag, slot)) = special_item(&model, index).map(|i| (i.bag, i.slot)) {
-                model
-                    .script_calls
-                    .push(super::ScriptCall::UseItem { bag, slot });
+            let item = special_item(&super::model_mut_of(lua), index).map(|i| (i.bag, i.slot));
+            if let Some((bag, slot)) = item {
+                super::calls::make(lua, super::ScriptCall::UseItem { bag, slot });
             }
             Ok(())
         })?,

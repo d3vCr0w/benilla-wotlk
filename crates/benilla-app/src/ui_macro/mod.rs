@@ -76,13 +76,13 @@ impl Plugin for UiMacroPlugin {
 /// so no VM builds it unasked. A failed load leaves it empty, and `MacroPopupOkayButton_Update`
 /// then keeps OKAY disabled.
 fn load_icon_catalog(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut script: crate::ui_script::InTurn,
     assets: Option<Res<WorldAssets>>,
     list: Res<MacroIconList>,
     item_list: Res<MacroItemIconList>,
     mut seeded: Local<crate::ui_script::VmMemo<bool>>,
 ) {
-    let (Some(mut script), Some(assets)) = (script, assets) else {
+    let (Some(mut script), Some(assets)) = (script.turn(), assets) else {
         return;
     };
     if !seeded.claim(&script) {
@@ -145,12 +145,14 @@ pub(crate) fn identity(roster: &crate::char_select::Roster) -> Option<(String, S
 /// Seed the engine's macro table from the two slots once per VM, when both have heard from the
 /// server (the reference's macro read `0x567c10` runs from the deferred load).
 fn load_macros(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut script: crate::ui_script::InTurn,
     data: Res<crate::account_data::AccountData>,
     mut files: ResMut<MacroFiles>,
 ) {
     use crate::account_data::store::{MACROS_ACCOUNT, MACROS_CHARACTER};
-    let Some(mut script) = script else { return };
+    let Some(mut script) = script.turn() else {
+        return;
+    };
     if *files.loaded.get(&script) {
         return;
     }
@@ -175,11 +177,10 @@ fn load_macros(
 }
 
 /// An edit fires `UPDATE_MACROS` and owes the shutdown's save.
-fn note_dirty_macros(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
-    mut files: ResMut<MacroFiles>,
-) {
-    let Some(mut script) = script else { return };
+fn note_dirty_macros(mut script: crate::ui_script::InTurn, mut files: ResMut<MacroFiles>) {
+    let Some(mut script) = script.turn() else {
+        return;
+    };
     if !script.take_macros_dirty() {
         return;
     }
@@ -218,10 +219,10 @@ pub(crate) fn save_to_account_data(world: &mut World) {
 }
 
 /// Recompute every macro's bound spell when the macro table or the spell book changes: gated on
-/// the engine's macro generation and on change detection over the action store.
+/// the engine's macro generation and on change detection over the book.
 fn rebind_macro_spells(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
-    actions: Res<crate::ui_action::PlayerActions>,
+    script: Option<NonSendMut<UiScript>>,
+    book: Res<crate::ui_spellbook::SpellBook>,
     table: Option<Res<crate::ui_chat::commands::SlashCommands>>,
     mut bound: ResMut<MacroBoundSpells>,
     mut last_generation: Local<crate::ui_script::VmMemo<Option<u64>>>,
@@ -232,18 +233,18 @@ fn rebind_macro_spells(
     // Per VM: a fresh VM restarts its generation at 0, which a bare memo would gate off for good.
     let last_generation = last_generation.get(&script);
     let generation = script.macros_generation();
-    if *last_generation == Some(generation) && !actions.is_changed() {
+    if *last_generation == Some(generation) && !book.is_changed() {
         return;
     }
     *last_generation = Some(generation);
 
-    let (macros, book) = (script.macros(), script.spellbook());
+    let (macros, book) = (script.macros(), &book.live.book);
     let mut fresh = std::collections::HashMap::new();
     for index in 1..=benilla_ui::script::MAX_MACRO_INDEX as u32 {
         let Some(m) = macros.get(index as usize) else {
             continue;
         };
-        fresh.insert(index, run::bound_spell(&table, &m.body, &book));
+        fresh.insert(index, run::bound_spell(&table, &m.body, book));
     }
     // The engine's copy, for `GetActionAutocast`, re-pushed on every recompute so a fresh VM has
     // it. The book flag stays the player's: `run::bound_spell` resolves the player's book only.

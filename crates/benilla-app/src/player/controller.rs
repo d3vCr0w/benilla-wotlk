@@ -74,6 +74,8 @@ pub(super) fn control(
         // The one auto-move cell, follow or a Click to Move walk, which a knockback clears.
         ResMut<super::follow::FollowState>,
         ResMut<super::approach::Approach>,
+        // The stand-state setter's barber leg.
+        crate::ui_barber::BarberStand,
     ),
     mut commands: Commands,
     mut player: ResMut<Player>,
@@ -83,16 +85,8 @@ pub(super) fn control(
     // The body we drive, a possessed creature's included ([`BodyQuery`]).
     mut body: BodyQuery,
     window: Single<(&mut Window, &mut CursorOptions), With<PrimaryWindow>>,
-    // A press starts a look and arms a click test, which the release settles on time and travel.
-    mut world_clicks: (
-        MessageWriter<WorldClick>,
-        MessageWriter<WorldDropClick>,
-        MessageWriter<WorldRightClick>,
-    ),
-    mut click_test: (
-        Local<Option<camera::PressGesture>>,
-        Local<Option<camera::PressGesture>>,
-    ),
+    // A press starts a look and arms a click test, which the input pass settles at the release.
+    mut click_tests: ResMut<camera::WorldClickTests>,
     // The liquid query, the transports, and the parent chain from a deck collider to its transport.
     world_q: (
         benilla_world::world_point::WorldPoint,
@@ -101,7 +95,10 @@ pub(super) fn control(
     ),
 ) {
     let (world, transports, child_of) = (&world_q.0, &world_q.1, &world_q.2);
-    let (left_click, right_click) = (&mut *click_test.0, &mut *click_test.1);
+    let camera::WorldClickTests {
+        left: left_click,
+        right: right_click,
+    } = &mut *click_tests;
     let Ok((mut cam_t, mut cam)) = cameras.single_mut() else {
         return;
     };
@@ -255,9 +252,6 @@ pub(super) fn control(
         &mut opts_shadow,
         inspect.enabled,
         click_consumed.0,
-        &mut world_clicks.0,
-        &mut world_clicks.1,
-        &mut world_clicks.2,
         left_click,
         right_click,
         look_cfg,
@@ -504,6 +498,7 @@ pub(super) fn control(
             &mut net.3,
             &mut net.10,
             &mut net.15,
+            &mut speed_capsule.14,
             moving,
             turned,
         );
@@ -667,6 +662,15 @@ pub(super) fn control(
             player.swimming = false;
         }
         let swimming = swimming && !breach && !knock_breach;
+        // Our swim status's edge runs the usable update (`0x730f1e`).
+        if swimming != was_swimming {
+            commands.queue(|world: &mut World| {
+                crate::ui_action::usable_cache::step(crate::ui_action::usable_cache::Pass::Full)(
+                    world,
+                );
+                crate::ui_script::live::fire_handler_events(world);
+            });
+        }
         // A knockback ends a flight and takes `CAN_FLY` with it (the knockback launch, `0x6e9ff0`),
         // sending no `CMSG_MOVE_SET_FLY`; the land mover flies it.
         if player.flying && knock_launch.is_some() {

@@ -387,6 +387,18 @@ fn the_character_sheet_fields_read_where_the_12340_stat_verbs_read_them() {
     assert_eq!(f.player_combat_rating(25), None);
 }
 
+/// `GAMEOBJECT_BYTES_1` byte 2 is the art kit, a signed byte; with no field it is 0.
+#[test]
+fn a_gameobject_reads_its_art_kit_as_a_signed_byte() {
+    let kit = |bytes: u32| {
+        ObjectFields::from_pairs(&[(FIELD_GAMEOBJECT_BYTES_1, bytes)]).gameobject_art_kit()
+    };
+    assert_eq!(kit(0x0001_0001), 1);
+    assert_eq!(kit(0x0051_0601), 81);
+    assert_eq!(kit(0xFFFF_0601), -1, "0xff names no row");
+    assert_eq!(ObjectFields::from_pairs(&[]).gameobject_art_kit(), 0);
+}
+
 /// `GAMEOBJECT_BYTES_1` holds the state and type; `GAMEOBJECT_DYNAMIC`'s low half the dynamic
 /// flags under a path progress. The parent rotation is not the spawn's own.
 #[test]
@@ -407,10 +419,16 @@ fn a_gameobject_reads_its_packed_bytes_and_its_rotation_from_movement() {
     let f = f.into_created(ObjectType::GameObject);
     assert_eq!(f.gameobject_state(), Some(1));
     assert_eq!(f.gameobject_type_id(), 19);
+    assert_eq!(
+        f.gameobject_art_kit(),
+        0,
+        "byte 3 is the progress, not the art kit"
+    );
     assert_eq!(f.gameobject_dynamic_flags(), 0x4);
     assert_eq!(f.gameobject_displayid(), Some(5_000));
     assert_eq!(f.gameobject_faction(), 35);
     assert_eq!(f.gameobject_rotation(), Some([0.0, 0.0, 0.6, 0.8]));
+    assert_eq!(f.gameobject_parent_rotation(), [0.0, 0.0, 0.0, 1.0]);
     // A values delta keeps the create's rotation.
     let mut live = f.clone();
     live.merge(ObjectFields::from_pairs(&[(
@@ -942,6 +960,54 @@ fn a_dropped_mount_reads_zero_until_its_field_moves() {
     assert!(!f.drop_mount(), "nothing left to drop");
     f.merge(mount(2_410));
     assert_eq!(f.unit_mount_display_id(), 2_410, "a new mount reads");
+}
+
+/// An early form cancel reads no form (`0x71af70`) until the form byte moves (`0x6e538a`, `0x6da174`): a move of another byte of `UNIT_FIELD_BYTES_2` keeps it.
+#[test]
+fn an_early_form_cancel_reads_no_form_until_the_form_byte_moves() {
+    let bytes2 = |v: u32| ObjectFields::from_pairs(&[(FIELD_UNIT_BYTES_2, v)]);
+    let mut f = bytes2(1 << 24).into_created(ObjectType::Player);
+    assert_eq!(f.unit_shapeshift_form(), 1);
+    f.suppress_form();
+    assert_eq!(f.unit_shapeshift_form(), 0);
+    f.merge(bytes2((1 << 24) | 0x08));
+    assert_eq!(
+        f.unit_shapeshift_form(),
+        0,
+        "the form byte held: still none"
+    );
+    f.merge(bytes2(0x08));
+    assert!(
+        !f.unit_form_suppressed(),
+        "the form moved: the cancel is over"
+    );
+    f.merge(bytes2(5 << 24));
+    assert_eq!(f.unit_shapeshift_form(), 5);
+}
+
+/// A held dismount reads unmounted while the copy stays, through a move back to the copy, and a
+/// move to another display clears it (`0x51a230`, `0x740450`, `0x741a7f`).
+#[test]
+fn a_held_mount_reads_unmounted_until_its_field_names_another() {
+    let mount = |id: u32| ObjectFields::from_pairs(&[(FIELD_UNIT_MOUNTDISPLAYID, id)]);
+    let mut f = mount(14_376).into_created(ObjectType::Unit);
+    assert!(f.unit_is_mounted());
+    f.hold_mount(f.unit_mount_copy());
+    assert!(!f.unit_is_mounted(), "held while passengers ride");
+    assert_eq!(f.unit_mount_copy(), 14_376, "the copy stays");
+    f.merge(mount(0));
+    assert_eq!(
+        f.unit_mount_copy(),
+        0,
+        "a zero with no hold renewed clears it"
+    );
+    f.hold_mount(14_376);
+    f.merge(mount(14_376));
+    assert!(!f.unit_is_mounted(), "the copy it holds is a no-op");
+    f.merge(mount(2_410));
+    assert!(f.unit_is_mounted(), "another display clears the hold");
+    f.hold_mount(0);
+    assert!(f.unit_is_mounted(), "no mount, nothing held");
 }
 
 /// Each slot array's guid words map to their player slot and back, one past each run to none.

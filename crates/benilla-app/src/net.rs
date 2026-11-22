@@ -31,9 +31,8 @@ pub(crate) use parked::ParkedObjects;
 mod session;
 mod world;
 
-pub(crate) use apply::apply_net_updates;
 pub(crate) use apply::enter_world_on_self_create;
-use apply::tag_self_player;
+pub(crate) use apply::{apply_net_updates, tag_self_player};
 pub(crate) use handlers::NetHandlerApp;
 
 pub(crate) use io::LoginRequest;
@@ -129,6 +128,7 @@ impl Plugin for NetPlugin {
             .add_message::<PetTalkMessage>()
             .add_message::<PetDismissSoundMessage>()
             .add_message::<WorldportMessage>()
+            .add_message::<TransferPendingMessage>()
             .add_message::<RealmListMessage>()
             .add_message::<CharListMessage>()
             .add_message::<WorldAuthMessage>()
@@ -168,9 +168,6 @@ impl Plugin for NetPlugin {
                 )
                     .chain()
                     .in_set(WorldStage::Net),
-                // `ui_session::feed_interact_npc` seats itself inside this chain, after
-                // `apply_net_updates` and before `drive_display_facing`, so the `"npc"` token is
-                // current when a window's show handler reads it.
             )
             // Not part of the movement chain above: the cascade's time query, after the self create
             // has claimed the mover.
@@ -180,7 +177,11 @@ impl Plugin for NetPlugin {
                     .in_set(WorldStage::Net)
                     .after(enter_world_on_self_create),
             )
-            .add_systems(Update, population_pulse.in_set(WorldStage::Net));
+            .add_systems(Update, population_pulse.in_set(WorldStage::Net))
+            .add_systems(
+                Startup,
+                motion::load_chase_rates.after(benilla_assets::AssetSet::Open),
+            );
     }
 }
 
@@ -1279,6 +1280,8 @@ pub(crate) enum ClientCommand {
     /// slot. `target` is the same cast-targets block as a cast's (the sender `0x80b351` writes
     /// both).
     UseItem {
+        /// The cast attempt's record `castCount` (`0x8050dc`).
+        count: u8,
         bag_index: u8,
         slot: u8,
         spell_id: u32,
@@ -1355,22 +1358,30 @@ pub(crate) enum ClientCommand {
     },
     /// `CMSG_CAST_SPELL`; `None` is a self or implicit target.
     CastSpell {
+        /// The cast attempt's record `castCount` (`0x8050dc`).
+        count: u8,
         spell_id: u32,
         target: Option<u64>,
     },
     /// `CMSG_CAST_SPELL` at a corpse: its bit and packed guid, a resurrection on a released player.
     CastSpellCorpse {
+        /// The cast attempt's record `castCount` (`0x8050dc`).
+        count: u8,
         spell_id: u32,
         target: benilla_protocol::messages::CorpseTarget,
         corpse_guid: u64,
     },
     /// `CMSG_CAST_SPELL` with `TARGET_FLAG_DEST_LOCATION`; `dest` in WoW coordinates.
     CastSpellAtDest {
+        /// The cast attempt's record `castCount` (`0x8050dc`).
+        count: u8,
         spell_id: u32,
         dest: benilla_protocol::messages::TargetPoint,
     },
     /// `CMSG_CAST_SPELL` with `TARGET_FLAG_SOURCE_LOCATION` (bit 5); `src` in WoW coordinates.
     CastSpellAtSource {
+        /// The cast attempt's record `castCount` (`0x8050dc`).
+        count: u8,
         spell_id: u32,
         src: benilla_protocol::messages::TargetPoint,
     },
@@ -1411,6 +1422,8 @@ pub(crate) enum ClientCommand {
     /// `CMSG_PET_CAST_SPELL`: a cast with the pet as caster, through the cast ladder; the targets
     /// block is a cast's.
     PetCastSpell {
+        /// The cast attempt's record `castCount` (`0x8050dc`).
+        count: u8,
         pet_guid: u64,
         spell_id: u32,
         target: benilla_protocol::messages::UseItemTarget,
@@ -1418,6 +1431,8 @@ pub(crate) enum ClientCommand {
     /// `CMSG_PET_CAST_SPELL` for a trajectory missile: the flown shot and the mover's pose for its
     /// stop report.
     PetCastTrajectory {
+        /// The cast attempt's record `castCount` (`0x8050dc`).
+        count: u8,
         pet_guid: u64,
         spell_id: u32,
         shot: benilla_protocol::messages::TrajectoryShot,
@@ -1469,9 +1484,10 @@ pub(crate) enum ClientCommand {
     /// `CMSG_CANCEL_AUTO_REPEAT_SPELL`, sent by every local cancel; harmless when the server
     /// cancelled first.
     CancelAutoRepeat,
-    /// `CMSG_CANCEL_CAST`: from the wand auto-repeat handoff and a local cancel.
+    /// `CMSG_CANCEL_CAST`: the cancelled record's `castCount` (`0x8062de`), or 0 from a refusal's wand repeat cancel (`0x8082ad`), then the spell.
     CancelCast {
         spell_id: u32,
+        count: u8,
     },
     /// `CMSG_CANCEL_CHANNELLING`; the server ignores the spell id the client writes.
     CancelChannelling {
@@ -1682,10 +1698,6 @@ pub(crate) enum ClientCommand {
     },
     /// The world-enter status request: `CMSG_BATTLEFIELD_STATUS`.
     BattlefieldStatusRequest,
-    /// `ConfirmPetUnlearn()`: `CMSG_PET_UNLEARN` with the latched trainer.
-    PetUnlearn {
-        trainer: u64,
-    },
     /// `CMSG_BANKER_ACTIVATE`: a pure banker's direct opener (bit 8 the lowest service bit); a
     /// gossip banker goes through the menu. Answered by `SMSG_SHOW_BANK`.
     BankerActivate {
@@ -1825,20 +1837,28 @@ pub(crate) enum ClientCommand {
     },
     /// `CMSG_CAST_SPELL` at a GameObject: an OPEN_LOCK cast on a lock, vein or herb.
     CastSpellGameObject {
+        /// The cast attempt's record `castCount` (`0x8050dc`).
+        count: u8,
         spell_id: u32,
         go_guid: u64,
     },
     /// An item-targeted cast (`TARGET_FLAG_ITEM` and a packed guid).
     CastSpellItem {
+        /// The cast attempt's record `castCount` (`0x8050dc`).
+        count: u8,
         spell_id: u32,
         item_guid: u64,
     },
     /// A cast at the trade window's not-traded slot (`TARGET_FLAG_TRADE_ITEM`).
     CastSpellTradeItem {
+        /// The cast attempt's record `castCount` (`0x8050dc`).
+        count: u8,
         spell_id: u32,
     },
     /// A glyph-socket cast from the book (`TARGET_FLAG_GLYPH_SLOT`, no payload).
     CastSpellGlyph {
+        /// The cast attempt's record `castCount` (`0x8050dc`).
+        count: u8,
         spell_id: u32,
     },
     /// `CMSG_LOOT` on a unit; the server rejects a GameObject guid, which loots by `GameObjUse`.
@@ -2939,6 +2959,12 @@ pub(crate) struct KnockBackMessage {
     pub(crate) launch: JumpInfo,
 }
 
+/// `SMSG_TRANSFER_PENDING` as it arrives. The loading screen raises on it, not on
+/// [`PendingTransfer`]: AzerothCore sends `SMSG_NEW_WORLD` right behind it, and the worldport
+/// takes the latch in the same drain, before any reader of the resource runs.
+#[derive(Message, Clone, Copy)]
+pub(crate) struct TransferPendingMessage(pub(crate) PendingTransferInfo);
+
 /// A cross-map worldport: snap, swap the map, ack if required.
 #[derive(Message, Clone, Copy)]
 pub(crate) struct WorldportMessage {
@@ -2967,6 +2993,8 @@ pub(crate) struct PendingTransfer(pub(crate) Option<PendingTransferInfo>);
 pub(crate) struct PendingTransferInfo {
     pub(crate) map_id: u32,
     pub(crate) transport_entry: Option<u32>,
+    /// The map the transport leaves, sent with the entry.
+    pub(crate) transport_map: Option<u32>,
 }
 
 /// `SMSG_PLAY_SOUND`, `PLAY_MUSIC` or `PLAY_OBJECT_SOUND`: a SoundEntries id. An unstreamed

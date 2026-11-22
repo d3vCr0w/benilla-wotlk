@@ -27,17 +27,12 @@ use benilla_protocol::messages::{
 use benilla_protocol::EntityKind;
 use benilla_ui::script::UiScript;
 
-use super::probes::ProbeClock;
 use crate::items::Items;
-use crate::net::{
-    ChatKind, ClientCommand, Guid, NetCommands, NetEntity, ObjectStore, Objects, SelfPlayer,
-};
+use crate::net::{ChatKind, ClientCommand, NetCommands, ObjectStore, Objects};
 use crate::player::Player;
 use crate::target::cursor_mode::npc_flags;
 use crate::ui_gossip::GossipState;
 use crate::ui_items::{find_item, ItemSearch, PACK_SLOTS};
-use crate::ui_petition::GuildRegistrarState;
-use crate::ui_session::NpcSession;
 
 /// Aldwin Laughlin's spawn, the `.go xyz` target.
 const REGISTRAR_AT: [f32; 3] = [-8885.25, 614.395, 95.2576];
@@ -74,8 +69,7 @@ const SETTLE_SECS: f64 = 3.0;
 const GUILD_CLEAR_TIMEOUT_SECS: f64 = 20.0;
 const SCAN_TIMEOUT_SECS: f64 = 25.0;
 const MENU_TIMEOUT_SECS: f64 = 20.0;
-/// How long step 4 waits for the portrait's `"npc"` token, reported, not asserted:
-/// `feed_interact_npc` is unordered against the apply pass, so it resolves a frame late.
+/// How long step 4 waits for the portrait's `"npc"` token, reported, not asserted.
 const REGISTRAR_TOKEN_SETTLE_SECS: f64 = 1.0;
 
 const REGISTRAR_TIMEOUT_SECS: f64 = 15.0;
@@ -154,7 +148,7 @@ enum Phase {
         sent_at: f64,
     },
     /// Step 4: the charter row selected; waiting for `SMSG_PETITION_SHOWLIST` to reach
-    /// [`GuildRegistrarState`] and `GUILD_REGISTRAR_SHOW` to open the window.
+    /// the registrar held and `GUILD_REGISTRAR_SHOW` to open the window.
     Registrar {
         since: f64,
     },
@@ -244,12 +238,26 @@ fn charter_tooltip_lines(script: &UiScript, pos: Option<(i64, u32)>) -> Vec<Stri
         .unwrap_or_default()
 }
 
-/// `BENILLA_GOSSIP_ICONS.petition` in the live VM, `""` when absent. The stock
-/// `GossipFrame.lua:123` builds the icon path from the type string and defines no such table.
-fn vm_petition_texture(script: &UiScript) -> String {
-    script
-        .eval::<String>("return (BENILLA_GOSSIP_ICONS and BENILLA_GOSSIP_ICONS.petition) or \"\"")
-        .unwrap_or_default()
+/// The icon texture the stock gossip frame drew beside the shown title button reading `label`,
+/// `""` when no button reads it: `GossipFrame.lua` sets it from the row's type string.
+fn vm_row_icon(script: &UiScript, label: &str) -> String {
+    let chunk = format!(
+        "for i = 1, NUMGOSSIPBUTTONS or 32 do \
+           local b = _G['GossipTitleButton' .. i] \
+           if b and b:IsShown() and b:GetText() == {label:?} then \
+             local t = _G[b:GetName() .. 'GossipIcon'] \
+             return (t and t:GetTexture()) or '' \
+           end \
+         end \
+         return ''"
+    );
+    script.eval::<String>(&chunk).unwrap_or_default()
+}
+
+/// Whether `texture` is the stock icon for gossip type `ty`, `Interface\GossipFrame\<Type>GossipIcon`.
+fn is_type_icon(texture: &str, ty: &str) -> bool {
+    let want = format!("interface\\gossipframe\\{ty}gossipicon");
+    texture.to_ascii_lowercase().replace('/', "\\") == want
 }
 
 /// Is a named frame visible in the live UI; a missing global reads `false`.
@@ -312,37 +320,87 @@ fn lua_bag_pos(bag_index: u8, slot: u8) -> Option<(i64, u32)> {
     }
 }
 
-/// A fresh guild name: a 13-character prefix, a space and the low 8 digits of the wall clock, 22
-/// characters within `MAX_CHARTER_NAME` (24); `IsValidCharterName` allows digits and spaces.
+/// A fresh guild name: a 13-character prefix, a space and the low 8 digits of the wall clock spelt
+/// as letters (`0` is `a`), 22 characters within `MAX_CHARTER_NAME` (24); the server refuses digits
+/// ("That name contains invalid characters").
 fn probe_guild_name(prefix: &str) -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())
         % 100_000_000;
-    format!("{prefix} {secs:08}")
+    let letters: String = format!("{secs:08}")
+        .bytes()
+        .map(|d| char::from(b'a' + (d - b'0')))
+        .collect();
+    format!("{prefix} {letters}")
 }
 
-fn charter_probe(
-    time: ProbeClock,
-    mut probe: ResMut<CharterProbe>,
-    gossip: Res<GossipState>,
-    registrar: Res<GuildRegistrarState>,
-    objects: Objects,
-    items: Res<Items>,
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
-    self_q: Query<&ObjectStore, With<SelfPlayer>>,
-    player: Res<Player>,
-    units: Query<(&Guid, &NetEntity, &ObjectStore, &Transform), Without<SelfPlayer>>,
-    net: Res<NetCommands>,
-    mut exit: MessageWriter<AppExit>,
-) {
-    let Ok(store) = self_q.single() else {
+fn charter_probe(world: &mut World) {
+    let Some(store) = super::probes::self_store(world) else {
         return; // not in-world yet
     };
-    let Some(script) = script else {
-        return; // no UI VM (headless net-only)
+    let now = f64::from(super::probes::probe_secs(world));
+    let units = super::probes::seen(world);
+    let pos = world.resource::<Player>().pos;
+    let net = NetCommands(world.resource::<NetCommands>().0.clone());
+    let Some(mut probe) = world.remove_resource::<CharterProbe>() else {
+        return;
     };
-    let now = time.elapsed_secs_f64();
+    let mut exit = Vec::new();
+    super::probes::with_vm(world, |script| {
+        // No UI VM (headless net-only).
+        if let Some(script) = script {
+            charter_step(
+                &mut probe, script, now, &store, &units, pos, &net, &mut exit,
+            );
+        }
+    });
+    world.insert_resource(probe);
+    for e in exit {
+        world.write_message(e);
+    }
+}
+
+/// The charter in our bags, searched off the lent `World` (`find_item`).
+fn find_charter(store: &ObjectStore) -> Option<(u8, u8, u64)> {
+    super::probes::read(|w| {
+        w.run_system_cached_with(
+            |In(fields): In<benilla_protocol::ObjectFields>, objects: Objects| {
+                find_item(&fields, &objects, CHARTER_ITEM_ENTRY, ItemSearch::default())
+            },
+            store.0.clone(),
+        )
+        .ok()
+        .flatten()
+    })
+}
+
+/// The registrar the window parked on, read off the lent `World`.
+fn registrar() -> Option<u64> {
+    super::probes::read(|w| {
+        w.get_resource::<crate::ui_petition::GuildRegistrarState>()
+            .and_then(|r| r.registrar())
+    })
+}
+
+/// One frame of the probe on the VM, the `World` lent.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn charter_step(
+    probe: &mut CharterProbe,
+    script: &mut UiScript,
+    now: f64,
+    store: &ObjectStore,
+    units: &super::probes::Seen,
+    pos: Vec3,
+    net: &NetCommands,
+    exit: &mut Vec<AppExit>,
+) {
+    // The gossip globals as the verbs read them.
+    let gossip = super::probes::read(|w| {
+        w.get_resource::<crate::ui_gossip::GossipState>()
+            .cloned()
+            .unwrap_or_default()
+    });
     let phase = probe.phase;
 
     match phase {
@@ -395,7 +453,7 @@ fn charter_probe(
                          cannot apply"
                             .to_string(),
                     );
-                    return hop(&mut probe, &net, now);
+                    return hop(probe, net, now);
                 }
                 // A guild master cannot leave (`ERR_GUILD_LEADER_LEAVE`), so rank 0 disbands.
                 // The rank is read off the descriptor, not `IsGuildLeader()`, whose feed can lag
@@ -432,7 +490,7 @@ fn charter_probe(
                     "the guild an earlier run founded is gone — PLAYER_GUILDID is back to 0"
                         .to_string(),
                 );
-                hop(&mut probe, &net, now);
+                hop(probe, net, now);
             } else if now - since > GUILD_CLEAR_TIMEOUT_SECS {
                 probe.fail(
                     0,
@@ -442,7 +500,7 @@ fn charter_probe(
                          the buy in step 5 would be refused SILENTLY (a bare `return` at \
                          PetitionsHandler.cpp:66), so the run is stopped here rather than \
                          reporting that as a wire failure. Lines seen: {:?}",
-                        probe_lines(&script)
+                        probe_lines(script)
                     ),
                 );
                 probe.phase = Phase::Done;
@@ -454,7 +512,7 @@ fn charter_probe(
             if now - sent_at < SETTLE_SECS {
                 return;
             }
-            let me = player.pos;
+            let me = pos;
             let found = units.iter().find(|(_, net_e, store, tf)| {
                 net_e.kind == EntityKind::Unit
                     && (store.0.object_entry() == Some(REGISTRAR_ENTRY)
@@ -496,7 +554,9 @@ fn charter_probe(
                 return;
             };
             let open = gossip.npc == Some(npc) && !gossip.options.is_empty();
-            let pushed = vm_gossip_values(&script) as usize == gossip.options.len() * 2;
+            // The rows are drawn once the frame is shown (`GOSSIP_SHOW`), not when the menu reads.
+            let pushed = vm_gossip_values(script) as usize == gossip.options.len() * 2
+                && vm_visible(script, "GossipFrame");
             if open && pushed {
                 probe.pass(
                     2,
@@ -512,7 +572,7 @@ fn charter_probe(
                             .join(" ")
                     ),
                 );
-                assert_icon_and_select(&mut probe, &gossip, &script, &net, npc, now);
+                assert_icon_and_select(probe, &gossip, script, net, npc, now);
             } else if now - sent_at > MENU_TIMEOUT_SECS {
                 probe.fail(
                     2,
@@ -522,7 +582,7 @@ fn charter_probe(
                          npc={:?} options={} vm_values={})",
                         gossip.npc,
                         gossip.options.len(),
-                        vm_gossip_values(&script)
+                        vm_gossip_values(script)
                     ),
                 );
                 probe.phase = Phase::Done;
@@ -536,13 +596,12 @@ fn charter_probe(
                 probe.phase = Phase::Done;
                 return;
             };
-            let parked = registrar.npc() == Some(npc);
-            let visible = vm_visible(&script, "GuildRegistrarFrame");
-            let cost = vm_charter_cost(&script);
+            let parked = registrar() == Some(npc);
+            let visible = vm_visible(script, "GuildRegistrarFrame");
+            let cost = vm_charter_cost(script);
             if parked && visible && cost == CHARTER_COST_COPPER {
                 // The portrait's `"npc"` token is reported, not asserted, and sampled up to
-                // `REGISTRAR_TOKEN_SETTLE_SECS` late: `feed_interact_npc` is unordered against
-                // the apply pass, so it is empty on the frame the window opens.
+                // `REGISTRAR_TOKEN_SETTLE_SECS` late.
                 let token = script
                     .eval::<String>("return UnitName(\"npc\") or \"\"")
                     .unwrap_or_default();
@@ -583,13 +642,13 @@ fn charter_probe(
                     "registrar",
                     format!(
                         "no registrar window within {REGISTRAR_TIMEOUT_SECS}s of the select: \
-                         GuildRegistrarState npc={:?} (wanted {npc:#x}), \
+                         registrar npc={:?} (wanted {npc:#x}), \
                          GuildRegistrarFrame:IsVisible()={visible}, GetGuildCharterCost()={cost}. \
                          An SMSG_PETITION_SHOWLIST with no parse arm at all \
                          falls through to ServerPacket::Other — that is what this reading looks \
                          like. Lines seen: {:?}",
-                        registrar.npc(),
-                        probe_lines(&script)
+                        registrar(),
+                        probe_lines(script)
                     ),
                 );
                 probe.phase = Phase::Done;
@@ -630,18 +689,15 @@ fn charter_probe(
                 };
                 return;
             }
-            let found = find_item(
-                &store.0,
-                &objects,
-                CHARTER_ITEM_ENTRY,
-                ItemSearch::default(),
-            );
+            let found = find_charter(store);
             // The template must have landed too: the click's charter arm tests its
             // `ITEM_FLAG_CHARTER`. Folded into one `Option` so a missing template still times out.
             let ready = found.and_then(|(bag_index, slot, guid)| {
-                items
-                    .template(CHARTER_ITEM_ENTRY, guid, &net)
-                    .map(|t| (bag_index, slot, guid, t.flags))
+                super::probes::read(|w| {
+                    w.resource::<Items>()
+                        .template(CHARTER_ITEM_ENTRY, guid, w.resource::<NetCommands>())
+                        .map(|t| (bag_index, slot, guid, t.flags))
+                })
             });
             if let Some((bag_index, slot, guid, flags)) = ready {
                 if flags & ITEM_FLAG_CHARTER == 0 {
@@ -694,7 +750,7 @@ fn charter_probe(
                         } else {
                             "was never asked for"
                         },
-                        probe_lines(&script)
+                        probe_lines(script)
                     ),
                 );
                 // A charter seen without a template still goes to the cleanup.
@@ -721,7 +777,7 @@ fn charter_probe(
             };
             if !sent {
                 // The control: a window already up would make the step meaningless.
-                if vm_visible(&script, "PetitionFrame") {
+                if vm_visible(script, "PetitionFrame") {
                     probe.fail(
                         6,
                         "open",
@@ -773,12 +829,12 @@ fn charter_probe(
                 };
                 return;
             }
-            let visible = vm_visible(&script, "PetitionFrame");
-            let kind = vm_petition_str(&script, 1);
-            let originator = vm_is_originator(&script);
-            let names = vm_num_names(&script);
+            let visible = vm_visible(script, "PetitionFrame");
+            let kind = vm_petition_str(script, 1);
+            let originator = vm_is_originator(script);
+            let names = vm_num_names(script);
             if visible && kind == "guild" && originator == 1 && names == FRESH_SIGNATURES {
-                let at_open = vm_petition_str(&script, 2);
+                let at_open = vm_petition_str(script, 2);
                 probe.title_at_open = at_open.clone();
                 probe.pass(
                     6,
@@ -801,7 +857,7 @@ fn charter_probe(
                          item-use fork never reached ItemUseRoute::ShowPetition (a charter that \
                          falls through to `Nothing` sends nothing at all — a silent \
                          failure) or the answer never became a window. Lines seen: {:?}",
-                        probe_lines(&script)
+                        probe_lines(script)
                     ),
                 );
                 probe.phase = Phase::Destroying {
@@ -815,8 +871,8 @@ fn charter_probe(
         // arrives on `SMSG_PETITION_QUERY_RESPONSE`, keyed by petition id, and the feed re-fires
         // `PETITION_SHOW`. A FAIL leaves the window titleless.
         Phase::Record { since } => {
-            let title = vm_petition_str(&script, 2);
-            let max = vm_petition_max(&script);
+            let title = vm_petition_str(script, 2);
+            let max = vm_petition_max(script);
             if title == probe.bought && max == REQUIRED_SIGNATURES {
                 // At open the title was empty or already the bought name (the record beat the
                 // paint); anything else came from another charter's record.
@@ -892,11 +948,11 @@ fn charter_probe(
                 };
                 return;
             }
-            let title = vm_petition_str(&script, 2);
+            let title = vm_petition_str(script, 2);
             // The bag tooltip must reach the same name: it is fed by the container snapshot,
             // whose rebuild is gated, so it can lag the window.
             let tip = charter_tooltip_lines(
-                &script,
+                script,
                 probe.charter.and_then(|(b, sl, _)| lua_bag_pos(b, sl)),
             );
             let tip_caught_up = tip.iter().any(|l| l.contains(&probe.renamed));
@@ -927,7 +983,7 @@ fn charter_probe(
                          RenamePetition({renamed:?}). The echo is sent ONLY on success, so either \
                          the rename was refused (name taken/invalid/reserved) or the echo did not \
                          patch the record. Lines seen: {:?}",
-                        probe_lines(&script)
+                        probe_lines(script)
                     ),
                 );
                 probe.phase = Phase::Destroying {
@@ -948,12 +1004,7 @@ fn charter_probe(
             };
             if !sent {
                 // The position is read fresh: `count: 0` destroys whatever stack sits there.
-                let Some((bag_index, slot, _)) = find_item(
-                    &store.0,
-                    &objects,
-                    CHARTER_ITEM_ENTRY,
-                    ItemSearch::default(),
-                ) else {
+                let Some((bag_index, slot, _)) = find_charter(store) else {
                     probe.pass(
                         9,
                         "cleanup",
@@ -980,12 +1031,7 @@ fn charter_probe(
                 };
                 return;
             }
-            let still_there = find_item(
-                &store.0,
-                &objects,
-                CHARTER_ITEM_ENTRY,
-                ItemSearch::default(),
-            );
+            let still_there = find_charter(store);
             if still_there.is_none() {
                 probe.pass(
                     9,
@@ -1005,7 +1051,7 @@ fn charter_probe(
                          CMSG_DESTROYITEM. Remove it by hand before the next run — otherwise its \
                          step 5 is refused silently for `the owner already has one` and reads as a \
                          buy that never sent. Lines seen: {:?}",
-                        probe_lines(&script)
+                        probe_lines(script)
                     ),
                 );
                 probe.phase = Phase::Done;
@@ -1021,7 +1067,7 @@ fn charter_probe(
                 probe.passes, probe.fails
             );
             // `AppExit` plus a hard-exit thread, so a teardown hang cannot hold the account.
-            exit.write(AppExit::Success);
+            exit.push(AppExit::Success);
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 warn!("PROBE_CHARTER: still alive 5s after AppExit — hard exit");
@@ -1104,16 +1150,14 @@ fn assert_icon_and_select(
         probe.phase = Phase::Done;
         return;
     }
-    // The stock interface defines no `BENILLA_GOSSIP_ICONS` (see `vm_petition_texture`).
-    let texture = vm_petition_texture(script);
-    if texture.is_empty() {
+    let texture = vm_row_icon(script, &opt.message);
+    if !is_type_icon(&texture, ICON_TYPE_PETITION) {
         probe.fail(
             3,
             "icon",
             format!(
-                "the app maps the row to {ICON_TYPE_PETITION:?} but BENILLA_GOSSIP_ICONS.petition \
-                 resolves to nothing in the live VM, so the row would still draw the fallback \
-                 bubble"
+                "the app maps the row to {ICON_TYPE_PETITION:?} but the stock frame \
+                 drew {texture:?} beside the row"
             ),
         );
         probe.phase = Phase::Done;
@@ -1124,7 +1168,7 @@ fn assert_icon_and_select(
         "icon",
         format!(
             "row {} {:?}: wire icon={ICON_PETITION} index={} → type {ty:?}, \
-             BENILLA_GOSSIP_ICONS.petition = {texture:?}",
+             the stock frame drew {texture:?}",
             pos + 1,
             opt.message,
             opt.index

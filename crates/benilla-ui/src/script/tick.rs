@@ -44,13 +44,20 @@ impl UiScript {
             self.fire_event("PLAYER_REGEN_ENABLED", Vec::new());
         } else {
             self.fire_event("PLAYER_REGEN_DISABLED", Vec::new());
-            self.model_mut().protected_actions_allowed = false;
+            // After the event's listeners, also when a host step queues the event in turn.
+            super::world_loan::in_turn_or_now(self, |s| {
+                s.model_mut().protected_actions_allowed = false;
+            });
         }
     }
 }
 
 /// [`UiScript::fire_event`] for a caller holding `&Lua`, such as a Lua binding.
 pub(crate) fn fire_event_into(lua: &Lua, event: &str, args: Vec<ScriptValue>) {
+    // A host step that holds the lent state queues its raise in turn.
+    let Some(args) = super::world_loan::queue_in_turn(lua, event, args) else {
+        return;
+    };
     let model_mut = || crate::script::model_mut_of(lua);
     let vm = {
         let model = lua
@@ -105,6 +112,13 @@ impl super::UiScript {
     /// walk ([`Self::update_walk`]), the layout drained again, then the hover re-pick; then the
     /// model panes' paint callbacks.
     pub fn tick(&mut self, elapsed: f32) {
+        self.tick_anchored(elapsed, std::time::Instant::now());
+    }
+
+    /// [`Self::tick`], its `GetTime` clock anchored at `anchor`, the host's instant whose steps the
+    /// clock's deltas are: every stored `Instant` then maps onto `GetTime` alike at every read, as
+    /// the reference's stored starts do.
+    pub fn tick_anchored(&mut self, elapsed: f32, anchor: std::time::Instant) {
         // The clock is no extract input and a drained queue is no change: the mutation count
         // stands ([`ModelCell`]); the events fired below bump it through their verbs.
         let quiet = self.visual_epoch();
@@ -115,7 +129,7 @@ impl super::UiScript {
             // The layer update first closes every attribute-change allowance (`0x495320`).
             model.attribute_changes_allowed.clear();
         }
-        self.model_ref().clock_wall.set(std::time::Instant::now());
+        self.model_ref().clock_wall.set(anchor);
         // The socketed item's changes queue first, the reference signalling them as they land.
         self.watch_socket_item();
         // Events queued since the last tick fire before this tick's walk.

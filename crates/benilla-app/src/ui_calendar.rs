@@ -74,11 +74,7 @@ impl Plugin for UiCalendarPlugin {
                         .after(calendar_enter_world)
                         .after(crate::ui_social::feed_social)
                         .after(crate::ui_mail::send_query_next_mail_time_on_enter)
-                        .after(
-                            crate::ui_session::close_npc_session_out_of_range::<
-                                crate::ui_mail::MailOpen,
-                            >,
-                        )
+                        .after(crate::ui_session::update_interact_target)
                         .before(crate::ui_unit::EnterWorldFeed)
                         .run_if(crate::ui_script::ingame_ui_up),
                 ),
@@ -217,7 +213,7 @@ fn player_view(
 
 #[allow(clippy::too_many_arguments)]
 fn feed_calendar(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut script: crate::ui_script::InTurn,
     catalog: Option<Res<CalendarCatalog>>,
     mut feed: ResMut<CalendarFeed>,
     self_q: Query<&ObjectStore, With<SelfPlayer>>,
@@ -235,7 +231,7 @@ fn feed_calendar(
     mut mail: crate::ui_mail::MailArrival,
     mut memory: Local<VmMemo<FeedMemory>>,
 ) {
-    let Some(mut script) = script else {
+    let Some(mut script) = script.turn() else {
         return;
     };
     let (memory, vm_reset) = memory.get_reset(&script);

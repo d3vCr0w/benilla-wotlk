@@ -152,17 +152,6 @@ impl super::UiScript {
     }
 }
 
-/// The spells of every glyph the talent groups hold, whose descriptions the tooltip reads.
-pub(super) fn glyph_spells(model: &Model) -> impl Iterator<Item = u32> + '_ {
-    model
-        .talents
-        .groups
-        .iter()
-        .flat_map(|g| g.glyphs)
-        .filter_map(|id| model.glyph_catalog.glyph(id))
-        .map(|g| g.spell)
-}
-
 /// The player object exists, as every glyph verb but the count first asks.
 fn has_player(model: &Model) -> bool {
     model.unit("player").is_some_and(|u| u.exists)
@@ -306,12 +295,13 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let Some(verdict) = verdict else {
                 return Ok(MultiValue::from_vec(vec![Value::Nil]));
             };
-            crate::script::model_mut_of(lua)
-                .script_calls
-                .push(super::ScriptCall::PlaceGlyph {
+            super::calls::make(
+                lua,
+                super::ScriptCall::PlaceGlyph {
                     socket: socket as u32,
                     verdict,
-                });
+                },
+            );
             Ok(MultiValue::from_vec(vec![flag(
                 verdict == GlyphPlacement::Bind && wants,
             )]))
@@ -380,7 +370,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 .app_data_ref::<crate::script::ModelCell>()
                 .expect("model app_data");
             Ok(flag(
-                model.spell_targeting && model.glyph_targeting.is_some_and(|t| t.wants_socket),
+                super::spellbook::targeting().active
+                    && model.glyph_targeting.is_some_and(|t| t.wants_socket),
             ))
         })?,
     )?;
@@ -542,6 +533,7 @@ pub(super) fn install_tooltip_method(lua: &Lua, m: &Table) -> mlua::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::script::live::TestTargeting;
     use crate::script::{TalentGroupView, TalentUiState, UiScript, UnitState};
 
     const ICON: &str = r"Interface\Icons\INV_Glyph_MajorHunter";
@@ -660,80 +652,82 @@ mod tests {
     /// the answer is 1 only for a bind the word wanted.
     #[test]
     fn placement_needs_a_targeting_glyph_cast() {
-        let mut s = script();
-        assert_eq!(
-            s.eval::<i64>("return select('#', GlyphMatchesSocket(4))")
-                .unwrap(),
-            0
-        );
-        assert_eq!(
-            s.eval::<Option<i64>>("return PlaceGlyphInSocket(4)")
-                .unwrap(),
-            None
-        );
-        assert!(s.take_script_calls().is_empty());
-        let arm = |s: &mut UiScript, glyph, wants_socket| {
-            s.set_glyph_targeting(Some(GlyphTargeting {
-                glyphs: [None, Some(glyph), None],
-                wants_socket,
-            }));
-        };
-        arm(&mut s, 182, true);
-        assert_eq!(
-            s.eval::<Option<i64>>("return GlyphMatchesSocket(2)")
-                .unwrap(),
-            Some(1)
-        );
-        assert_eq!(
-            s.eval::<Option<i64>>("return GlyphMatchesSocket(4)")
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            s.eval::<Option<i64>>("return PlaceGlyphInSocket(2)")
-                .unwrap(),
-            Some(1)
-        );
-        arm(&mut s, 182, false);
-        assert_eq!(
-            s.eval::<Option<i64>>("return PlaceGlyphInSocket(3)")
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            s.eval::<Option<i64>>("return PlaceGlyphInSocket(6)")
-                .unwrap(),
-            None
-        );
-        assert_eq!(
-            s.take_script_calls(),
-            vec![
-                crate::script::ScriptCall::PlaceGlyph {
-                    socket: 1,
-                    verdict: GlyphPlacement::Bind
-                },
-                crate::script::ScriptCall::PlaceGlyph {
-                    socket: 2,
-                    verdict: GlyphPlacement::Bind
-                },
-                crate::script::ScriptCall::PlaceGlyph {
-                    socket: 5,
-                    verdict: GlyphPlacement::Fail(GLYPH_FAILED_LOCKED)
-                },
-            ]
-        );
-        assert_eq!(
-            s.eval::<Option<i64>>("return SpellCanTargetGlyph()")
-                .unwrap(),
-            None
-        );
-        s.set_spell_targeting(true);
-        arm(&mut s, 182, true);
-        assert_eq!(
-            s.eval::<Option<i64>>("return SpellCanTargetGlyph()")
-                .unwrap(),
-            Some(1)
-        );
+        crate::script::live::lending(&mut crate::script::live::TestView::default(), || {
+            let mut s = script();
+            assert_eq!(
+                s.eval::<i64>("return select('#', GlyphMatchesSocket(4))")
+                    .unwrap(),
+                0
+            );
+            assert_eq!(
+                s.eval::<Option<i64>>("return PlaceGlyphInSocket(4)")
+                    .unwrap(),
+                None
+            );
+            assert!(s.take_script_calls().is_empty());
+            let arm = |s: &mut UiScript, glyph, wants_socket| {
+                s.set_glyph_targeting(Some(GlyphTargeting {
+                    glyphs: [None, Some(glyph), None],
+                    wants_socket,
+                }));
+            };
+            arm(&mut s, 182, true);
+            assert_eq!(
+                s.eval::<Option<i64>>("return GlyphMatchesSocket(2)")
+                    .unwrap(),
+                Some(1)
+            );
+            assert_eq!(
+                s.eval::<Option<i64>>("return GlyphMatchesSocket(4)")
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                s.eval::<Option<i64>>("return PlaceGlyphInSocket(2)")
+                    .unwrap(),
+                Some(1)
+            );
+            arm(&mut s, 182, false);
+            assert_eq!(
+                s.eval::<Option<i64>>("return PlaceGlyphInSocket(3)")
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                s.eval::<Option<i64>>("return PlaceGlyphInSocket(6)")
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                s.take_script_calls(),
+                vec![
+                    crate::script::ScriptCall::PlaceGlyph {
+                        socket: 1,
+                        verdict: GlyphPlacement::Bind
+                    },
+                    crate::script::ScriptCall::PlaceGlyph {
+                        socket: 2,
+                        verdict: GlyphPlacement::Bind
+                    },
+                    crate::script::ScriptCall::PlaceGlyph {
+                        socket: 5,
+                        verdict: GlyphPlacement::Fail(GLYPH_FAILED_LOCKED)
+                    },
+                ]
+            );
+            assert_eq!(
+                s.eval::<Option<i64>>("return SpellCanTargetGlyph()")
+                    .unwrap(),
+                None
+            );
+            s.set_spell_targeting(true);
+            arm(&mut s, 182, true);
+            assert_eq!(
+                s.eval::<Option<i64>>("return SpellCanTargetGlyph()")
+                    .unwrap(),
+                Some(1)
+            );
+        });
     }
 
     /// The glyph frame polls `GlyphMatchesSocket` and `GetGlyphSocketInfo` every frame and the

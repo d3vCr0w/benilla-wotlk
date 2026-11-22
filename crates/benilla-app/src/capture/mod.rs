@@ -674,7 +674,17 @@ impl Plugin for CapturePlugin {
             .add_systems(Update, pin_scene.in_set(WorldStage::Present))
             // Before `UnitFeed`: the seed stands in for wire data live play delivers on earlier
             // frames, so the same frame's feeds and the one-shot `MERCHANT_SHOW` paint must see it.
-            .add_systems(Update, seed_ui_fixture.before(crate::ui_unit::UnitFeed))
+            .init_resource::<probes::ProbeChunks>()
+            .add_systems(
+                Update,
+                (
+                    crate::ui_script::raises::then_fire(seed_ui_fixture),
+                    probes::run_probe_chunks,
+                )
+                    .chain()
+                    .in_set(crate::ui_script::UiFeed)
+                    .before(crate::ui_unit::UnitFeed),
+            )
             .add_systems(
                 Update,
                 (realm_list::seed_realm_list, glue_create::seed_char_create),
@@ -1052,5 +1062,64 @@ fn drive_capture(
             (true, false) => clock.pause(),
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bevy::prelude::*;
+
+    /// Initialize every system a plugin adds, in every schedule, on an empty world: a system whose
+    /// parameters conflict (B0001/B0002, a `Res<X>` beside a live view that lends `X` mutably)
+    /// panics here, as it would at the probe's first frame.
+    fn initialize_all(plugin: impl Plugin) {
+        let mut app = App::new();
+        app.add_plugins(plugin);
+        let world = app.world_mut();
+        let mut schedules = std::mem::take(&mut *world.resource_mut::<Schedules>());
+        for (_, schedule) in schedules.iter_mut() {
+            schedule.graph_mut().systems.initialize(world);
+        }
+    }
+
+    /// Every live probe's systems initialize: none borrows what its live view lends.
+    #[test]
+    fn every_probe_plugin_initializes_without_an_access_conflict() {
+        initialize_all(super::ProbeAuctionPlugin);
+        initialize_all(super::ProbeBankPlugin);
+        initialize_all(super::ProbeBgPlugin);
+        initialize_all(super::ProbeBgQueuePlugin);
+        initialize_all(super::ProbeBinderPlugin);
+        initialize_all(super::ProbeBookPlugin);
+        initialize_all(super::ProbeCamPlugin);
+        initialize_all(super::ProbeCastCancelPlugin);
+        initialize_all(super::ProbeCharCreatePlugin);
+        initialize_all(super::ProbeCharterPlugin);
+        initialize_all(super::ProbeChatPlugin);
+        initialize_all(super::ProbeChestPlugin);
+        initialize_all(super::ProbeClamPlugin);
+        initialize_all(super::ProbeCrossingPlugin);
+        initialize_all(super::ProbeDragPlugin);
+        initialize_all(super::ProbeExitPlugin);
+        initialize_all(super::ProbeFocusPlugin);
+        initialize_all(super::ProbeGlueLuaPlugin);
+        initialize_all(super::ProbeGmTicketPlugin);
+        initialize_all(super::ProbeGoQuestPlugin);
+        initialize_all(super::ProbeGuardPoiPlugin);
+        initialize_all(super::ProbeHoverPlugin);
+        initialize_all(super::ProbeInteractPlugin);
+        initialize_all(super::ProbeKeyPlugin);
+        initialize_all(super::ProbeLookPlugin);
+        initialize_all(super::ProbeLuaPlugin);
+        initialize_all(super::ProbeMailPlugin);
+        initialize_all(super::ProbeMeleePlugin);
+        initialize_all(super::ProbeModelCameraPlugin);
+        initialize_all(super::ProbePartnerPlugin);
+        initialize_all(super::ProbePitchPlugin);
+        initialize_all(super::ProbeResizePlugin);
+        initialize_all(super::ProbeRigPlugin);
+        initialize_all(super::ProbeServicePlugin);
+        initialize_all(super::ProbeTaxiPlugin);
+        initialize_all(super::ProbeVendorSwapPlugin);
     }
 }

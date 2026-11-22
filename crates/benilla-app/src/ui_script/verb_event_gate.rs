@@ -53,6 +53,26 @@ const ELSEWHERE: &[(&str, &str, &str)] = &[
         "UPDATE_BINDINGS",
         "benilla-app/src/bindings.rs",
     ),
+    (
+        "SetBindingClick",
+        "UPDATE_BINDINGS",
+        "benilla-app/src/bindings.rs",
+    ),
+    (
+        "SetBindingItem",
+        "UPDATE_BINDINGS",
+        "benilla-app/src/bindings.rs",
+    ),
+    (
+        "SetBindingMacro",
+        "UPDATE_BINDINGS",
+        "benilla-app/src/bindings.rs",
+    ),
+    (
+        "SetBindingSpell",
+        "UPDATE_BINDINGS",
+        "benilla-app/src/bindings.rs",
+    ),
     // The trade drain applies the accept, the unaccept or the close to the session at once, and
     // the trade feed fires on the change it reads.
     (
@@ -80,12 +100,6 @@ const ELSEWHERE: &[(&str, &str, &str)] = &[
         "CalendarContextInviteDecline",
         "CALENDAR_ACTION_PENDING",
         "benilla-ui/src/script/calendar/engine.rs",
-    ),
-    // The close intent empties the window's snapshot; the feed fires on the open edge falling.
-    (
-        "CloseGuildRegistrar",
-        "GUILD_REGISTRAR_CLOSED",
-        "benilla-app/src/ui_petition/feed.rs",
     ),
     // `pickup_item` puts the item on the cursor and queues the cursor's transition event.
     (

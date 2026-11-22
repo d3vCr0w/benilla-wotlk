@@ -315,7 +315,7 @@ impl super::UiScript {
                 let template = global_text(lua, "RAID_MEMBER_NOT_READY");
                 check.lines.push(template.replacen("%s", &name, 1));
             }
-            for token in model.unit_guids.tokens_naming(guid) {
+            for token in model.tokens().tokens_naming(guid) {
                 model.ready_check.events.push((
                     "READY_CHECK_CONFIRM",
                     vec![ScriptValue::Str(token), ScriptValue::Bool(ready)],
@@ -882,7 +882,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 return Ok(());
             }
             if model.ready_check.deadline.is_some_and(|d| now < d) {
-                model.ui_errors.push("ERR_READY_CHECK_IN_PROGRESS");
+                drop(model);
+                crate::script::ui_errors::show_now(lua, "ERR_READY_CHECK_IN_PROGRESS");
                 return Ok(());
             }
             model.party_requests.push(PartyRequest::ReadyCheckStart);
@@ -2113,7 +2114,7 @@ mod tests {
 
         s.run("DoReadyCheck()").unwrap();
         assert!(s.take_party_requests().is_empty());
-        assert_eq!(s.take_ui_errors(), vec!["ERR_READY_CHECK_IN_PROGRESS"]);
+        assert_eq!(s.take_shown(), vec!["ERR_READY_CHECK_IN_PROGRESS"]);
     }
 
     /// A member's client arms and flags nothing without rank, and prints the initiator's line.

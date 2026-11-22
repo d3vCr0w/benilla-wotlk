@@ -43,8 +43,14 @@ impl Plugin for UiAuraPlugin {
                     .in_set(AuraEvents)
                     .after(crate::ui_action::SlotIdentityFeed),
             )
-            .add_systems(Update, drain_aura_cancels.in_set(UiDrain))
-            .add_systems(OnExit(ClientState::InWorld), end_session_aura_state);
+            .add_systems(
+                Update,
+                crate::ui_script::raises::then_fire(drain_aura_cancels).in_set(UiDrain),
+            )
+            .add_systems(
+                OnExit(ClientState::InWorld),
+                crate::ui_script::raises::then_fire(end_session_aura_state),
+            );
     }
 }
 
@@ -385,20 +391,21 @@ fn shown_in_aura_ui(ctx: ListCtx, spell_id: u32, flags: u8, caster: u64) -> bool
 #[derive(bevy::ecs::system::SystemParam)]
 struct AuraUnits<'w> {
     selection: Res<'w, Selection>,
-    pet: crate::ui_script::LentRef<'w, crate::ui_pet::PetBar>,
+    pet: Option<Res<'w, crate::ui_pet::PetBar>>,
     // `Option`: a UI-only harness lacks their plugins; without the party's no group token names
     // anyone.
     group: Option<Res<'w, crate::ui_party::GroupState>>,
     hovered: Option<Res<'w, crate::target::Hovered>>,
     hovered_go: Option<Res<'w, crate::target::HoveredObject>>,
-    interact: Option<Res<'w, crate::ui_session::InteractNpc>>,
     encounter: Option<Res<'w, crate::ui_instance::EncounterUnits>>,
     arena: Option<Res<'w, crate::ui_arena::ArenaOpponents>>,
+    /// The interact target (`0x60af67`), the `"npc"` unit's.
+    interact: Option<Res<'w, crate::ui_session::InteractTarget>>,
 }
 
 #[allow(clippy::type_complexity)] // a Bevy system's full input set
 fn feed_auras(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
+    mut script: crate::ui_script::InTurn,
     self_q: Query<
         (
             &ObjectStore,
@@ -421,7 +428,7 @@ fn feed_auras(
     mut mem: ResMut<AuraFeedMemory>,
     actions: Option<Res<crate::ui_action::PlayerActions>>,
 ) {
-    let Some(mut script) = script else {
+    let Some(mut script) = script.turn() else {
         return;
     };
     let Ok((store, self_guid, self_table, seated)) = self_q.single() else {
@@ -431,7 +438,7 @@ fn feed_auras(
 
     let bevy_now = time.elapsed_secs_f64();
     // Read until the pushes below, before any call into Lua.
-    let pet_read = units.pet.get();
+    let pet_read = units.pet.as_deref();
     let pet_guid = pet_read.as_ref().map_or(0, |b| b.spells.pet_guid);
     // A plain borrow, so the dispel list and the trace clock borrow apart.
     let mem: &mut AuraFeedMemory = &mut mem;
@@ -469,14 +476,18 @@ fn feed_auras(
 
     // The minimap's tracking spell follows a known tracking spell's aura on and off the player
     // (`0x727760` add, `0x722090` removal).
-    let tracking_spell = self_table
-        .listed()
-        .filter(|a| script.is_tracking_spell(a.spell_id))
-        .last()
-        .map_or(0, |a| a.spell_id);
-    if tracking_spell != script.tracking_spell() {
-        script.set_tracking_spell(tracking_spell);
-    }
+    // The known tracking spells are the live book's, read in the step's turn with the `World` lent.
+    let listed: Vec<u32> = self_table.listed().map(|a| a.spell_id).collect();
+    benilla_ui::script::world_loan::in_turn_or_now(&mut script, move |script| {
+        let tracking_spell = listed
+            .into_iter()
+            .rev()
+            .find(|&id| script.is_tracking_spell(id))
+            .unwrap_or(0);
+        if tracking_spell != script.tracking_spell() {
+            script.set_tracking_spell(tracking_spell);
+        }
+    });
 
     if let Some(period) = trace_period() {
         if bevy_now - mem.traced_at >= period {
@@ -543,6 +554,8 @@ fn feed_auras(
         let pet_of = crate::ui_arena::pet_of(&index, &stores);
         (a.opponents(), a.pets(&pet_of), a.count())
     });
+    // The interact target (`0x60af67`).
+    let interact = units.interact.as_ref().and_then(|t| t.0).unwrap_or(0);
     let unit_changed = memo.units.feed(
         &mut script,
         units::Inputs {
@@ -558,8 +571,9 @@ fn feed_auras(
                     h.mouseover(&units.hovered_go.as_deref().copied().unwrap_or_default())
                 })
                 .map_or(0, |(_, guid)| guid),
-            npc: units.interact.as_deref().and_then(|i| i.1).unwrap_or(0),
+            npc: interact,
             focus: focus_guid,
+            interact,
             // The player's transport while seated (`0x60ac87`).
             vehicle: seated
                 .filter(|p| p.state == crate::vehicle::SEATED)
@@ -593,7 +607,6 @@ fn feed_auras(
         }
     }
 
-    drop(pet_read);
     script.set_player_auras(list);
     if changed {
         script.fire_event("UNIT_AURA", vec![ScriptValue::Str("player".into())]);
@@ -608,12 +621,9 @@ fn feed_auras(
 
 /// The session's end: drops the lists, so nothing reaches the next character's frames. The
 /// tables die with their units.
-fn end_session_aura_state(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
-) {
-    if let Some(mut script) = script {
+fn end_session_aura_state(mut script: crate::ui_script::InTurn) {
+    if let Some(mut script) = script.turn() {
         script.clear_auras();
-        script.set_unit_guids(&Default::default());
         script.clear_tracking();
     }
     // No `AuraFeedMemory` reset: its edge keys die with the VM.
@@ -621,18 +631,30 @@ fn end_session_aura_state(
 
 /// A `CMSG_CANCEL_AURA` per queued `CancelUnitBuff` or `SetTracking`, naming the spell, not the
 /// slot.
-fn drain_aura_cancels(
-    (script, _live): (Option<NonSendMut<UiScript>>, crate::ui_script::LendLive),
-    net: Res<NetCommands>,
-) {
-    let Some(mut script) = script else {
+pub(crate) fn drain_aura_cancels(mut script: crate::ui_script::InTurn, net: Res<NetCommands>) {
+    let Some(mut script) = script.turn() else {
         return;
     };
     for spell_id in script.take_cancel_aura_requests() {
-        let _ = net.0.send(ClientCommand::CancelAura { spell_id });
+        // The aura cancel's form drop at its step, its send after the drop's listeners (`0x80324d`, `0x803458`).
+        match script.queue() {
+            Some(queue) => {
+                queue.world(move |w| crate::ui_shapeshift::cancel_aura_step(w, spell_id))
+            }
+            None => {
+                let _ = net.0.send(ClientCommand::CancelAura { spell_id });
+            }
+        }
     }
     for slot in script.take_temp_enchant_cancels() {
-        let _ = net.0.send(ClientCommand::CancelTempEnchantment { slot });
+        let cmd = ClientCommand::CancelTempEnchantment { slot };
+        // Behind the aura cancels queued before it.
+        match script.queue() {
+            Some(queue) => queue.world(move |w| crate::ui_shapeshift::send_after_raises(w, cmd)),
+            None => {
+                let _ = net.0.send(cmd);
+            }
+        }
     }
 }
 

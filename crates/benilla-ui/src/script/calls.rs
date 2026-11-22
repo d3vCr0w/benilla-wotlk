@@ -1,11 +1,87 @@
-//! The script calls whose effects touch the selection, the player's cast or the targeting cursor,
-//! held in one queue in the order the script made them. In the reference each such call is done
-//! when it returns: the macro runner fires every line in one pass, `TargetUnit`, `TargetByName` and
-//! `ClearTarget` commit through the selection set before returning, and `CastSpellByName` casts at
-//! the selection as it stands then. So `/target Bob` then `/cast Flash Heal` heals Bob, and the app
-//! applies this queue front to back at one point in the frame.
+//! The script calls whose effects touch the selection, the player's cast or the targeting cursor.
+//! In the reference each such call is done when it returns: the macro runner fires every line in
+//! one pass, `TargetUnit`, `TargetByName` and `ClearTarget` commit through the selection set before
+//! returning, and `CastSpellByName` casts at the selection as it stands then. So a call goes
+//! through [`make`], which applies it inside the Lua call through the host's applier
+//! ([`set_apply`]) wherever the host's state is lent ([`super::world_loan`]); with none lent it
+//! waits in one queue, in call order.
 
-use super::{ActionUse, SelectionRequest, UiScript};
+use super::{world_loan, ActionUse, SelectionRequest, UiScript};
+
+/// The host's applier: one call applied with the lent state, inside the Lua call that made it;
+/// `false` when the host cannot apply it now, and it waits.
+pub type ApplyCall = fn(&mlua::Lua, ScriptCall) -> bool;
+
+/// The host's applier, kept in the VM's app data.
+struct HostApply(ApplyCall);
+
+/// Name the host's applier of every script call `lua` makes.
+pub fn set_apply(lua: &mlua::Lua, apply: ApplyCall) {
+    lua.set_app_data(HostApply(apply));
+}
+
+/// Make `call`: applied before this returns where the host's state is lent, after the calls still
+/// queued; with none lent it waits in the queue. The caller holds no model borrow.
+pub(crate) fn make(lua: &mlua::Lua, call: ScriptCall) {
+    super::model_mut_of(lua).script_calls.push(call);
+    apply_queued(lua);
+}
+
+/// Apply the queued calls front to back through the host's applier; with nothing lent, they wait.
+/// A call a listener makes while one applies is applied inside that listener, nested, as 12340
+/// re-enters its cast entry from a `UNIT_SPELLCAST_SENT` listener (`0x80b556`).
+pub fn apply_queued(lua: &mlua::Lua) {
+    let Some(apply) = lua.app_data_ref::<HostApply>().map(|a| a.0) else {
+        return;
+    };
+    if !world_loan::lent() {
+        return;
+    }
+    loop {
+        let call = {
+            let mut model = super::model_mut_of(lua);
+            if model.script_calls.is_empty() {
+                break;
+            }
+            model.script_calls.remove(0)
+        };
+        if !apply(lua, call.clone()) {
+            super::model_mut_of(lua).script_calls.insert(0, call);
+            break;
+        }
+    }
+}
+
+/// Whether no earlier call waits once the queued ones applied through the lent hook: a verb that
+/// runs inside its call does so only then, so it keeps its turn behind a waiting call.
+pub(crate) fn none_waiting(lua: &mlua::Lua) -> bool {
+    apply_queued(lua);
+    super::model_mut_of(lua).script_calls.is_empty()
+}
+
+impl UiScript {
+    /// Another handle on this VM (the same Lua state, counter and session), for a host that lends
+    /// its state into a call while the VM itself stays where it lives.
+    pub fn share(&self) -> UiScript {
+        UiScript {
+            lua: self.lua.clone(),
+            instructions: self.instructions.clone(),
+            session: self.session,
+        }
+    }
+
+    /// The host over `lua` for an apply inside a Lua call: the same VM, sharing its counters.
+    pub fn in_call(lua: &mlua::Lua) -> UiScript {
+        let ids = lua
+            .app_data_ref::<super::HostIds>()
+            .expect("host ids app_data");
+        UiScript {
+            lua: lua.clone(),
+            instructions: ids.instructions.clone(),
+            session: ids.session,
+        }
+    }
+}
 
 /// One queued call, in the reference's terms.
 #[derive(Clone, Debug, PartialEq)]
@@ -62,6 +138,8 @@ pub enum ScriptCall {
     /// `UseAction(slot [, unit [, button]])` (`0x5ac000` → `0x5abbc0`); a macro slot runs its
     /// lines inside it.
     UseAction(ActionUse),
+    /// `DestroyTotem(slot)` behind a queued call, the 0-based slot (`0x5197d0`).
+    DestroyTotem(u8),
     /// `UseContainerItem(bag, slot)` outside repair mode.
     UseContainerItem { bag: i64, slot: u32 },
     /// A questgiver GameObject's use from `DeclineQuest`, its right-click (`0x58ceb2` -> `0x711140`).
@@ -84,6 +162,39 @@ pub enum ScriptCall {
     PetAction(u32),
     /// `PetAttack` and the other one-shot orders, as their bar slot's packed word.
     PetOrder(u32),
+    /// A verb whose press the host runs inside the call, off the intents it queued.
+    Press(VerbPress),
+}
+
+/// The verbs that press inside their call off a queued intent: each casts or sends before it returns, so the caller's next line reads what the press armed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerbPress {
+    /// `DoTradeSkill(index [, repeat])` (`0x5dac00`): the cast (`0x5dacb1` -> `0x80da40`), then the repeat set on success alone (`0x5dacbb`, `0x5dacc1` -> `0x5d9fa0`).
+    TradeSkill,
+    /// `DropItemOnUnit(unit)` (`0x51bdd0`): the pet's feed (`0x51bf26` -> `0x80dcf0`).
+    DropItemOnUnit,
+    /// `RepopMe`, `RetrieveCorpse`, `AcceptResurrect`, `DeclineResurrect`, `AcceptXPLoss` and `UseSoulstone`, each sending or using its item inside the call (`0x51aab3`, `0x51ae6d`).
+    Death,
+    /// An item pick of the targeting cursor (`SpellTargetItem` `0x8008a5` -> `0x5210d0`), the enchant confirms (`0x522f7f`, `0x5167c8`) and the trade slot's (`0x80c5f0`).
+    ItemPicks,
+}
+
+/// Press `verb` inside this call where the host's state is lent (else it waits, in call order). The caller holds no model borrow.
+pub(crate) fn press(lua: &mlua::Lua, verb: VerbPress) {
+    make(lua, ScriptCall::Press(verb));
+}
+
+/// [`press`] the item picks when a pick, an enchant confirm or a trade slot's is queued.
+pub(crate) fn press_item_picks(lua: &mlua::Lua) {
+    let queued = {
+        let model = super::model_mut_of(lua);
+        !model.item_picks.is_empty()
+            || !model.enchant_confirms.is_empty()
+            || !model.trade_enchant_targets.is_empty()
+    };
+    if queued {
+        press(lua, VerbPress::ItemPicks);
+    }
 }
 
 /// The unit a cast verb aims at, the guid its target argument leaves for the cast

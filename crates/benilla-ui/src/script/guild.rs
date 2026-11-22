@@ -622,9 +622,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             global,
             lua.create_function(move |lua, name: Value| {
                 let Some(name) = lua.coerce_string(name)? else {
-                    crate::script::model_mut_of(lua)
-                        .ui_errors
-                        .push("ERR_COMMAND_NEEDS_TARGET");
+                    crate::script::ui_errors::show_now(lua, "ERR_COMMAND_NEEDS_TARGET");
                     return Ok(());
                 };
                 if name.as_bytes().len() > 48 {
@@ -1188,44 +1186,46 @@ mod tests {
         );
 
         // Both values read the bank at the call (`0xc1dc20`, `0xc1dc34`).
-        let _bank = crate::script::live::lend_test(crate::script::live::TestView {
+        let mut bank_v = crate::script::live::TestView {
             guild_bank_money: 12_345_678,
             guild_bank_withdraw_money: -1,
             ..Default::default()
-        });
-        s.set_guild(GuildState {
-            in_guild: true,
-            rights: 0x0004_0003,
-            ..Default::default()
-        });
-        assert!(s.eval::<bool>("return CanGuildBankRepair() == 1").unwrap());
-        assert_eq!(
-            s.eval::<i64>("return GetGuildBankMoney()").unwrap(),
-            12_345_678
-        );
-        assert_eq!(
-            s.eval::<i64>("return GetGuildBankWithdrawMoney()").unwrap(),
-            -1,
-            "the guild master's unlimited"
-        );
+        };
+        crate::script::live::lending(&mut bank_v, || {
+            s.set_guild(GuildState {
+                in_guild: true,
+                rights: 0x0004_0003,
+                ..Default::default()
+            });
+            assert!(s.eval::<bool>("return CanGuildBankRepair() == 1").unwrap());
+            assert_eq!(
+                s.eval::<i64>("return GetGuildBankMoney()").unwrap(),
+                12_345_678
+            );
+            assert_eq!(
+                s.eval::<i64>("return GetGuildBankWithdrawMoney()").unwrap(),
+                -1,
+                "the guild master's unlimited"
+            );
 
-        s.set_guild(GuildState {
-            in_guild: true,
-            rights: 0x0000_0003,
-            ..Default::default()
+            s.set_guild(GuildState {
+                in_guild: true,
+                rights: 0x0000_0003,
+                ..Default::default()
+            });
+            assert!(s
+                .eval::<bool>("return CanGuildBankRepair() == nil")
+                .unwrap());
+            s.set_guild(GuildState {
+                rights: 0x0004_0000,
+                ..Default::default()
+            });
+            assert!(
+                s.eval::<bool>("return CanGuildBankRepair() == nil")
+                    .unwrap(),
+                "guildless"
+            );
         });
-        assert!(s
-            .eval::<bool>("return CanGuildBankRepair() == nil")
-            .unwrap());
-        s.set_guild(GuildState {
-            rights: 0x0004_0000,
-            ..Default::default()
-        });
-        assert!(
-            s.eval::<bool>("return CanGuildBankRepair() == nil")
-                .unwrap(),
-            "guildless"
-        );
     }
 
     #[test]
@@ -1536,7 +1536,7 @@ mod tests {
                 GuildRequest::SetLeader(String::new()),
             ]
         );
-        assert_eq!(s.take_ui_errors(), vec!["ERR_COMMAND_NEEDS_TARGET"]);
+        assert_eq!(s.take_shown(), vec!["ERR_COMMAND_NEEDS_TARGET"]);
         assert!(s.run(r#"GuildPromote(string.rep("a", 49))"#).is_err());
         s.run(r#"GuildDemote(string.rep("a", 48))"#).unwrap();
         assert_eq!(s.take_guild_requests().len(), 1);

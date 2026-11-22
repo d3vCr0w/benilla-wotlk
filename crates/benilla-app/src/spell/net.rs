@@ -19,8 +19,8 @@ use super::{
     QueuedMeleeSpell,
 };
 use crate::creature_anim::{CastEvent, CastEventKind, Casting, SpellGoTargets};
-use crate::ui_action::{CastErrors, PlayerActions, Spells, UiError, UiErrorKeys};
-use crate::ui_cast::{CastBarEdge, CastBarFeed};
+use crate::ui_action::{CastRefusals, PlayerActions, Spells, UiError};
+use crate::ui_cast::CastBarEdge;
 use crate::ui_spellbook::LearnedInTab;
 
 use benilla_protocol::{SessionEvent, SessionEventKind};
@@ -69,7 +69,9 @@ pub(crate) struct Lifecycle<'w> {
     spells: Option<Res<'w, Spells>>,
     net: Res<'w, NetCommands>,
     actions: ResMut<'w, PlayerActions>,
-    learned_in_tab: ResMut<'w, LearnedInTab>,
+    slots: ResMut<'w, crate::ui_action::ActionSlots>,
+    /// The book the update rebuilds (`0x53ca70`).
+    book: ResMut<'w, crate::ui_spellbook::SpellBook>,
     summons: Res<'w, super::SummonSlots>,
     /// The companion lists the known-spell adds file into (`0x5426a5`).
     companions: ResMut<'w, crate::ui_companion::CompanionLists>,
@@ -81,7 +83,8 @@ pub(crate) struct Lifecycle<'w> {
     /// The companion adds' tutorials (`0x542751`).
     tutorials: Option<ResMut<'w, Messages<crate::tutorial::TutorialEvent>>>,
     multicast: ResMut<'w, super::multicast::MultiCastLists>,
-    cast_bar: ResMut<'w, CastBarFeed>,
+    /// The book update's school masks, which the not-interruptible test reads.
+    schools: ResMut<'w, crate::ui_cast::InterruptSchools>,
     pending: ResMut<'w, PendingCast>,
     queued_melee: ResMut<'w, QueuedMeleeSpell>,
     cooldowns: ResMut<'w, Cooldowns>,
@@ -92,6 +95,21 @@ pub(crate) struct Lifecycle<'w> {
     /// The animation call-order counter: every animation-bearing message stamps `next()`, in packet
     /// order.
     play_seq: ResMut<'w, crate::creature_anim::PlaySeq>,
+}
+
+impl Lifecycle<'_> {
+    /// The book update with its re-sort and masks (`0x53ca70`): the book, the school masks, then
+    /// `SPELLS_CHANGED`; then `LEARNED_SPELL_IN_TAB` for each spell `learned` names (`0x542d16`).
+    fn update_book(&mut self, learned: &LearnedInTab) {
+        let inputs = crate::ui_spellbook::BookInputs {
+            known: &self.actions.spells,
+            spells: self.spells.as_deref(),
+            summons: &self.summons.0,
+            skill_lines: self.skill_lines.as_deref().map(|s| &*s.catalog),
+        };
+        self.book.update(&inputs, &mut self.schools, &mut self.ui);
+        self.book.flash(learned, &inputs, &mut self.ui);
+    }
 }
 
 /// The scene a cast lands in: the streamed units, the item store, and the animation, text and
@@ -157,26 +175,29 @@ fn on_spell_book(In(ev): In<SessionEvent>, mut l: Lifecycle, mut sc: Scene) {
             }
         }
     }
+    // The load passes the registrar with its live flag clear, which skips the book update
+    // (`0x542cc8`); our object's init runs it (`0x6e7fdb`).
 }
 
 fn on_action_buttons(In(ev): In<SessionEvent>, mut l: Lifecycle) {
     if let SessionEvent::ActionButtons { state, buttons } = ev {
         let player = l.self_guid.0.is_some_and(|g| l.index.0.contains_key(&g));
-        action_buttons(state, buttons, player, &mut l.actions, &l.net);
+        let bar = (&*l.actions, &mut *l.slots);
+        action_buttons(state, buttons, player, bar, &l.net, &mut l.ui);
     }
 }
 
 /// Every session end returns to glue, whose next world entry zeroes the bar (`0x5a79d0`, via
 /// `0x52b550` from `0x405540`) before the login goes out; the lock lives on the player object.
-fn on_session_end(In(ev): In<SessionEvent>, mut actions: ResMut<PlayerActions>) {
+fn on_session_end(In(ev): In<SessionEvent>, mut slots: ResMut<crate::ui_action::ActionSlots>) {
     if let SessionEvent::Disconnected { .. } = ev {
-        clear_bar(&mut actions);
+        clear_bar(&mut slots);
     }
 }
 
 /// The bar and its lock emptied without a send; the stored table stays (`0xad9f6c` is only
 /// overwritten).
-fn clear_bar(actions: &mut PlayerActions) {
+fn clear_bar(actions: &mut crate::ui_action::ActionSlots) {
     if !actions.buttons.is_empty() {
         actions.buttons.clear();
         actions.dirty = true;
@@ -187,9 +208,10 @@ fn clear_bar(actions: &mut PlayerActions) {
 fn on_spell_learned(
     In(ev): In<SessionEvent>,
     mut l: Lifecycle,
-    mut errors: ResMut<UiErrorKeys>,
     stores: Query<&ObjectStore>,
+    mut commands: Commands,
 ) {
+    refill_in_turn(&mut commands);
     if let SessionEvent::SpellLearned { spell_id } = ev {
         // `0x4d4db0` on the active player (`0x10`): our own player, once its object has streamed.
         let me = our_store(&l, &stores);
@@ -198,16 +220,28 @@ fn on_spell_learned(
             class: store.0.unit_class().unwrap_or(0),
             form: store.0.unit_shapeshift_form(),
         });
+        let mut flash = LearnedInTab::default();
+        // Each slot the rank replace or the first-rank placement writes signals at its write
+        // (`0x5aae80`), around the announcement as the registrar orders them.
         learned_spell(
             spell_id,
-            &mut l.actions,
+            (&mut l.actions, &mut l.slots),
             l.spells.as_deref(),
-            &mut errors,
-            &mut l.learned_in_tab,
+            &mut *l.ui,
+            &mut flash,
             learner,
             &l.net,
             &l.summons.0,
         );
+        // The registrar's stance and reactive lists (`0x542647`), past which a live learn signals
+        // `UPDATE_SHAPESHIFT_FORMS`.
+        if learner.is_some() {
+            use crate::ui_action::usable_cache::{edit_step, ListEdit};
+            l.ui.world(edit_step(ListEdit::Learn {
+                spell: spell_id,
+                replaces: None,
+            }));
+        }
         // The totem lists, and a live learn's refill (`0x542d33`, `0x542df1`).
         let display = l
             .spells
@@ -224,19 +258,35 @@ fn on_spell_learned(
             Some(me) => companion_add(&mut l, me, spell_id),
             None => l.known_buffer.0.push(spell_id),
         }
+        // The registrar's book update and tab flash, reached by a live learn past its exits, the
+        // same ones the flash is gated on (`0x542cbf`-`0x542d16`).
+        if !flash.0.is_empty() {
+            l.update_book(&flash);
+        }
     }
 }
 
-fn on_spell_removed(In(ev): In<SessionEvent>, mut l: Lifecycle, mut errors: ResMut<UiErrorKeys>) {
+fn on_spell_removed(In(ev): In<SessionEvent>, mut l: Lifecycle, mut commands: Commands) {
+    refill_in_turn(&mut commands);
     if let SessionEvent::SpellRemoved { spell_id } = ev {
         // The known-spell removal drops a companion from its list (`0x53fad0`); before our object exists it zeroes the buffer's entry (`0x6e7888`).
-        if !our_object_exists(&l) {
+        let exists = our_object_exists(&l);
+        if !exists {
             l.known_buffer.0.retain(|&s| s != spell_id);
         } else {
             companion_remove(&mut l, spell_id);
         }
-        removed_spell(spell_id, &mut l.actions, l.spells.as_deref(), &mut errors);
+        removed_spell(spell_id, &mut l.actions, l.spells.as_deref(), &mut *l.ui);
         unlearn_totem(&mut l.multicast, spell_id);
+        // The plain unlearn drops its stance entry (`0x53fe44`, notify clear, `0x6e7361`).
+        if exists {
+            use crate::ui_action::usable_cache::{edit_step, ListEdit};
+            l.ui.world(edit_step(ListEdit::Remove(spell_id)));
+        }
+        // The removal ends in the book update, a spell it held or not (`0x5401b8`).
+        if exists {
+            l.update_book(&LearnedInTab::default());
+        }
     }
 }
 
@@ -313,6 +363,13 @@ fn companion_add(l: &mut Lifecycle, (race, class): (u8, u8), spell_id: u32) {
     }
 }
 
+/// Run the totem bar's refill once the calling handler's commands apply, when the handler made one
+/// due: a learn or unlearn refills inside its handler (`0x542df1`, `0x53ff4f`). Queued first, it
+/// still runs after the handler's own writes, which apply before its queued commands.
+fn refill_in_turn(commands: &mut Commands) {
+    commands.queue(super::multicast::refill_if_due);
+}
+
 /// The unlearn's totem sweep (`0x53fe57`); an emptied list or a call spell refills (`0x53ff4f`).
 fn unlearn_totem(lists: &mut super::multicast::MultiCastLists, spell_id: u32) {
     if lists.unlearn(spell_id) || super::multicast::CALL_SPELLS.contains(&spell_id) {
@@ -323,18 +380,22 @@ fn unlearn_totem(lists: &mut super::multicast::MultiCastLists, spell_id: u32) {
 fn on_spell_superceded(
     In(ev): In<SessionEvent>,
     mut l: Lifecycle,
-    mut errors: ResMut<UiErrorKeys>,
     stores: Query<&ObjectStore>,
+    mut commands: Commands,
 ) {
+    refill_in_turn(&mut commands);
     if let SessionEvent::SpellSuperceded {
         old_spell_id,
         new_spell_id,
     } = ev
     {
-        // Before our object exists the pair edits the buffer: the old entry renamed, else the new one appended (`0x6e7ef4`); after, the removal then the registrar with notify set run their companion arms (`0x542eba`, `0x542ec6`).
-        match our_store(&l, &stores).map(|me| race_class_of(&me.0)) {
+        // Before our object exists the pair edits the buffer: the old entry renamed, else the new one appended (`0x6e7ef4`); after, the removal then the registrar with notify set run their companion arms (`0x542eba`, `0x542ec6`), each ending in a book update (`0x5401b8`, `0x542cd4`).
+        let me = our_store(&l, &stores).map(|me| race_class_of(&me.0));
+        match me {
             Some(me) => {
                 companion_remove(&mut l, old_spell_id);
+                l.actions.spells.remove(&old_spell_id);
+                l.update_book(&LearnedInTab::default());
                 companion_add(&mut l, me, new_spell_id);
             }
             None => {
@@ -345,13 +406,14 @@ fn on_spell_superceded(
                 }
             }
         }
+        let mut flash = LearnedInTab::default();
         superceded_spell(
             old_spell_id,
             new_spell_id,
             &mut l.actions,
             l.spells.as_deref(),
-            &mut errors,
-            &mut l.learned_in_tab,
+            &mut *l.ui,
+            &mut flash,
         );
         // The pair is unlearn then a live learn (`0x542eb0`).
         unlearn_totem(&mut l.multicast, old_spell_id);
@@ -364,15 +426,25 @@ fn on_spell_superceded(
                 l.multicast.refill_due = true;
             }
         }
+        if me.is_some() {
+            // The removal kept the old rank's stance entry (notify set, `0x542eb7`); the registrar
+            // replaces it in place (`0x54252d`).
+            use crate::ui_action::usable_cache::{edit_step, ListEdit};
+            l.ui.world(edit_step(ListEdit::Learn {
+                spell: new_spell_id,
+                replaces: Some(old_spell_id),
+            }));
+            l.update_book(&flash);
+        }
     }
 }
 
 /// What the cast-result handler reaches beyond the ladder.
 #[derive(SystemParam)]
 pub(crate) struct Reply<'w, 's> {
+    ui: ResMut<'w, crate::ui_script::live::UiEvents>,
     self_guid: Res<'w, SelfGuid>,
     index: Res<'w, GuidIndex>,
-    cast_bar: ResMut<'w, CastBarFeed>,
     casting: Query<'w, 's, &'static Casting>,
     cast_events: MessageWriter<'w, CastEvent>,
     play_seq: ResMut<'w, crate::creature_anim::PlaySeq>,
@@ -400,37 +472,93 @@ fn on_cast_result(
         wire_reason,
     } = ev
     {
-        // `SMSG_CAST_FAILED` ends our cast through `0x808200` -> `0x7fecc0` with its reason.
+        use crate::ui_action::signals::{cooldown_site, selection, spellbook, Tail};
+        let row = ladder
+            .spells
+            .as_deref()
+            .and_then(|s| s.catalog.get(spell_id));
+        let on_event = row.is_some_and(|d| d.cooldown_on_event());
+        // The failure routine's error mapping (`0x808341`): a not-ready refusal with no argument
+        // releases an on-hold record, then signals (`0x807f6b`-`0x807fa4`).
+        let category = row.map_or(0, |d| d.category);
+        let not_ready_hold = !success
+            && reason == Some(0x3c)
+            && arg.unwrap_or(0) == 0
+            && ladder
+                .cooldowns
+                .as_ref()
+                .has_on_hold_record(spell_id, 0, category);
+        if not_ready_hold {
+            ladder.cooldowns.clear_spell(spell_id);
+        }
+        // Its start cooldown clear signals when a record matched (`0x80476d`); DONT_REPORT
+        // returns before it.
+        let start_cleared =
+            !success && reason != Some(0x17) && ladder.cooldowns.has_spell(spell_id);
+        // The routine's auto-repeat cancel (`0x8082d3`, `0x8083c6`), signalled in its place below.
+        let mut cancels: Vec<&'static str> = Vec::new();
+        let chained = cast_result(
+            (spell_id, cast_count, wire_reason.unwrap_or(0)),
+            success,
+            reason,
+            &mut ladder.ecs,
+            &r.self_guid,
+            &r.index,
+            &r.casting,
+            &mut r.cast_events,
+            ladder.pending.as_mut(),
+            ladder.queued_melee.as_mut(),
+            ladder.cooldowns.as_mut(),
+            ladder.auto_repeat.as_mut(),
+            ladder.spells.as_deref(),
+            &ladder.commands,
+            r.play_seq.next(),
+            &mut cancels,
+        );
+        // The routine's signals in its order: the hold's release, the auto-repeat cancel, the
+        // start cooldown's clear, then the cast's end through `0x7fecc0` and its finish's
+        // selection update (`0x808b7f`, `0x8055f9`, `0x8054f0`).
+        if not_ready_hold {
+            cooldown_site(&mut r.ui, true, Tail::Bags);
+        }
+        for event in cancels {
+            r.ui.fire(event, Vec::new());
+        }
+        if start_cleared {
+            spellbook(&mut r.ui);
+        }
+        // The red line, independent of the bar: a pre-start failure still shows it, after the
+        // routine's cancel and before the cast's end (`0x808aa5`, `0x808b00`, then `0x808b75`).
+        // `0x17` DONT_REPORT shows nothing. `SMSG_CAST_FAILED` is addressed to the caster, and this
+        // handler is ours.
+        if let (false, Some(reason)) = (success, reason.filter(|&r| r != 0x17)) {
+            r.ui.refuse(crate::ui_action::CastFail {
+                arg,
+                arg2,
+                ..crate::ui_action::CastFail::local(spell_id, reason)
+            });
+        }
         if let (false, Some(reason), Some(caster)) = (success, reason, r.self_guid.0) {
-            r.cast_bar.0.push(CastBarEdge::Failed {
+            r.ui.cast_edge(CastBarEdge::Failed {
                 caster,
                 spell_id,
                 cast_count,
                 reason,
             });
+            if cast_count != 0 {
+                selection(&mut r.ui);
+            }
         }
-        let chained = cast_result(
-            (spell_id, cast_count, wire_reason.unwrap_or(0)),
-            success,
-            reason,
-            [arg, arg2],
-            &mut ladder.ecs,
-            &r.self_guid,
-            &r.index,
-            &mut ladder.cast_errors,
-            &r.casting,
-            &mut r.cast_events,
-            &mut ladder.pending,
-            &mut ladder.queued_melee,
-            &mut ladder.cooldowns.write(),
-            &mut ladder.auto_repeat,
-            ladder.spells.as_deref(),
-            &ladder.commands,
-            r.play_seq.next(),
-        );
+        // A failure other than not-ready of a cooldown-on-event spell drops its on-hold record,
+        // then signals (`0x809bd5`-`0x809c05`).
+        if !success && reason != Some(0x3c) && on_event {
+            cooldown_site(&mut r.ui, true, Tail::Bags);
+        }
         if let Some(next) = chained {
             let ctx = targeting.context();
             ladder.send(next, &ctx, CastCommit::Spell);
+            // The chained send's `UNIT_SPELLCAST_SENT`, in this handler's turn (`0x80b556`).
+            ladder.press.defer(&mut r.ui);
         }
     }
 }
@@ -458,24 +586,25 @@ fn on_own_spell_go(
         (spell_id, 0, 0),
         true,
         None,
-        [None; 2],
         &mut ladder.ecs,
         &r.self_guid,
         &r.index,
-        &mut ladder.cast_errors,
         &r.casting,
         &mut r.cast_events,
-        &mut ladder.pending,
-        &mut ladder.queued_melee,
-        &mut ladder.cooldowns.write(),
-        &mut ladder.auto_repeat,
+        ladder.pending.as_mut(),
+        ladder.queued_melee.as_mut(),
+        ladder.cooldowns.as_mut(),
+        ladder.auto_repeat.as_mut(),
         ladder.spells.as_deref(),
         &ladder.commands,
         r.play_seq.next(),
+        &mut *r.ui,
     );
     if let Some(next) = chained {
         let ctx = targeting.context();
         ladder.send(next, &ctx, CastCommit::Spell);
+        // The chained send's `UNIT_SPELLCAST_SENT`, in this handler's turn (`0x80b556`).
+        ladder.press.defer(&mut r.ui);
     }
 }
 
@@ -505,8 +634,7 @@ fn on_spell_start(In(ev): In<SessionEvent>, mut l: Lifecycle, mut sc: Scene) {
             &sc.casting,
             &mut sc.cast_events,
             &l.self_guid,
-            &mut l.cast_bar,
-            &mut l.pending,
+            &mut l.ui,
             l.spells.as_deref(),
             l.play_seq.next(),
         );
@@ -525,12 +653,7 @@ fn on_spell_go(In(ev): In<SessionEvent>, mut l: Lifecycle, mut sc: Scene, mut ar
     if !matches!(ev, SessionEvent::SpellGo { .. }) {
         return;
     }
-    let pet_generation = l.pet_bar.cooldowns.generation;
     on_spell_go_inner(ev, &mut l, &mut sc, &mut arm);
-    // The pet leg's insert flushes in the go (`0x80fe3b`, `0x80fe4b`).
-    if l.pet_bar.cooldowns.generation != pet_generation {
-        crate::ui_pet::pet_cooldown_flush(&mut l.ui);
-    }
 }
 
 fn on_spell_go_inner(ev: SessionEvent, l: &mut Lifecycle, sc: &mut Scene, arm: &mut SpellGoLoot) {
@@ -619,7 +742,7 @@ fn on_spell_go_inner(ev: SessionEvent, l: &mut Lifecycle, sc: &mut Scene, arm: &
             &mut sc.go_targets,
             &l.self_guid,
             &sc.stores,
-            &mut l.cast_bar,
+            &mut l.ui,
             &mut l.pending,
             &mut l.queued_melee,
             &mut sc.go_lid,
@@ -688,16 +811,20 @@ fn on_spell_failed(
                 &mut sc.commands,
                 &l.net,
                 &mut sounds,
+                &mut *l.ui,
             );
         }
         // Both handlers end the cast through `0x7fecc0` with the packet's reason (`0x809db3`,
-        // `0x806bb0`).
-        l.cast_bar.0.push(CastBarEdge::Failed {
+        // `0x806bb0`), and finish ours with the selection update (`0x809dc1`, `0x806bbe`).
+        l.ui.cast_edge(CastBarEdge::Failed {
             caster,
             spell_id,
             cast_count,
             reason,
         });
+        if l.self_guid.0 == Some(caster) && cast_count != 0 {
+            crate::ui_action::signals::selection(&mut l.ui);
+        }
         spell_failed_other(
             other,
             caster,
@@ -716,13 +843,7 @@ fn on_spell_failed(
 
 fn on_spell_delayed(In(ev): In<SessionEvent>, mut l: Lifecycle) {
     if let SessionEvent::SpellDelayed { caster, delay_ms } = ev {
-        spell_delayed(
-            caster,
-            delay_ms,
-            &l.self_guid,
-            &mut l.cast_bar,
-            &mut l.pending,
-        );
+        spell_delayed(caster, delay_ms, &l.self_guid, &mut l.ui);
     }
 }
 
@@ -734,32 +855,45 @@ fn on_cancel_auto_repeat(In(ev): In<SessionEvent>, mut l: Lifecycle, mut sc: Sce
             &l.self_guid,
             &l.index,
             &mut sc.commands,
+            &mut *l.ui,
         );
     }
 }
 
 /// The five cooldown packets, routed by the caster guid: `SMSG_SPELL_COOLDOWN` and
 /// `SMSG_COOLDOWN_CHEAT` through [`addressed_store`], the other three through
-/// [`pet_or_player_store`].
+/// [`pet_or_player_store`]. Each ends in the spellbook's cooldown signals and its list's own
+/// ([`crate::ui_action::signals`]).
 fn on_cooldown_packet(In(ev): In<SessionEvent>, mut l: Lifecycle) {
+    use crate::ui_action::signals::{cooldown_site, Tail};
     let pet = |caster: u64| l.pet_bar.has_bar() && l.pet_bar.spells.pet_guid == caster;
-    // A packet addressed to the pet flushes its bar once, whatever it changed (`0x807039`, `0x802bd6`, `0x802c1e`, `0x804179`); the player is tested first (`0x806e0e`, `0x804122`).
-    let flush = match ev {
+    let me = |caster: u64| l.self_guid.0 == Some(caster);
+    // `(usable, tail)` of the site the packet reaches, or none.
+    let site = match ev {
+        // Ours or the pet's alone, the player tested first (`0x806e0e`, `0x80702e`-`0x807048`;
+        // `0x804122`, `0x80413f`-`0x804179`).
         SessionEvent::SpellCooldowns { caster, .. } | SessionEvent::CooldownCheat { caster } => {
-            l.self_guid.0 != Some(caster) && pet(caster)
+            if me(caster) {
+                Some((false, Tail::Bags))
+            } else if pet(caster) {
+                Some((false, Tail::Pet))
+            } else {
+                None
+            }
         }
+        // The modify (`0x802bc6`-`0x802bdc`) on any caster, the pet's list for the pet's guid.
         SessionEvent::CooldownEvent { caster, .. } | SessionEvent::ClearCooldown { caster, .. } => {
-            pet(caster)
+            Some((true, Tail::of_list(pet(caster))))
         }
-        // Spell 0 is skipped before the delay (`0x8040e4`).
+        // The delay (`0x802c0e`-`0x802c24`); spell 0 is skipped before it (`0x8040e4`).
         SessionEvent::ModifyCooldown {
             spell_id, caster, ..
-        } => spell_id != 0 && pet(caster),
-        _ => false,
+        } => (spell_id != 0).then(|| (true, Tail::of_list(pet(caster)))),
+        _ => None,
     };
     cooldown_packet(ev, &mut l);
-    if flush {
-        crate::ui_pet::pet_cooldown_flush(&mut l.ui);
+    if let Some((usable, tail)) = site {
+        cooldown_site(&mut l.ui, usable, tail);
     }
 }
 
@@ -807,7 +941,7 @@ fn cooldown_packet(ev: SessionEvent, l: &mut Lifecycle) {
             let row = spells.as_deref().and_then(|s| s.catalog.get(spell_id));
             let left = |store: &Cooldowns| store.info(spell_id, 0, row, now).remaining_ms;
             let before = left(store);
-            store.delay(spell_id, delay_ms, now);
+            store.delay(spell_id, delay_ms);
             let after = left(store);
             debug!(
                 "net: modify cooldown — spell {spell_id} by {delay_ms} ms on {caster:#x}: \
@@ -825,6 +959,12 @@ fn on_item_cooldown(In(ev): In<SessionEvent>, mut l: Lifecycle, sc: Scene) {
     } = ev
     {
         item_cooldown(item_guid, spell_id, &l.index, &sc.stores, &mut l.cooldowns);
+        // Whether or not the item resolved (`0x80719d`, `0x8071a2`).
+        crate::ui_action::signals::cooldown_site(
+            &mut l.ui,
+            false,
+            crate::ui_action::signals::Tail::Bags,
+        );
     }
 }
 
@@ -844,7 +984,7 @@ fn on_channel(In(ev): In<SessionEvent>, mut l: Lifecycle) {
                 spell_id,
                 duration_ms,
                 &mut l.channel,
-                &mut l.cast_bar,
+                &mut l.ui,
             );
         }
         SessionEvent::ChannelUpdate {
@@ -852,7 +992,7 @@ fn on_channel(In(ev): In<SessionEvent>, mut l: Lifecycle) {
             remaining_ms,
         } => {
             let own = l.self_guid.0 == Some(caster);
-            channel_update(caster, own, remaining_ms, &mut l.channel, &mut l.cast_bar);
+            channel_update(caster, own, remaining_ms, &mut l.channel, &mut l.ui);
         }
         _ => {}
     }
@@ -868,7 +1008,7 @@ fn on_resume_cast_bar(In(ev): In<SessionEvent>, mut l: Lifecycle) {
         );
         // The caster must be a streamed unit (`0x802150`).
         if l.index.0.contains_key(&r.caster) {
-            l.cast_bar.0.push(CastBarEdge::Resume {
+            l.ui.cast_edge(CastBarEdge::Resume {
                 caster: r.caster,
                 spell_id: r.spell_id,
                 remaining_ms: r.remaining_ms,
@@ -880,31 +1020,36 @@ fn on_resume_cast_bar(In(ev): In<SessionEvent>, mut l: Lifecycle) {
 
 fn on_reset_ranged_combat_timer(In(ev): In<SessionEvent>, mut l: Lifecycle) {
     if let SessionEvent::ResetRangedCombatTimer { time_ms } = ev {
-        reset_ranged_combat_timer(
+        let added = reset_ranged_combat_timer(
             time_ms,
             &l.actions,
             l.spells.as_deref(),
             &l.summons.0,
             &mut l.cooldowns,
         );
+        // The spellbook's cooldown signals after each record, inside the loop (`0x807364`).
+        for _ in 0..added {
+            crate::ui_action::signals::spellbook(&mut l.ui);
+        }
     }
 }
 
 /// `SMSG_RESET_RANGED_COMBAT_TIMER` (`0x8071c0`): every book spell with Attributes `0x2`, without
 /// AttributesEx2 `0x20000` and AttributesEx4 `0x10000000`, adds a record starting now with
-/// `time_ms` as its recovery and no category (`0x80734f`).
+/// `time_ms` as its recovery and no category (`0x80734f`). Answers how many it added.
 fn reset_ranged_combat_timer(
     time_ms: u32,
     actions: &PlayerActions,
     spells: Option<&Spells>,
     summons: &benilla_formats::SummonPropertiesCatalog,
     cooldowns: &mut Cooldowns,
-) {
+) -> usize {
     debug!("net: reset ranged combat timer — {time_ms} ms");
     let Some(spells) = spells else {
-        return;
+        return 0;
     };
     let now = Instant::now();
+    let mut added = 0;
     for &id in &actions.spells {
         let Some(d) = spells.catalog.get(id) else {
             continue;
@@ -914,8 +1059,10 @@ fn reset_ranged_combat_timer(
             && d.attributes_ex4 & 0x1000_0000 == 0
         {
             cooldowns.start_recovery(id, time_ms, now);
+            added += 1;
         }
     }
+    added
 }
 
 /// `SMSG_SPELL_FAILURE`'s own legs (`0x809c70`), on a streamed caster with a `Spell.dbc` row: the
@@ -933,6 +1080,7 @@ fn spell_failure(
     commands: &mut Commands,
     net: &crate::net::NetCommands,
     sounds: &mut MessageWriter<crate::net::ServerSoundMessage>,
+    sink: &mut dyn crate::ui_action::signals::SignalSink,
 ) {
     let Some(spells) = spells else {
         return;
@@ -950,7 +1098,7 @@ fn spell_failure(
     }
     // The shared numbering of wire 0x34-0x36.
     if self_guid.0 == Some(caster) && matches!(reason, 0x2f..=0x31) {
-        crate::creature_anim::cancel_auto_repeat_local(Some(e), auto_repeat, commands, net);
+        crate::creature_anim::cancel_auto_repeat_local(Some(e), auto_repeat, commands, net, sink);
     }
 }
 
@@ -1051,16 +1199,18 @@ fn spell_book(
 
 /// `SMSG_ACTION_BUTTONS` (`0x6d8750`). State 2 locks the bar of a streamed player (`0x6d8798`).
 /// States 0 and 1 store the table; state 1 also unlocks and puts it on a streamed player's bar
-/// (`0x6d87e8`): a slot that [`slot_stands`] is set without a send (`0x6d883c`), every other slot
-/// of the 144, an empty one included, is removed with its `CMSG_SET_ACTION_BUTTON` clear
-/// (`0x6d882c` -> `0x5aab02`). Otherwise the player's init puts the table on
-/// ([`put_action_table_on_init`]).
+/// (`0x6d87e8`): a slot that [`slot_stands`] is set without a send or a signal (`0x6d883c`), every
+/// other slot of the 144, an empty one included, is removed with its `CMSG_SET_ACTION_BUTTON` clear
+/// and its signal (`0x6d882c` -> `0x5aab02`), each slot's usable bytes recomputed in slot order;
+/// then the whole bar signals, 0 (`0x6d885b`). Otherwise the player's init puts the table on
+/// ([`put_action_table`]).
 fn action_buttons(
     state: u8,
     buttons: Vec<ActionButton>,
     player: bool,
-    actions: &mut PlayerActions,
+    (book, actions): (&PlayerActions, &mut crate::ui_action::ActionSlots),
     net: &NetCommands,
+    ui: &mut crate::ui_script::live::UiEvents,
 ) {
     debug!(
         "net: action bar — state {state}, {} occupied slots",
@@ -1081,14 +1231,20 @@ fn action_buttons(
     let table: std::collections::HashMap<u8, ActionButton> =
         buttons.into_iter().map(|b| (b.slot, b)).collect();
     for slot in 0..benilla_protocol::messages::ACTION_BUTTON_SLOTS as u8 {
-        match table.get(&slot).filter(|b| slot_stands(b, actions, true)) {
+        match table.get(&slot).filter(|b| slot_stands(b, book, true)) {
             Some(&b) => {
                 actions.buttons.insert(slot, b);
                 actions.dirty = true;
+                ui.world(move |world| crate::ui_action::slots::slot_set_silently(world, slot));
             }
-            None => actions.write_slot(slot, 0, net),
+            None => {
+                if actions.write_slot(slot, 0, net) {
+                    crate::ui_action::slots::changed_in_turn(ui, slot);
+                }
+            }
         }
     }
+    ui.world(crate::ui_action::slots::bar_changed);
 }
 
 /// Whether a table slot goes on the bar: a spell word (kind nibble 0) only if the spell is known,
@@ -1104,24 +1260,38 @@ fn slot_stands(b: &ActionButton, actions: &PlayerActions, sets: bool) -> bool {
         || actions.equipment_sets.iter().any(|s| s.id == b.action)
 }
 
-/// The player's init (`0x6e8000`-`0x6e8046`): the stored table's slots go on the bar, a spell slot
-/// only if known; nothing is removed.
-pub(crate) fn put_action_table_on_init(
-    mut cascades: MessageReader<crate::net::WorldEnterCascadeMessage>,
-    mut actions: ResMut<PlayerActions>,
-) {
-    if cascades.read().next().is_none() {
-        return;
-    }
-    let Some(table) = actions.table.clone() else {
-        return;
-    };
-    for b in table {
-        if slot_stands(&b, &actions, false) {
-            actions.buttons.insert(b.slot, b);
+/// The player's init (`0x6e8000`-`0x6e8046`): the stored table's slots go on the bar without a
+/// send or a signal, a spell slot only if known, each slot's usable bytes recomputed; nothing is
+/// removed; then the whole bar signals, 0 (`0x6e8046`).
+pub(crate) fn put_action_table(world: &mut World) {
+    let slots = world
+        .get_resource::<PlayerActions>()
+        .zip(world.get_resource::<crate::ui_action::ActionSlots>())
+        .map(|(book, bar)| put_table(book, bar.table.as_deref()))
+        .unwrap_or_default();
+    if let Some(mut bar) = world.get_resource_mut::<crate::ui_action::ActionSlots>() {
+        for &b in &slots {
+            bar.buttons.insert(b.slot, b);
         }
+        bar.dirty = true;
     }
-    actions.dirty = true;
+    let slots: Vec<u8> = slots.into_iter().map(|b| b.slot).collect();
+    for slot in slots {
+        crate::ui_action::slots::slot_set_silently(world, slot);
+    }
+    crate::ui_action::slots::bar_changed(world);
+}
+
+/// The table's slots that go on the bar, in slot order.
+fn put_table(book: &PlayerActions, table: Option<&[ActionButton]>) -> Vec<ActionButton> {
+    let mut set: Vec<ActionButton> = table
+        .unwrap_or_default()
+        .iter()
+        .filter(|b| slot_stands(b, book, false))
+        .copied()
+        .collect();
+    set.sort_unstable_by_key(|b| b.slot);
+    set
 }
 
 /// `SMSG_LEARNED_SPELL` (`0x6e7d60`): with our player streamed, `0x6e7b00(spell, slot, 1, 1)`:
@@ -1136,9 +1306,9 @@ pub(crate) fn put_action_table_on_init(
 /// Hidden, recipe, companion (#263) and unbooked learns skip tab and bar (`0x54265c`-`0x542856`).
 fn learned_spell(
     spell_id: u32,
-    actions: &mut PlayerActions,
+    (actions, bar): (&mut PlayerActions, &mut crate::ui_action::ActionSlots),
     spells: Option<&Spells>,
-    errors: &mut UiErrorKeys,
+    errors: &mut dyn LearnOut,
     tab_flash: &mut LearnedInTab,
     learner: Option<Learner>,
     net: &NetCommands,
@@ -1155,9 +1325,11 @@ fn learned_spell(
     let packed = spell_id | (u32::from(ACTION_KIND_SPELL) << 24);
     let display = spells.and_then(|s| s.catalog.get(spell_id));
     if let (Some(spells), Some(display)) = (spells, display) {
-        for slot in learn_place::lower_rank_slots(actions, &spells.catalog, display) {
+        for slot in learn_place::lower_rank_slots(bar, &spells.catalog, display) {
             info!("net: bar slot {slot} rank-replaced by learned spell {spell_id}");
-            actions.write_slot(slot, packed, net);
+            if bar.write_slot(slot, packed, net) {
+                errors.slot_changed(slot);
+            }
         }
     }
     if let Some(d) = display {
@@ -1180,12 +1352,31 @@ fn learned_spell(
     if let (Some(spells), Some(display)) = (spells, display) {
         if learn_place::auto_place_allowed(display, learner.level) {
             let page = learn_place::auto_place_page(display, learner, &spells.forms);
-            if let Some(slot) = learn_place::first_empty_slot(actions, page) {
+            if let Some(slot) = learn_place::first_empty_slot(bar, page) {
                 info!("net: learned spell {spell_id} placed on bar slot {slot} (page {page})");
-                actions.write_slot(slot, packed, net);
+                if bar.write_slot(slot, packed, net) {
+                    errors.slot_changed(slot);
+                }
             }
         }
     }
+}
+
+/// Where a learn's writes signal, in its order: a bar slot it wrote (`0x5aae80`) and its line.
+trait LearnOut: crate::ui_action::signals::SignalSink {
+    fn slot_changed(&mut self, slot: u8);
+}
+
+impl LearnOut for crate::ui_script::live::UiEvents {
+    fn slot_changed(&mut self, slot: u8) {
+        crate::ui_action::slots::changed_in_turn(self, slot);
+    }
+}
+
+/// A test's record of the lines; the slots are read off the bar.
+#[cfg(test)]
+impl LearnOut for crate::ui_action::signals::LinesSeen {
+    fn slot_changed(&mut self, _: u8) {}
 }
 
 /// `Attributes & 0x80`: the registrar's first exit (`0x54265c`).
@@ -1197,7 +1388,11 @@ const ATTR_EX4_NOT_IN_SPELLBOOK: u32 = 0x8000;
 /// and whether it carries the rank, is [`benilla_formats::SpellDisplay::learn_announcement`]'s. Ids
 /// `0x37`/`0x38`/`0x39` are chat type 10 rows, so all three land on the system channel. An unknown
 /// id says nothing, the registrar's bail.
-fn announce_learn(spell_id: u32, spells: Option<&Spells>, errors: &mut UiErrorKeys) {
+fn announce_learn(
+    spell_id: u32,
+    spells: Option<&Spells>,
+    errors: &mut dyn crate::ui_action::signals::SignalSink,
+) {
     let Some(display) = spells.and_then(|s| s.catalog.get(spell_id)) else {
         return;
     };
@@ -1210,7 +1405,7 @@ fn announce_learn(spell_id: u32, spells: Option<&Spells>, errors: &mut UiErrorKe
         // The recipe arm pushes the bare name: it returns before the rank composer.
         LearnAnnouncement::Recipe => ("ERR_LEARN_RECIPE_S", display.name.clone()),
     };
-    errors.0.push(UiError::s(key, arg));
+    errors.line(UiError::s(key, arg));
 }
 
 /// `SMSG_REMOVED_SPELL`: the spell leaves the book. A talent wipe arrives as these (vmangos
@@ -1226,7 +1421,7 @@ fn removed_spell(
     spell_id: u32,
     actions: &mut PlayerActions,
     spells: Option<&Spells>,
-    errors: &mut UiErrorKeys,
+    errors: &mut dyn crate::ui_action::signals::SignalSink,
 ) {
     debug!("net: removed spell {spell_id}");
     if actions.spells.remove(&spell_id) {
@@ -1238,16 +1433,18 @@ fn removed_spell(
 /// `ERR_SPELL_UNLEARNED_S` with the bare name: the reference pushes `SpellRec+0x1e0` and this path
 /// has no rank composer. Which spells say it is
 /// [`benilla_formats::SpellDisplay::announces_unlearn`]'s.
-fn announce_unlearn(spell_id: u32, spells: Option<&Spells>, errors: &mut UiErrorKeys) {
+fn announce_unlearn(
+    spell_id: u32,
+    spells: Option<&Spells>,
+    errors: &mut dyn crate::ui_action::signals::SignalSink,
+) {
     let Some(display) = spells.and_then(|s| s.catalog.get(spell_id)) else {
         return;
     };
     if !display.announces_unlearn() {
         return;
     }
-    errors
-        .0
-        .push(UiError::s("ERR_SPELL_UNLEARNED_S", display.name.clone()));
+    errors.line(UiError::s("ERR_SPELL_UNLEARNED_S", display.name.clone()));
 }
 
 /// `SMSG_SUPERCEDED_SPELL`: the new rank replaces the old in the book. The bar follows from the
@@ -1258,7 +1455,7 @@ fn superceded_spell(
     new_spell_id: u32,
     actions: &mut PlayerActions,
     spells: Option<&Spells>,
-    errors: &mut UiErrorKeys,
+    errors: &mut dyn crate::ui_action::signals::SignalSink,
     tab_flash: &mut LearnedInTab,
 ) {
     debug!("net: superceded spell {old_spell_id} -> {new_spell_id}");
@@ -1278,11 +1475,9 @@ fn cast_result(
     (spell_id, cast_count, wire_reason): (u32, u8, u8),
     success: bool,
     reason: Option<u8>,
-    [arg, arg2]: [Option<u32>; 2],
     commands: &mut Commands,
     self_guid: &SelfGuid,
     index: &GuidIndex,
-    cast_errors: &mut CastErrors,
     casting: &Query<&Casting>,
     cast_events: &mut MessageWriter<CastEvent>,
     pending: &mut PendingCast,
@@ -1292,11 +1487,12 @@ fn cast_result(
     spells: Option<&Spells>,
     net: &crate::net::NetCommands,
     seq: u64,
+    sink: &mut dyn crate::ui_action::signals::SignalSink,
 ) -> Option<u32> {
     debug!("net: cast result — spell {spell_id} success={success} reason={reason:?}");
     // Is this the reply to our outstanding cast? Read before either arm clears the guard: both
     // clears are the reference's one.
-    let in_flight = pending.committed(Instant::now()) == Some(spell_id);
+    let in_flight = pending.find(spell_id, cast_count).is_some();
     if !success {
         // The cast-failed handler clears the GCD armed at send, and the bit-25 revert below drops a
         // parked record; the spell's own recovery starts at SPELL_GO, which a failed cast never
@@ -1324,7 +1520,13 @@ fn cast_result(
         }
         let self_e = self_guid.0.and_then(|g| index.0.get(&g)).copied();
         if auto_repeat.0 == Some(spell_id) && reason != Some(0x17) {
-            crate::creature_anim::cancel_auto_repeat_local(self_e, auto_repeat, commands, net);
+            crate::creature_anim::cancel_auto_repeat_local(
+                self_e,
+                auto_repeat,
+                commands,
+                net,
+                sink,
+            );
         }
         // Only the failure of the cast the bar shows (keyed to our `Casting`) red-fades it: a
         // pre-start rejection opened no bar, and a proc's failure names another spell.
@@ -1339,22 +1541,8 @@ fn cast_result(
         // The in-flight guard opens either way. A queued on-next-swing strike dies here too: the
         // server's melee-slot interrupt (vmangos `Spell::cancel` on the preparing slot) arrives as
         // a failure.
-        pending.clear_if(spell_id);
+        pending.release(spell_id, cast_count);
         queued_melee.clear_if(spell_id);
-        // The red line is independent of the bar: a pre-start failure still shows it.
-        if let Some(reason) = reason {
-            if !dont_report {
-                cast_errors.0.push(crate::ui_action::CastFail {
-                    spell_id,
-                    reason,
-                    arg,
-                    arg2,
-                    // `SMSG_CAST_FAILED` is addressed to the caster, and this handler is ours.
-                    caster: crate::ui_action::Caster::Player,
-                    redisplay: false,
-                });
-            }
-        }
         // Our cast died (vmangos never sends `SMSG_SPELL_FAILURE`): end the self avatar's cast
         // state and precast hold, keyed by spell id.
         if let Some(e) = self_e {
@@ -1386,7 +1574,7 @@ fn cast_result(
     //   swing timer; with no record to refresh, we send nothing.
     // The chained spell is returned; `on_cast_result` hands it to the ladder in the same call.
     if in_flight {
-        pending.clear_if(spell_id);
+        pending.release(spell_id, cast_count);
         if let Some(next) = spells
             .and_then(|s| s.catalog.get(spell_id))
             .map(|d| d.modal_next_spell)
@@ -1414,8 +1602,7 @@ fn spell_start(
     casting: &Query<&Casting>,
     cast_events: &mut MessageWriter<CastEvent>,
     self_guid: &SelfGuid,
-    cast_bar: &mut CastBarFeed,
-    pending: &mut PendingCast,
+    ui: &mut crate::ui_script::live::UiEvents,
     spells: Option<&crate::ui_action::Spells>,
     seq: u64,
 ) {
@@ -1464,7 +1651,7 @@ fn spell_start(
     // A hidden start (`castFlags & 1`) skips the cast state, precast and UI start (`0x80694e`).
     let hidden = cast_flags & 0x1 != 0;
     // Every caster's start reaches the unit-cast feed, which applies the event gate.
-    cast_bar.0.push(CastBarEdge::Start {
+    ui.cast_edge(CastBarEdge::Start {
         caster,
         spell_id,
         cast_count,
@@ -1472,9 +1659,9 @@ fn spell_start(
         immunities,
         hidden,
     });
-    if self_guid.0 == Some(caster) && cast_time_ms > 0 {
-        // The real cast time replaces the guard's send-time deadline, ranged casts included.
-        pending.refine(cast_time_ms, Instant::now());
+    // Our cast's start visuals end in the selection update (`0x806961`, `0x805330`).
+    if self_guid.0 == Some(caster) && cast_count != 0 && !hidden {
+        crate::ui_action::signals::selection(ui);
     }
     if let Some(&e) = index.0.get(&caster).filter(|_| !hidden) {
         let fresh = Casting {
@@ -1597,7 +1784,7 @@ fn spell_go(
     go_targets: &mut MessageWriter<SpellGoTargets>,
     self_guid: &SelfGuid,
     stores: &Query<&mut ObjectStore>,
-    cast_bar: &mut CastBarFeed,
+    ui: &mut crate::ui_script::live::UiEvents,
     pending: &mut PendingCast,
     queued_melee: &mut QueuedMeleeSpell,
     go_lid: &mut MessageWriter<crate::go_anim::GoLidOpen>,
@@ -1634,11 +1821,11 @@ fn spell_go(
     let (cooldowns, spells, items, net_commands, pet_bar, spell_mods) = cooldown_ctx;
     if !transports_here {
         if self_guid.0 == Some(caster) {
-            pending.clear_if(spell_id);
+            pending.release(spell_id, cast_count);
             queued_melee.clear_if(spell_id);
         }
         if pet_bar.has_bar() && pet_bar.spells.pet_guid == caster {
-            pet_bar.pending_cast = None;
+            pending.release(spell_id, cast_count);
         }
         // The caster's cast state stays; the next start or end clears it (`0x805330`, `0x7fecc0`).
         if let Some(&e) = index.0.get(&caster) {
@@ -1654,7 +1841,7 @@ fn spell_go(
         return;
     }
     // Every caster's launch reaches the unit-cast feed (`0x80e763`).
-    cast_bar.0.push(CastBarEdge::Go {
+    ui.cast_edge(CastBarEdge::Go {
         caster,
         spell_id,
         cast_count,
@@ -1709,7 +1896,7 @@ fn spell_go(
         if *crate::net::CAST_TRACE {
             info!("cast-trace: RECV SPELL_GO — spell {spell_id} (self); completes_bar={completes_our_cast}");
         }
-        pending.clear_if(spell_id);
+        pending.release(spell_id, cast_count);
         // The queued strike fired on this swing: the queue opens here, like the in-flight finish.
         queued_melee.clear_if(spell_id);
 
@@ -1734,6 +1921,7 @@ fn spell_go(
                     sheath,
                     commands,
                     net_commands,
+                    ui,
                 );
             }
         }
@@ -1775,6 +1963,13 @@ fn spell_go(
                 }
             }
         }
+        // The insert's signals, the usable update for an on-hold one (`0x80fa30`-`0x80fa40`,
+        // `0x80fc32`-`0x80fc42`).
+        crate::ui_action::signals::cooldown_site(
+            ui,
+            display.is_some_and(|d| d.cooldown_on_event()),
+            crate::ui_action::signals::Tail::Bags,
+        );
         if benilla_assets::trace::enabled() {
             if let Some(d) = display {
                 let (recovery_ms, category_ms) = spell_mods.spell_cooldowns(d, ranged_ms);
@@ -1790,7 +1985,7 @@ fn spell_go(
     }
     // The pet leg of the same insert: an independent `if`, not an else.
     if pet_bar.has_bar() && pet_bar.spells.pet_guid == caster {
-        pet_bar.pending_cast = None;
+        pending.release(spell_id, cast_count);
     }
     if let Some(d) = display.filter(|_| pet_go_cooldown(caster, self_guid, index, stores)) {
         // No ranged pad: the reference is called on the self leg only. Op 11 still applies to both
@@ -1798,9 +1993,13 @@ fn spell_go(
         pet_bar
             .cooldowns
             .start_spell(spell_id, d, 0, now, Some(spell_mods));
-        // The flush that follows fires off the list's generation, which the insert bumped:
-        // `ACTIONBAR_UPDATE_COOLDOWN`, `SPELL_UPDATE_COOLDOWN`, `PET_BAR_UPDATE_COOLDOWN`, and no
-        // `PET_BAR_UPDATE`.
+        // The pet's insert signals the same way, then the pet bar's (`0x80fe3b`-`0x80fe4b`), and
+        // no `PET_BAR_UPDATE`.
+        crate::ui_action::signals::cooldown_site(
+            ui,
+            d.cooldown_on_event(),
+            crate::ui_action::signals::Tail::Pet,
+        );
         if benilla_assets::trace::enabled() {
             let (recovery_ms, category_ms) = spell_mods.spell_cooldowns(d, 0);
             benilla_assets::trace::line(
@@ -1819,6 +2018,11 @@ fn spell_go(
     {
         cooldowns.collect(now);
         pet_bar.cooldowns.collect(now);
+    }
+    // Our cast's finish runs the selection update last, a hidden go aside (`0x80fe86`-`0x80fe9d`,
+    // `0x8054f0`).
+    if self_guid.0 == Some(caster) && cast_count != 0 && cast_flags & 1 == 0 {
+        crate::ui_action::signals::selection(ui);
     }
     // The end clears the held state of this spell and count alone (`0x7fed81`).
     if let Some(&e) = index.0.get(&caster) {
@@ -1926,7 +2130,7 @@ fn spell_failed_other(
         if *crate::net::CAST_TRACE {
             info!("cast-trace: RECV SPELL_FAILED_OTHER — spell {spell_id} (self); interrupts_bar={interrupts_our_cast}");
         }
-        pending.clear_if(spell_id);
+        pending.release(spell_id, cast_count);
         // The melee-slot interrupt's other half, beside the failing CAST_RESULT.
         queued_melee.clear_if(spell_id);
     }
@@ -1954,23 +2158,17 @@ fn spell_failed_other(
     }
 }
 
-/// `SMSG_SPELL_DELAYED`: pushback. Any caster's reaches the unit-cast feed, which slides the
-/// cast's window (`UNIT_SPELLCAST_DELAYED`); our own also holds the in-flight guard longer.
+/// `SMSG_SPELL_DELAYED`: pushback. Any caster's reaches the unit-cast feed, which slides the cast's window (`UNIT_SPELLCAST_DELAYED`).
 fn spell_delayed(
     caster: u64,
     delay_ms: u32,
     self_guid: &SelfGuid,
-    cast_bar: &mut CastBarFeed,
-    pending: &mut PendingCast,
+    ui: &mut crate::ui_script::live::UiEvents,
 ) {
     debug!("net: spell delayed by {caster:#x} (+{delay_ms}ms pushback)");
-    cast_bar.0.push(CastBarEdge::Delayed { caster, delay_ms });
-    if self_guid.0 == Some(caster) {
-        if *crate::net::CAST_TRACE {
-            info!("cast-trace: RECV SPELL_DELAYED — +{delay_ms}ms pushback (bar extends, does NOT vanish)");
-        }
-        // The in-flight guard holds past the stretched end.
-        pending.delay(delay_ms, Instant::now());
+    ui.cast_edge(CastBarEdge::Delayed { caster, delay_ms });
+    if self_guid.0 == Some(caster) && *crate::net::CAST_TRACE {
+        info!("cast-trace: RECV SPELL_DELAYED — +{delay_ms}ms pushback (bar extends, does NOT vanish)");
     }
 }
 
@@ -1987,6 +2185,7 @@ fn cancel_auto_repeat(
     self_guid: &SelfGuid,
     index: &GuidIndex,
     commands: &mut Commands,
+    sink: &mut dyn crate::ui_action::signals::SignalSink,
 ) {
     let Some(&e) = index.0.get(&guid) else {
         debug!("net: cancel auto-repeat for {guid:#x}, not streamed — ignored");
@@ -1994,7 +2193,7 @@ fn cancel_auto_repeat(
     };
     debug!("net: cancel auto-repeat for {guid:#x}");
     if self_guid.0 == Some(guid) {
-        crate::creature_anim::clear_auto_repeat(Some(e), auto_repeat, commands);
+        crate::creature_anim::clear_auto_repeat(Some(e), auto_repeat, commands, sink);
     }
     crate::creature_anim::end_ranged_mode(e, commands);
 }
@@ -2098,7 +2297,7 @@ fn channel_start(
     spell_id: u32,
     duration_ms: u32,
     channel: &mut ActiveChannel,
-    feed: &mut CastBarFeed,
+    ui: &mut crate::ui_script::live::UiEvents,
 ) {
     if duration_ms as i32 <= 0 || !streamed {
         debug!("net: channel start {spell_id} on {caster:#x} for {duration_ms} ms dropped");
@@ -2107,7 +2306,7 @@ fn channel_start(
     if own {
         channel.start(spell_id, duration_ms, Instant::now());
     }
-    feed.0.push(CastBarEdge::ChannelStart {
+    ui.cast_edge(CastBarEdge::ChannelStart {
         caster,
         spell_id,
         duration_ms,
@@ -2120,12 +2319,12 @@ fn channel_update(
     own: bool,
     remaining_ms: u32,
     channel: &mut ActiveChannel,
-    feed: &mut CastBarFeed,
+    ui: &mut crate::ui_script::live::UiEvents,
 ) {
     if own {
         channel.update(remaining_ms, Instant::now());
     }
-    feed.0.push(CastBarEdge::ChannelUpdate {
+    ui.cast_edge(CastBarEdge::ChannelUpdate {
         caster,
         remaining_ms,
     });
@@ -2226,6 +2425,7 @@ mod tests {
                             &self_guid,
                             &index,
                             &mut commands,
+                            &mut Vec::new(),
                         );
                     },
                 )
@@ -2278,6 +2478,70 @@ mod tests {
         spells
     }
 
+    /// A learn's slot writes and its line, in the order they were raised.
+    #[derive(Default)]
+    struct LearnOrder(Vec<String>);
+
+    impl crate::ui_action::signals::SignalSink for LearnOrder {
+        fn signal(&mut self, _: &'static str) {}
+
+        fn line(&mut self, line: UiError) {
+            self.0.push(line.key.to_string());
+        }
+    }
+
+    impl LearnOut for LearnOrder {
+        fn slot_changed(&mut self, slot: u8) {
+            self.0.push(format!("slot {slot}"));
+        }
+    }
+
+    /// The rank below leaves its button for the new rank (`0x5aafd0`) before the registrar
+    /// announces the learn (`0x542030`), so the slot's signal comes ahead of the line.
+    #[test]
+    fn a_rank_up_signals_its_button_before_the_line() {
+        let mut spells = Spells::empty_for_tests();
+        spells.catalog = benilla_formats::SpellCatalog::from_displays(
+            [(133, "Rank 1"), (143, "Rank 2")]
+                .into_iter()
+                .map(|(id, rank)| {
+                    (
+                        id,
+                        benilla_formats::SpellDisplay {
+                            id,
+                            name: "Fireball".to_string(),
+                            rank: Some(rank.to_string()),
+                            attributes: 0x10000,
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let mut bar = crate::ui_action::ActionSlots::default();
+        bar.buttons.insert(
+            0,
+            ActionButton {
+                slot: 0,
+                action: 133,
+                kind: ACTION_KIND_SPELL,
+            },
+        );
+        let mut order = LearnOrder::default();
+        learned_spell(
+            143,
+            (&mut PlayerActions::default(), &mut bar),
+            Some(&spells),
+            &mut order,
+            &mut LearnedInTab::default(),
+            live(),
+            &no_bar(),
+            &Default::default(),
+        );
+        assert_eq!(bar.buttons[&0].action, 143, "the rank replaced in place");
+        assert_eq!(order.0, ["slot 0", "ERR_LEARN_SPELL_S"]);
+    }
+
     /// Heroic Strike carries `SPELL_ATTR_ABILITY`, so the reference lands on `0x38`, the ability
     /// wording, with the argText `"%s (%s)"`.
     #[test]
@@ -2292,11 +2556,12 @@ mod tests {
             },
         );
         let mut actions = PlayerActions::default();
-        let mut errors = UiErrorKeys::default();
+        let mut bar = crate::ui_action::ActionSlots::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         let mut flash = LearnedInTab::default();
         learned_spell(
             78,
-            &mut actions,
+            (&mut actions, &mut bar),
             Some(&spells),
             &mut errors,
             &mut flash,
@@ -2324,10 +2589,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut errors = UiErrorKeys::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         learned_spell(
             133,
-            &mut PlayerActions::default(),
+            (
+                &mut PlayerActions::default(),
+                &mut crate::ui_action::ActionSlots::default(),
+            ),
             Some(&spells),
             &mut errors,
             &mut LearnedInTab::default(),
@@ -2347,10 +2615,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut errors = UiErrorKeys::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         learned_spell(
             2550,
-            &mut PlayerActions::default(),
+            (
+                &mut PlayerActions::default(),
+                &mut crate::ui_action::ActionSlots::default(),
+            ),
             Some(&spells),
             &mut errors,
             &mut LearnedInTab::default(),
@@ -2396,7 +2667,7 @@ mod tests {
         );
         let mut actions = PlayerActions::default();
         actions.spells.insert(78);
-        let mut errors = UiErrorKeys::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         let mut flash = LearnedInTab::default();
         superceded_spell(
             78,
@@ -2428,10 +2699,13 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut errors = UiErrorKeys::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         learned_spell(
             668,
-            &mut PlayerActions::default(),
+            (
+                &mut PlayerActions::default(),
+                &mut crate::ui_action::ActionSlots::default(),
+            ),
             Some(&spells),
             &mut errors,
             &mut LearnedInTab::default(),
@@ -2441,7 +2715,10 @@ mod tests {
         );
         learned_spell(
             99999,
-            &mut PlayerActions::default(),
+            (
+                &mut PlayerActions::default(),
+                &mut crate::ui_action::ActionSlots::default(),
+            ),
             Some(&spells),
             &mut errors,
             &mut LearnedInTab::default(),
@@ -2458,10 +2735,11 @@ mod tests {
     #[test]
     fn learned_spell_adds_to_the_book_once() {
         let mut actions = PlayerActions::default();
-        let mut errors = UiErrorKeys::default();
+        let mut bar = crate::ui_action::ActionSlots::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         learned_spell(
             6603,
-            &mut actions,
+            (&mut actions, &mut bar),
             None,
             &mut errors,
             &mut LearnedInTab::default(),
@@ -2475,7 +2753,7 @@ mod tests {
         actions.dirty = false;
         learned_spell(
             6603,
-            &mut actions,
+            (&mut actions, &mut bar),
             None,
             &mut errors,
             &mut LearnedInTab::default(),
@@ -2530,7 +2808,8 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
         let mut actions = PlayerActions::default();
-        actions.buttons.insert(
+        let mut bar = crate::ui_action::ActionSlots::default();
+        bar.buttons.insert(
             0,
             ActionButton {
                 slot: 0,
@@ -2538,12 +2817,12 @@ mod tests {
                 kind: ACTION_KIND_SPELL,
             },
         );
-        let mut errors = UiErrorKeys::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         let mut flash = LearnedInTab::default();
 
         learned_spell(
             133,
-            &mut actions,
+            (&mut actions, &mut bar),
             Some(&spells),
             &mut errors,
             &mut flash,
@@ -2551,7 +2830,7 @@ mod tests {
             &net,
             &Default::default(),
         );
-        assert_eq!(actions.buttons[&1].action, 133, "slot 1 is the first empty");
+        assert_eq!(bar.buttons[&1].action, 133, "slot 1 is the first empty");
         assert_eq!(
             sent(&rx),
             vec![(1, 133)],
@@ -2564,7 +2843,7 @@ mod tests {
         actions.dirty = false;
         learned_spell(
             168,
-            &mut actions,
+            (&mut actions, &mut bar),
             Some(&spells),
             &mut errors,
             &mut flash,
@@ -2572,14 +2851,14 @@ mod tests {
             &net,
             &Default::default(),
         );
-        assert!(!actions.buttons.contains_key(&2));
+        assert!(!bar.buttons.contains_key(&2));
         assert!(sent(&rx).is_empty());
 
         // Rank 2: the rank-1 button becomes rank 2 (`0x5aafd0` runs before the registrar), and
         // the rank gate (`< 2`) places nothing more.
         learned_spell(
             143,
-            &mut actions,
+            (&mut actions, &mut bar),
             Some(&spells),
             &mut errors,
             &mut flash,
@@ -2587,16 +2866,16 @@ mod tests {
             &net,
             &Default::default(),
         );
-        assert_eq!(actions.buttons[&1].action, 143);
-        assert!(!actions.buttons.contains_key(&2));
+        assert_eq!(bar.buttons[&1].action, 143);
+        assert!(!bar.buttons.contains_key(&2));
         assert_eq!(sent(&rx), vec![(1, 143)]);
 
         // At level 11 the level gate closes: the book grows, the bar does not.
         actions.spells.clear();
-        actions.buttons.remove(&1);
+        bar.buttons.remove(&1);
         learned_spell(
             133,
-            &mut actions,
+            (&mut actions, &mut bar),
             Some(&spells),
             &mut errors,
             &mut flash,
@@ -2609,7 +2888,7 @@ mod tests {
             &Default::default(),
         );
         assert!(actions.spells.contains(&133));
-        assert!(!actions.buttons.contains_key(&1));
+        assert!(!bar.buttons.contains_key(&1));
         assert!(sent(&rx).is_empty());
     }
 
@@ -2683,11 +2962,12 @@ mod tests {
             (1006, Some("ERR_LEARN_SPELL_S"), true),
         ] {
             let mut actions = PlayerActions::default();
-            let mut errors = UiErrorKeys::default();
+            let mut bar = crate::ui_action::ActionSlots::default();
+            let mut errors = crate::ui_action::signals::LinesSeen::default();
             let mut flash = LearnedInTab::default();
             learned_spell(
                 id,
-                &mut actions,
+                (&mut actions, &mut bar),
                 Some(&spells),
                 &mut errors,
                 &mut flash,
@@ -2698,7 +2978,7 @@ mod tests {
             assert!(actions.spells.contains(&id), "{id} joins the book");
             assert_eq!(errors.0.first().map(|e| e.key), line, "{id}'s line");
             assert_eq!(!flash.0.is_empty(), shown, "{id}'s tab flash");
-            assert_eq!(actions.buttons.contains_key(&0), shown, "{id}'s button");
+            assert_eq!(bar.buttons.contains_key(&0), shown, "{id}'s button");
         }
     }
 
@@ -2716,11 +2996,12 @@ mod tests {
         );
         let (tx, rx) = crossbeam_channel::unbounded();
         let mut actions = PlayerActions::default();
-        let mut errors = UiErrorKeys::default();
+        let mut bar = crate::ui_action::ActionSlots::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         let mut flash = LearnedInTab::default();
         learned_spell(
             133,
-            &mut actions,
+            (&mut actions, &mut bar),
             Some(&spells),
             &mut errors,
             &mut flash,
@@ -2729,7 +3010,7 @@ mod tests {
             &Default::default(),
         );
         assert!(actions.spells.contains(&133));
-        assert!(actions.buttons.is_empty(), "no button");
+        assert!(bar.buttons.is_empty(), "no button");
         assert!(sent(&rx).is_empty());
         assert!(errors.0.is_empty(), "no line");
         assert!(flash.0.is_empty(), "no flash");
@@ -2739,8 +3020,9 @@ mod tests {
     #[test]
     fn superceded_spell_swaps_the_book_and_leaves_the_bar_to_the_rank_pass() {
         let mut actions = PlayerActions::default();
+        let mut bar = crate::ui_action::ActionSlots::default();
         actions.spells.insert(78); // Heroic Strike rank 1, known
-        actions.buttons.insert(
+        bar.buttons.insert(
             0,
             ActionButton {
                 slot: 0,
@@ -2754,7 +3036,7 @@ mod tests {
             284,
             &mut actions,
             None,
-            &mut UiErrorKeys::default(),
+            &mut crate::ui_action::signals::LinesSeen::default(),
             &mut LearnedInTab::default(),
         );
 
@@ -2767,7 +3049,7 @@ mod tests {
             "the new rank enters the book"
         );
         assert_eq!(
-            actions.buttons[&0].action, 78,
+            bar.buttons[&0].action, 78,
             "the bar follows from the book, not from here"
         );
         assert!(actions.dirty, "…and `dirty` is what makes it follow");
@@ -2792,7 +3074,7 @@ mod tests {
             .add_message::<crate::player::StandStateRequest>()
             .init_resource::<GuidIndex>()
             .init_resource::<SelfGuid>()
-            .init_resource::<CastBarFeed>()
+            .init_resource::<crate::ui_script::live::UiEvents>()
             .init_resource::<PendingCast>()
             .init_resource::<QueuedMeleeSpell>()
             .init_resource::<Cooldowns>()
@@ -2834,7 +3116,7 @@ mod tests {
                           mut go_targets: MessageWriter<SpellGoTargets>,
                           self_guid: Res<SelfGuid>,
                           stores: Query<&mut ObjectStore>,
-                          mut cast_bar: ResMut<CastBarFeed>,
+                          mut cast_bar: ResMut<crate::ui_script::live::UiEvents>,
                           mut pending: ResMut<PendingCast>,
                           mut queued_melee: ResMut<QueuedMeleeSpell>,
                           mut go_lid: MessageWriter<GoLidOpen>,
@@ -2901,7 +3183,9 @@ mod tests {
             cast_flags: 0,
         };
         assert_eq!(
-            app.world().resource::<CastBarFeed>().0,
+            app.world()
+                .resource::<crate::ui_script::live::UiEvents>()
+                .cast_edges(),
             vec![go(6136), go(133)]
         );
 
@@ -2914,17 +3198,16 @@ mod tests {
             listed: true,
             hidden: false,
         });
-        app.world_mut()
-            .resource_mut::<PendingCast>()
-            .arm(10, Instant::now(), true);
+        app.world_mut().resource_mut::<PendingCast>().arm(10, 0);
         fire_go(&mut app, 10, false);
-        assert_eq!(app.world().resource::<CastBarFeed>().0.len(), 2);
         assert_eq!(
             app.world()
-                .resource::<PendingCast>()
-                .committed(Instant::now()),
-            None
+                .resource::<crate::ui_script::live::UiEvents>()
+                .cast_edges()
+                .len(),
+            2
         );
+        assert_eq!(app.world().resource::<PendingCast>().committed(), None);
         // Held, but its pending cast is no longer listed (`0x805f30`).
         assert_eq!(
             app.world()
@@ -2942,8 +3225,7 @@ mod tests {
                           casting: Query<&Casting>,
                           mut cast_events: MessageWriter<CastEvent>,
                           self_guid: Res<SelfGuid>,
-                          mut cast_bar: ResMut<CastBarFeed>,
-                          mut pending: ResMut<PendingCast>| {
+                          mut cast_bar: ResMut<crate::ui_script::live::UiEvents>| {
                         spell_start(
                             10,
                             count,
@@ -2959,7 +3241,6 @@ mod tests {
                             &mut cast_events,
                             &self_guid,
                             &mut cast_bar,
-                            &mut pending,
                             None,
                             2,
                         );
@@ -3020,8 +3301,8 @@ mod tests {
         app.add_message::<CastEvent>()
             .init_resource::<GuidIndex>()
             .init_resource::<SelfGuid>()
-            .init_resource::<CastErrors>()
-            .init_resource::<CastBarFeed>()
+            .init_resource::<crate::ui_action::RefusalsSeen>()
+            .init_resource::<crate::ui_script::live::UiEvents>()
             .init_resource::<PendingCast>()
             .init_resource::<QueuedMeleeSpell>()
             .init_resource::<Cooldowns>()
@@ -3049,8 +3330,7 @@ mod tests {
                           casting: Query<&Casting>,
                           mut cast_events: MessageWriter<CastEvent>,
                           self_guid: Res<SelfGuid>,
-                          mut cast_bar: ResMut<CastBarFeed>,
-                          mut pending: ResMut<PendingCast>| {
+                          mut cast_bar: ResMut<crate::ui_script::live::UiEvents>| {
                         spell_start(
                             10,
                             count,
@@ -3066,7 +3346,6 @@ mod tests {
                             &mut cast_events,
                             &self_guid,
                             &mut cast_bar,
-                            &mut pending,
                             None,
                             2,
                         );
@@ -3082,7 +3361,6 @@ mod tests {
                     move |mut commands: Commands,
                           self_guid: Res<SelfGuid>,
                           index: Res<GuidIndex>,
-                          mut cast_errors: ResMut<CastErrors>,
                           casting: Query<&Casting>,
                           mut cast_events: MessageWriter<CastEvent>,
                           mut pending: ResMut<PendingCast>,
@@ -3093,11 +3371,9 @@ mod tests {
                             (spell, count, 0x1e),
                             false,
                             Some(0x1e),
-                            [None; 2],
                             &mut commands,
                             &self_guid,
                             &index,
-                            &mut cast_errors,
                             &casting,
                             &mut cast_events,
                             &mut pending,
@@ -3107,6 +3383,7 @@ mod tests {
                             None,
                             &crate::net::NetCommands(tx.clone()),
                             1,
+                            &mut Vec::new(),
                         );
                     },
                 )
@@ -3160,7 +3437,7 @@ mod tests {
     fn a_channel_arms_the_mirror_and_feeds_its_edges() {
         const BLIZZARD: u32 = 10;
         let t0 = Instant::now();
-        let mut feed = CastBarFeed::default();
+        let mut feed = crate::ui_script::live::UiEvents::default();
         let mut channel = ActiveChannel::default();
         channel_start(10, true, true, BLIZZARD, 8_000, &mut channel, &mut feed);
         assert_eq!(
@@ -3177,7 +3454,7 @@ mod tests {
         channel_start(0x42, false, true, BLIZZARD, 8_000, &mut channel, &mut feed);
         assert_eq!(channel.current(t0 + Duration::from_secs(1)), None);
         assert_eq!(
-            feed.0,
+            feed.cast_edges(),
             vec![
                 CastBarEdge::ChannelStart {
                     caster: 10,
@@ -3249,7 +3526,7 @@ mod tests {
             .add_message::<crate::player::StandStateRequest>()
             .init_resource::<GuidIndex>()
             .init_resource::<SelfGuid>()
-            .init_resource::<CastBarFeed>()
+            .init_resource::<crate::ui_script::live::UiEvents>()
             .init_resource::<PendingCast>()
             .init_resource::<QueuedMeleeSpell>()
             .init_resource::<Cooldowns>()
@@ -3291,7 +3568,7 @@ mod tests {
                       mut go_targets: MessageWriter<SpellGoTargets>,
                       self_guid: Res<SelfGuid>,
                       stores: Query<&mut ObjectStore>,
-                      mut cast_bar: ResMut<CastBarFeed>,
+                      mut cast_bar: ResMut<crate::ui_script::live::UiEvents>,
                       mut pending: ResMut<PendingCast>,
                       mut queued_melee: ResMut<QueuedMeleeSpell>,
                       mut go_lid: MessageWriter<GoLidOpen>,
@@ -3461,7 +3738,7 @@ mod tests {
             .add_message::<crate::player::StandStateRequest>()
             .init_resource::<GuidIndex>()
             .init_resource::<SelfGuid>()
-            .init_resource::<CastBarFeed>()
+            .init_resource::<crate::ui_script::live::UiEvents>()
             .init_resource::<PendingCast>()
             .init_resource::<QueuedMeleeSpell>()
             .init_resource::<Cooldowns>()
@@ -3502,7 +3779,7 @@ mod tests {
                       mut go_targets: MessageWriter<SpellGoTargets>,
                       self_guid: Res<SelfGuid>,
                       stores: Query<&mut ObjectStore>,
-                      mut cast_bar: ResMut<CastBarFeed>,
+                      mut cast_bar: ResMut<crate::ui_script::live::UiEvents>,
                       mut pending: ResMut<PendingCast>,
                       mut queued_melee: ResMut<QueuedMeleeSpell>,
                       mut go_lid: MessageWriter<GoLidOpen>,
@@ -3591,9 +3868,9 @@ mod tests {
         app.add_message::<CastEvent>()
             .init_resource::<GuidIndex>()
             .init_resource::<SelfGuid>()
-            .init_resource::<CastErrors>()
+            .init_resource::<crate::ui_action::RefusalsSeen>()
             .init_resource::<crate::ui_action::UiErrorKeys>()
-            .init_resource::<CastBarFeed>()
+            .init_resource::<crate::ui_script::live::UiEvents>()
             .init_resource::<PendingCast>()
             .init_resource::<QueuedMeleeSpell>()
             .init_resource::<Cooldowns>()
@@ -3624,7 +3901,6 @@ mod tests {
                     move |mut commands: Commands,
                           self_guid: Res<SelfGuid>,
                           index: Res<GuidIndex>,
-                          mut cast_errors: ResMut<CastErrors>,
                           casting: Query<&Casting>,
                           mut cast_events: MessageWriter<CastEvent>,
                           mut pending: ResMut<PendingCast>,
@@ -3636,11 +3912,9 @@ mod tests {
                             (75, 0, 0),
                             false,
                             Some(reason),
-                            [None; 2],
                             &mut commands,
                             &self_guid,
                             &index,
-                            &mut cast_errors,
                             &casting,
                             &mut cast_events,
                             &mut pending,
@@ -3650,6 +3924,7 @@ mod tests {
                             None,
                             &net,
                             1,
+                            &mut Vec::new(),
                         );
                     },
                 )
@@ -3701,7 +3976,7 @@ mod tests {
         let mut actions = PlayerActions::default();
         actions.spells.extend([14522, 14788, 14789]);
 
-        let mut errors = UiErrorKeys::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         removed_spell(14788, &mut actions, None, &mut errors);
         assert!(!actions.spells.contains(&14788));
         assert!(actions.dirty);
@@ -3722,7 +3997,7 @@ mod tests {
             ..Default::default()
         };
 
-        let mut errors = UiErrorKeys::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         removed_spell(
             11069,
             &mut PlayerActions::default(),
@@ -3751,7 +4026,7 @@ mod tests {
             ),
             (0x80, 0, "DO_NOT_DISPLAY — the sign test"),
         ] {
-            let mut errors = UiErrorKeys::default();
+            let mut errors = crate::ui_action::signals::LinesSeen::default();
             removed_spell(
                 11069,
                 &mut PlayerActions::default(),
@@ -3762,7 +4037,7 @@ mod tests {
         }
 
         // An unknown id says nothing, like every other display path here.
-        let mut errors = UiErrorKeys::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         removed_spell(
             99999,
             &mut PlayerActions::default(),
@@ -3785,10 +4060,13 @@ mod tests {
             },
         );
 
-        let mut errors = UiErrorKeys::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         learned_spell(
             1234,
-            &mut PlayerActions::default(),
+            (
+                &mut PlayerActions::default(),
+                &mut crate::ui_action::ActionSlots::default(),
+            ),
             Some(&spells),
             &mut errors,
             &mut LearnedInTab::default(),
@@ -3799,7 +4077,7 @@ mod tests {
         assert_eq!(errors.0.len(), 1, "the learn block never reads castUI");
         assert_eq!(errors.0[0].key, "ERR_LEARN_SPELL_S");
 
-        let mut errors = UiErrorKeys::default();
+        let mut errors = crate::ui_action::signals::LinesSeen::default();
         removed_spell(
             1234,
             &mut PlayerActions::default(),
@@ -3860,7 +4138,7 @@ mod tests {
                 .add_message::<crate::player::StandStateRequest>()
                 .init_resource::<GuidIndex>()
                 .init_resource::<SelfGuid>()
-                .init_resource::<CastBarFeed>()
+                .init_resource::<crate::ui_script::live::UiEvents>()
                 .init_resource::<PendingCast>()
                 .init_resource::<QueuedMeleeSpell>()
                 .init_resource::<Cooldowns>()
@@ -3896,7 +4174,7 @@ mod tests {
                           mut go_targets: MessageWriter<SpellGoTargets>,
                           self_guid: Res<SelfGuid>,
                           stores: Query<&mut ObjectStore>,
-                          mut cast_bar: ResMut<CastBarFeed>,
+                          mut cast_bar: ResMut<crate::ui_script::live::UiEvents>,
                           mut pending: ResMut<PendingCast>,
                           mut queued_melee: ResMut<QueuedMeleeSpell>,
                           mut go_lid: MessageWriter<GoLidOpen>,
@@ -4041,10 +4319,10 @@ mod tests {
             app.add_message::<CastEvent>()
                 .init_resource::<GuidIndex>()
                 .init_resource::<SelfGuid>()
-                .init_resource::<CastErrors>()
+                .init_resource::<crate::ui_action::RefusalsSeen>()
                 .init_resource::<crate::ui_action::UiErrorKeys>()
                 .init_resource::<crate::ui_action::UiErrorKeys>()
-                .init_resource::<CastBarFeed>()
+                .init_resource::<crate::ui_script::live::UiEvents>()
                 .init_resource::<PendingCast>()
                 .init_resource::<QueuedMeleeSpell>()
                 .init_resource::<Cooldowns>()
@@ -4060,8 +4338,8 @@ mod tests {
             if let Some(id) = in_flight {
                 app.world_mut()
                     .resource_mut::<PendingCast>()
-                    // `guards: false`: a ranged hunter shot is recorded but does not guard.
-                    .arm(id, Instant::now(), false);
+                    // The answer names the record's spell and count 0.
+                    .arm(id, 0);
             }
             let (tx, _rx) = crossbeam_channel::unbounded();
             let cat = spells();
@@ -4071,7 +4349,6 @@ mod tests {
                     move |mut commands: Commands,
                           self_guid: Res<SelfGuid>,
                           index: Res<GuidIndex>,
-                          mut cast_errors: ResMut<CastErrors>,
                           casting: Query<&Casting>,
                           mut cast_events: MessageWriter<CastEvent>,
                           mut pending: ResMut<PendingCast>,
@@ -4083,11 +4360,9 @@ mod tests {
                             (spell_id, 0, 0),
                             success,
                             if success { None } else { Some(0x1b) },
-                            [None; 2],
                             &mut commands,
                             &self_guid,
                             &index,
-                            &mut cast_errors,
                             &casting,
                             &mut cast_events,
                             &mut pending,
@@ -4097,14 +4372,12 @@ mod tests {
                             Some(&cat),
                             &net,
                             1,
+                            &mut Vec::new(),
                         )
                     },
                 )
                 .unwrap();
-            let still_armed = app
-                .world()
-                .resource::<PendingCast>()
-                .in_flight(Instant::now());
+            let still_armed = app.world().resource::<PendingCast>().in_flight();
             (chained, still_armed)
         };
 
@@ -4148,6 +4421,7 @@ mod tests {
     #[test]
     fn a_set_table_bars_known_spells_and_listed_sets_only() {
         let mut actions = PlayerActions::default();
+        let mut bar = crate::ui_action::ActionSlots::default();
         actions.spells.insert(133);
         actions
             .equipment_sets
@@ -4158,7 +4432,7 @@ mod tests {
                 icon: String::new(),
                 items: [0; benilla_protocol::messages::EQUIPMENT_SET_SLOTS],
             });
-        actions.locked = true;
+        bar.locked = true;
         let table = vec![
             slot(0, 133, ACTION_KIND_SPELL),
             slot(1, 116, ACTION_KIND_SPELL),
@@ -4171,16 +4445,17 @@ mod tests {
             ACTION_BUTTONS_SET,
             table.clone(),
             true,
-            &mut actions,
+            (&actions, &mut bar),
             &NetCommands(tx),
+            &mut crate::ui_script::live::UiEvents::default(),
         );
-        let mut barred: Vec<u8> = actions.buttons.keys().copied().collect();
+        let mut barred: Vec<u8> = bar.buttons.keys().copied().collect();
         barred.sort_unstable();
         assert_eq!(barred, [0, 2, 4]);
         // Every other slot, empty ones included, is cleared on the server too.
         assert_eq!(rx.try_iter().count(), 144 - 3);
-        assert!(!actions.locked, "state 1 unlocks");
-        assert_eq!(actions.table, Some(table));
+        assert!(!bar.locked, "state 1 unlocks");
+        assert_eq!(bar.table, Some(table));
     }
 
     /// State 2 locks the writers; state 0 stores without barring, and the player's init bars a
@@ -4190,11 +4465,26 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
         let mut actions = PlayerActions::default();
-        action_buttons(ACTION_BUTTONS_LOCK, Vec::new(), false, &mut actions, &net);
-        assert!(!actions.locked, "no player, no lock");
-        action_buttons(ACTION_BUTTONS_LOCK, Vec::new(), true, &mut actions, &net);
-        actions.write_slot(5, 133, &net);
-        assert!(actions.buttons.is_empty() && rx.try_iter().next().is_none());
+        let mut bar = crate::ui_action::ActionSlots::default();
+        action_buttons(
+            ACTION_BUTTONS_LOCK,
+            Vec::new(),
+            false,
+            (&actions, &mut bar),
+            &net,
+            &mut crate::ui_script::live::UiEvents::default(),
+        );
+        assert!(!bar.locked, "no player, no lock");
+        action_buttons(
+            ACTION_BUTTONS_LOCK,
+            Vec::new(),
+            true,
+            (&actions, &mut bar),
+            &net,
+            &mut crate::ui_script::live::UiEvents::default(),
+        );
+        bar.write_slot(5, 133, &net);
+        assert!(bar.buttons.is_empty() && rx.try_iter().next().is_none());
 
         actions.spells.insert(133);
         let table = vec![
@@ -4206,21 +4496,19 @@ mod tests {
             benilla_protocol::messages::ACTION_BUTTONS_INIT,
             table,
             true,
-            &mut actions,
+            (&actions, &mut bar),
             &net,
+            &mut crate::ui_script::live::UiEvents::default(),
         );
-        assert!(actions.buttons.is_empty(), "state 0 only stores");
+        assert!(bar.buttons.is_empty(), "state 0 only stores");
 
         let mut app = App::new();
-        app.add_message::<crate::net::WorldEnterCascadeMessage>()
-            .insert_resource(actions)
-            .add_systems(Update, put_action_table_on_init);
-        app.world_mut()
-            .write_message(crate::net::WorldEnterCascadeMessage);
-        app.update();
+        app.insert_resource(actions);
+        app.insert_resource(bar);
+        put_action_table(app.world_mut());
         let mut barred: Vec<u8> = app
             .world()
-            .resource::<PlayerActions>()
+            .resource::<crate::ui_action::ActionSlots>()
             .buttons
             .keys()
             .copied()
@@ -4236,23 +4524,30 @@ mod tests {
         let (tx, rx) = crossbeam_channel::unbounded();
         let net = NetCommands(tx);
         let mut app = App::new();
-        app.add_message::<crate::net::WorldEnterCascadeMessage>()
-            .init_resource::<PlayerActions>()
-            .add_systems(Update, put_action_table_on_init);
+        app.init_resource::<PlayerActions>();
+        app.init_resource::<crate::ui_action::ActionSlots>();
         let end = app.world_mut().register_system(on_session_end);
         let enter = |app: &mut App, spells: &[u32], table: Vec<ActionButton>| {
             {
-                let mut actions = app.world_mut().resource_mut::<PlayerActions>();
+                let world = app.world_mut();
                 // AzerothCore's login sends state 1 before our player streams: stored, not barred.
-                actions.spells = spells.iter().copied().collect();
-                action_buttons(ACTION_BUTTONS_SET, table, false, &mut actions, &net);
+                world.resource_mut::<PlayerActions>().spells = spells.iter().copied().collect();
+                world.resource_scope(|world, mut bar: Mut<crate::ui_action::ActionSlots>| {
+                    let actions = world.resource::<PlayerActions>();
+                    action_buttons(
+                        ACTION_BUTTONS_SET,
+                        table,
+                        false,
+                        (actions, &mut bar),
+                        &net,
+                        &mut crate::ui_script::live::UiEvents::default(),
+                    );
+                });
             }
-            app.world_mut()
-                .write_message(crate::net::WorldEnterCascadeMessage);
-            app.update();
+            put_action_table(app.world_mut());
             let mut barred: Vec<u8> = app
                 .world()
-                .resource::<PlayerActions>()
+                .resource::<crate::ui_action::ActionSlots>()
                 .buttons
                 .keys()
                 .copied()
@@ -4266,7 +4561,9 @@ mod tests {
             slot(9, 66, ACTION_KIND_SPELL),
         ];
         assert_eq!(enter(&mut app, &[133, 66], mage), [0, 9]);
-        app.world_mut().resource_mut::<PlayerActions>().dirty = false;
+        app.world_mut()
+            .resource_mut::<crate::ui_action::ActionSlots>()
+            .dirty = false;
 
         app.world_mut()
             .run_system_with(
@@ -4277,9 +4574,9 @@ mod tests {
                 },
             )
             .unwrap();
-        let actions = app.world().resource::<PlayerActions>();
-        assert!(actions.buttons.is_empty() && !actions.locked);
-        assert!(actions.dirty, "the feed re-resolves the emptied slots");
+        let bar = app.world().resource::<crate::ui_action::ActionSlots>();
+        assert!(bar.buttons.is_empty() && !bar.locked);
+        assert!(bar.dirty, "the rank pass re-reads the emptied slots");
 
         let warrior = vec![
             slot(72, 78, ACTION_KIND_SPELL),
@@ -4294,12 +4591,12 @@ mod tests {
     #[test]
     fn a_channel_with_no_positive_duration_or_no_unit_opens_nothing() {
         let t0 = Instant::now();
-        let mut feed = CastBarFeed::default();
+        let mut feed = crate::ui_script::live::UiEvents::default();
         let mut channel = ActiveChannel::default();
         channel_start(10, true, true, 10, 0, &mut channel, &mut feed);
         channel_start(10, true, true, 10, u32::MAX, &mut channel, &mut feed);
         channel_start(0x42, false, false, 10, 8_000, &mut channel, &mut feed);
-        assert!(feed.0.is_empty());
+        assert!(feed.cast_edges().is_empty());
         assert_eq!(channel.current(t0), None);
     }
 
@@ -4407,7 +4704,7 @@ mod tests {
         app.add_message::<CastEvent>()
             .init_resource::<GuidIndex>()
             .init_resource::<SelfGuid>()
-            .init_resource::<CastErrors>()
+            .init_resource::<crate::ui_action::RefusalsSeen>()
             .init_resource::<PendingCast>()
             .init_resource::<QueuedMeleeSpell>()
             .init_resource::<Cooldowns>()
@@ -4421,7 +4718,6 @@ mod tests {
                     move |mut commands: Commands,
                           self_guid: Res<SelfGuid>,
                           index: Res<GuidIndex>,
-                          mut cast_errors: ResMut<CastErrors>,
                           casting: Query<&Casting>,
                           mut cast_events: MessageWriter<CastEvent>,
                           mut pending: ResMut<PendingCast>,
@@ -4436,11 +4732,9 @@ mod tests {
                             (STEALTH, 0, 0),
                             false,
                             Some(reason),
-                            [None; 2],
                             &mut commands,
                             &self_guid,
                             &index,
-                            &mut cast_errors,
                             &casting,
                             &mut cast_events,
                             &mut pending,
@@ -4450,6 +4744,7 @@ mod tests {
                             Some(&spells),
                             &crate::net::NetCommands(tx.clone()),
                             1,
+                            &mut Vec::new(),
                         );
                     },
                 )
@@ -4532,6 +4827,7 @@ mod tests {
                             &mut commands,
                             &crate::net::NetCommands(tx.clone()),
                             &mut sounds,
+                            &mut Vec::new(),
                         );
                     },
                 )

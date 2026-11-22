@@ -95,8 +95,8 @@ pub(crate) fn threat_warning_enabled(model: &super::Model) -> bool {
         0 => false,
         1 => matches!(model.instance_type, Some(1 | 2)),
         2 => {
-            let g = &model.unit_guids;
-            g.party.iter().any(|&p| p != 0) || g.raid.iter().any(|&r| r != 0)
+            let counts = model.tokens().counts();
+            counts.party != 0 || counts.raid != 0
         }
         _ => true,
     }
@@ -357,7 +357,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                 let party = &model.party;
                 let grouped = !party.members.is_empty() || !party.raid.is_empty();
                 if grouped && party.leader_guid != party.own_guid {
-                    model.ui_errors.push("ERR_NOT_LEADER");
+                    drop(model);
+                    crate::script::ui_errors::show_now(lua, "ERR_NOT_LEADER");
                     return Ok(());
                 }
                 model.party_requests.push(if raid {
@@ -553,6 +554,6 @@ mod tests {
         });
         s.run("SetDungeonDifficulty(1)").unwrap();
         assert!(s.take_party_requests().is_empty());
-        assert_eq!(s.take_ui_errors(), ["ERR_NOT_LEADER"]);
+        assert_eq!(s.take_shown(), ["ERR_NOT_LEADER"]);
     }
 }

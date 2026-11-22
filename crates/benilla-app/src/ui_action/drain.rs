@@ -7,11 +7,9 @@ use bevy::prelude::*;
 use benilla_protocol::messages::{ACTION_KIND_ITEM, ACTION_KIND_MACRO, ACTION_KIND_SPELL};
 use benilla_ui::script::UiScript;
 
-use crate::net::NetCommands;
-
 use crate::spell::{cast_target, CastLadder};
 
-use super::{attack_actor_refusal, PlayerActions, UiErrorKeys, SPELL_ATTACK};
+use super::{attack_actor_refusal, ActionSlots, SPELL_ATTACK};
 
 /// What clicking an item action does, and to which copy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,9 +56,11 @@ pub(super) fn item_action_route(
 pub(crate) fn attack_nearest_probe(
     mut probe: MessageReader<crate::target::AttackNearestRequest>,
     mut press: AttackPress,
+    mut signals: crate::ui_action::signals::QueuedSignals,
 ) {
-    if probe.read().last().is_some() && press.selection.read().guid.is_none() {
-        press.attack_target();
+    if probe.read().last().is_some() && press.selection.guid.is_none() {
+        press.attack_target(&mut signals);
+        signals.flush(&mut press.seam.ecs);
     }
 }
 
@@ -69,9 +69,8 @@ pub(crate) fn attack_nearest_probe(
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct AttackPress<'w, 's> {
     pick: crate::target::AttackPick<'w, 's>,
-    selection: crate::ui_script::OwnedMut<'w, crate::target::Selection>,
+    selection: ResMut<'w, crate::target::Selection>,
     seam: crate::creature_anim::AttackSeam<'w, 's>,
-    ui_errors: ResMut<'w, UiErrorKeys>,
     player: Option<Res<'w, crate::player::Player>>,
     auto_dismount: Option<Res<'w, crate::spell::cast_target::AutoDismount>>,
 }
@@ -81,8 +80,8 @@ impl AttackPress<'_, '_> {
     /// selection; a refusal ends the press. Then the toggle: attacking stops, else it starts at the
     /// validator's target. Only the start cancels auto-repeat, so stopping melee leaves Auto Shot
     /// running.
-    pub(crate) fn attack_target(&mut self) {
-        let Some(guid) = self.validate(None, true) else {
+    pub(crate) fn attack_target(&mut self, sink: &mut dyn crate::ui_action::signals::SignalSink) {
+        let Some(guid) = self.validate(None, true, sink) else {
             return;
         };
         let Self { pick, seam, .. } = self;
@@ -101,23 +100,27 @@ impl AttackPress<'_, '_> {
             e,
             guid,
             engaged,
-            &mut seam.queued_melee,
-            &mut seam.auto_repeat,
+            seam.queued_melee.as_mut(),
+            seam.auto_repeat.as_mut(),
             &mut seam.sheath,
             &mut seam.ecs,
             &seam.net,
+            sink,
         );
     }
 
     /// Whether the actor checks pass and we are not already attacking, `StartAttack`'s named leg
     /// running before its selection moves.
-    pub(crate) fn may_start(&mut self) -> bool {
+    pub(crate) fn may_start(
+        &mut self,
+        sink: &mut dyn crate::ui_action::signals::SignalSink,
+    ) -> bool {
         if self.pick.engaged() {
             return false;
         }
         let mounted = self.mounted_gate();
         let (me, my_guid) = self.pick.player();
-        !attack_actor_refusal(me, my_guid, mounted, &mut self.ui_errors)
+        !attack_actor_refusal(me, my_guid, mounted, sink)
     }
 
     fn mounted_gate(&self) -> crate::spell::validator::MountedGate {
@@ -128,23 +131,23 @@ impl AttackPress<'_, '_> {
     }
 
     /// `StartAttack` named nobody: the refusal, with the selection left alone (`0x72c2b0`).
-    pub(crate) fn no_attack_target(&mut self) {
-        self.ui_errors
-            .0
-            .push(crate::ui_action::UiError::key("ERR_NO_ATTACK_TARGET"));
+    pub(crate) fn no_attack_target(sink: &mut dyn crate::ui_action::signals::SignalSink) {
+        sink.line(crate::ui_action::UiError::key("ERR_NO_ATTACK_TARGET"));
     }
 
     /// `StartAttack`'s swing at the selection a named unit left, past the nearest-enemy pick
     /// (`0x72c2b0`).
-    pub(crate) fn swing_at_selection(&mut self) {
+    pub(crate) fn swing_at_selection(
+        &mut self,
+        sink: &mut dyn crate::ui_action::signals::SignalSink,
+    ) {
         let Self {
             pick,
             selection,
             seam,
-            ui_errors,
             ..
         } = self;
-        let gated = pick.gated(&selection.read(), ui_errors, true);
+        let gated = pick.gated(selection.as_ref(), true, sink);
         let Some(guid) = gated else {
             return;
         };
@@ -158,29 +161,30 @@ impl AttackPress<'_, '_> {
             e,
             guid,
             false,
-            &mut seam.queued_melee,
-            &mut seam.auto_repeat,
+            seam.queued_melee.as_mut(),
+            seam.auto_repeat.as_mut(),
             &mut seam.sheath,
             &mut seam.ecs,
             &seam.net,
+            sink,
         );
     }
 
     /// `StartAttack()` with no unit: the press, unless already attacking.
-    pub(crate) fn start_attack(&mut self) {
+    pub(crate) fn start_attack(&mut self, sink: &mut dyn crate::ui_action::signals::SignalSink) {
         if !self.pick.engaged() {
-            self.attack_target();
+            self.attack_target(sink);
         }
     }
 
     /// `StopAttack()` (`0x51d0b0`): only while attacking.
-    pub(crate) fn stop_attack(&mut self) {
+    pub(crate) fn stop_attack(&mut self, sink: &mut dyn crate::ui_action::signals::SignalSink) {
         if self.pick.engaged() {
-            self.attack_target_off();
+            self.attack_target_off(sink);
         }
     }
 
-    fn attack_target_off(&mut self) {
+    fn attack_target_off(&mut self, sink: &mut dyn crate::ui_action::signals::SignalSink) {
         let Self { seam, .. } = self;
         let Ok(e) = seam.me.single() else {
             return;
@@ -189,97 +193,94 @@ impl AttackPress<'_, '_> {
             e,
             0,
             true,
-            &mut seam.queued_melee,
-            &mut seam.auto_repeat,
+            seam.queued_melee.as_mut(),
+            seam.auto_repeat.as_mut(),
             &mut seam.sheath,
             &mut seam.ecs,
             &seam.net,
+            sink,
         );
     }
 
-    /// The cast attempt's attack pick for a spell press held there ([`crate::spell::HeldForPick`]):
-    /// the validator alone, with no swing after it. Whether the cast goes on, at the unit the pick
-    /// left selected.
-    pub(crate) fn pick_for_cast(&mut self, held: crate::spell::HeldCast) -> bool {
-        self.validate(held.passed, false).is_some()
+    /// The attempt's attack pick for a held spell press (`0x80d661`): the validator alone, returning the unit it bound into the attempt (`0x80d65e`) or `None` when the attempt ends.
+    pub(crate) fn pick_for_cast(
+        &mut self,
+        held: crate::spell::HeldCast,
+        sink: &mut dyn crate::ui_action::signals::SignalSink,
+    ) -> Option<u64> {
+        self.validate(held.passed, false, sink)
     }
 
     /// The attack validator: its actor checks, then its target pick. `check_range` is on for the
     /// Attack action (`0x72c2de`) and off for the cast attempt (`0x80d661`).
-    fn validate(&mut self, passed: Option<u64>, check_range: bool) -> Option<u64> {
+    fn validate(
+        &mut self,
+        passed: Option<u64>,
+        check_range: bool,
+        sink: &mut dyn crate::ui_action::signals::SignalSink,
+    ) -> Option<u64> {
         let mounted = self.mounted_gate();
         let Self {
             pick,
             selection,
             seam,
-            ui_errors,
             ..
         } = self;
         let (me, my_guid) = pick.player();
-        if attack_actor_refusal(me, my_guid, mounted, ui_errors) {
+        if attack_actor_refusal(me, my_guid, mounted, sink) {
             return None;
         }
-        pick.target(passed, &mut selection.write(), seam, ui_errors, check_range)
+        pick.target(passed, selection.as_mut(), seam, check_range, sink)
     }
 }
 
 /// Sends the queued GameObject openers through the cast ladder. The reference reaches its cast
 /// attempt from a right-click as from a button, so every rung applies: a second click on a chest
 /// mid-cast is the ladder's silent same-spell bail.
-pub(super) fn drain_go_openers(
-    mut queue: ResMut<crate::ui_action::GoOpenerCasts>,
-    (script, _live): (
-        Option<NonSendMut<UiScript>>,
-        crate::ui_script::LendLive<crate::ui_script::OwnsCooldowns>,
-    ),
+pub(super) fn drain_go_openers(world: &mut World) {
+    let openers = std::mem::take(&mut world.resource_mut::<crate::ui_action::GoOpenerCasts>().0);
+    // Each opener is its own press, its raises fired before the next.
+    for opener in openers {
+        crate::script_calls::press_step(world, go_opener, opener);
+    }
+}
+
+/// One GameObject opener.
+fn go_opener(
+    In(opener): In<super::GoOpener>,
+    script: Option<NonSendMut<benilla_ui::script::UiScript>>,
+    mut ui: ResMut<crate::ui_script::live::UiEvents>,
     targeting: cast_target::CastTargeting,
     mut ladder: CastLadder,
-    // Not a `CastLadder` field: Bevy panics on a resource reachable twice from one system.
-    mut ui_errors: ResMut<UiErrorKeys>,
     mut gate: crate::ui_bind_confirm::BindGate,
 ) {
-    if queue.0.is_empty() {
-        return;
-    }
     let ctx = targeting.context();
-    let mut script = script;
-    for opener in std::mem::take(&mut queue.0) {
-        match opener {
-            super::GoOpener::Spell { spell_id, go_guid } => {
-                debug!("ui_action: gameobject opener casts {spell_id} at {go_guid:#x}");
-                ladder.send_at_object(spell_id, &ctx, go_guid);
-            }
-            // The key goes through the shared item-use fork, as a bag click does.
-            super::GoOpener::Key(it) => {
-                let Some(script) = script.as_deref_mut() else {
-                    continue;
-                };
-                debug!(
-                    "ui_action: gameobject opener uses the key at wire {}/{} on {:?}",
-                    it.bag_index, it.slot, it.on_object
-                );
-                crate::ui_items::send_item_use(
-                    it,
-                    &ctx,
-                    &mut ladder,
-                    script,
-                    &mut gate,
-                    false,
-                    &mut ui_errors,
-                );
-            }
+    match opener {
+        super::GoOpener::Spell { spell_id, go_guid } => {
+            debug!("ui_action: gameobject opener casts {spell_id} at {go_guid:#x}");
+            ladder.send_at_object(spell_id, &ctx, go_guid);
+        }
+        // The key goes through the shared item-use fork, as a bag click does.
+        super::GoOpener::Key(it) => {
+            let Some(mut script) = script else {
+                return;
+            };
+            debug!(
+                "ui_action: gameobject opener uses the key at wire {}/{} on {:?}",
+                it.bag_index, it.slot, it.on_object
+            );
+            crate::ui_items::send_item_use(it, &ctx, &mut ladder, &mut script, &mut gate, false);
         }
     }
+    // The press's cast-bar edges, fired at its step (`0x80b556`).
+    ladder.press.defer(&mut ui);
 }
 
 /// What a `UseAction` press reads and writes.
 #[derive(bevy::ecs::system::SystemParam)]
 pub(crate) struct ActionPress<'w, 's> {
-    actions: Res<'w, PlayerActions>,
+    actions: Option<Res<'w, ActionSlots>>,
     targeting: cast_target::CastTargeting<'w, 's>,
-    // The by-key error line. Not a `CastLadder` field: Bevy panics, at runtime and not in unit
-    // tests, on a resource reachable twice from one system.
-    ui_errors: ResMut<'w, UiErrorKeys>,
     ladder: CastLadder<'w, 's>,
     gate: crate::ui_bind_confirm::BindGate<'w>,
     /// Resolves the press's unit token where it takes effect.
@@ -296,12 +297,13 @@ pub(crate) enum UseOutcome {
     Attack,
     /// A pet-action slot: the pet bar's action at this 0-based index is pressed.
     PetAction(u32),
+    /// A macro slot: the 1-based macro runs, its lines' calls applying inside it (`0x5abdbc`).
+    Macro(u32),
 }
 
 /// `UseAction` on the pressed slot: a cast, an item use or a macro run, at the selection as the
 /// calls before it left it, or the Attack slot, which it hands back for the player's Attack to run.
-/// A macro's lines run inside it, so the calls they make queue for [`crate::script_calls`] to apply
-/// next.
+/// A macro slot comes back for the caller to run once the press's borrows end.
 pub(crate) fn use_action(
     p: &mut ActionPress,
     script: &mut UiScript,
@@ -310,7 +312,6 @@ pub(crate) fn use_action(
     let ActionPress {
         actions,
         targeting,
-        ui_errors,
         ladder,
         gate,
         tokens,
@@ -321,7 +322,11 @@ pub(crate) fn use_action(
         Ok(s) => s,
         Err(_) => return UseOutcome::Done,
     };
-    match actions.buttons.get(&slot) {
+    // Copied out: a macro's verbs may write the bar inside the press.
+    let button = actions
+        .as_deref()
+        .and_then(|a| a.buttons.get(&slot).copied());
+    match button.as_ref() {
         Some(b) if b.kind == ACTION_KIND_SPELL && b.action == SPELL_ATTACK => {
             // `UseAction` casts Attack through the cast attempt, so its dead rung comes first: "You
             // are dead", where the binding, which skips the attempt, reads "Can't attack while
@@ -431,19 +436,11 @@ pub(crate) fn use_action(
                     script,
                     gate,
                     false,
-                    ui_errors,
                 );
             }
         }
-        // The macro arm: each body line goes through the chat input, as if typed.
-        Some(b) if b.kind == ACTION_KIND_MACRO => {
-            if !crate::ui_macro::run_macro(script, b.action) {
-                debug!(
-                    "ui_action: macro action {action} (macro {}) is empty",
-                    b.action
-                );
-            }
-        }
+        // The macro arm (`0x5abda2`): the macro runs once the press's borrows end.
+        Some(b) if b.kind == ACTION_KIND_MACRO => return UseOutcome::Macro(b.action),
         // A pet-action slot presses the pet bar's action by index, at no unit (`0x5ac000` →
         // `0x5d4210`).
         Some(b) if b.kind == super::ACTION_KIND_PET => return UseOutcome::PetAction(b.action),
@@ -456,29 +453,4 @@ pub(crate) fn use_action(
         None => debug!("ui_action: UseAction({action}) on an empty slot"),
     }
     UseOutcome::Done
-}
-
-/// Applies the queued `PickupAction`/`PlaceAction` writes (packed 0 clears) to the store, which
-/// the VM already mirrors, marks it dirty for the feed and sends each as `CMSG_SET_ACTION_BUTTON`.
-pub(super) fn drain_action_sets(
-    (script, _live): (
-        Option<NonSendMut<UiScript>>,
-        crate::ui_script::LendLive<crate::ui_script::OwnsActions>,
-    ),
-    mut actions: crate::ui_script::OwnedMut<PlayerActions>,
-    commands: Res<NetCommands>,
-) {
-    let Some(mut script) = script else {
-        return;
-    };
-    for (lua_id, packed) in script.take_action_sets() {
-        let Ok(slot) = u8::try_from(lua_id.saturating_sub(1)) else {
-            debug!("ui_action: set_action_button lua id {lua_id} out of range — ignored");
-            continue;
-        };
-        debug!(
-            "ui_action: set_action_button lua {lua_id} (wire slot {slot}) packed {packed:#010x}"
-        );
-        actions.write().write_slot(slot, packed, &commands);
-    }
 }

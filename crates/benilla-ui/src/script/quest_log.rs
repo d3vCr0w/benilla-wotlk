@@ -1115,7 +1115,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     // One return per live timer, in log order, re-read every OnUpdate: `QuestTimerFrame_Update`
     // takes them as varargs and hides on none (`QuestTimerFrame.lua:11`, `:26`, `:37`). A timer
-    // run out marks its quest expired unless it is complete, inside the call (`0x5e634a` -> `0x5e57e0`): it reads failed at once, the questgivers are asked again, its line shows (`0x5e6385`), and `QUEST_LOG_UPDATE` follows (`0x5e63b0`). Deviation: the line goes out with the engine verbs' other lines after the tick, not inside the call (#1306).
+    // run out marks its quest expired unless it is complete, inside the call (`0x5e634a` -> `0x5e57e0`): it reads failed at once, the questgivers are asked again, its line shows (`0x5e6385`), and `QUEST_LOG_UPDATE` follows (`0x5e63b0`).
     g.set(
         "GetQuestTimers",
         lua.create_function(|lua, ()| {
@@ -1141,7 +1141,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     fail_seeded(id);
                     if let Some(Some(Some(title))) = super::live::write_live(|l| l.expire_quest(id))
                     {
-                        model.ui_errors_s.push(("ERR_QUEST_FAILED_S", title));
+                        drop(model);
+                        crate::script::ui_errors::show_now_s(lua, "ERR_QUEST_FAILED_S", title);
+                        model = crate::script::model_mut_of(lua);
                     }
                 }
                 super::live::unique_signal(&mut model, "QUEST_LOG_UPDATE");
@@ -1260,8 +1262,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let Some(guid) = model.token_guid(&token).filter(|&g| g != 0) else {
                 return Ok(Value::Nil);
             };
-            let guids = &model.unit_guids;
-            if guid != guids.player && !guids.party.contains(&guid) {
+            let tokens = model.tokens();
+            if guid != tokens.player() && !tokens.in_party(guid) {
                 return Ok(Value::Nil);
             }
             let on = model.unit(&token).is_some_and(|u| {
@@ -1335,18 +1337,13 @@ mod tests {
     use super::{QuestLogDetail, QuestLogEntryView, QuestLogObjectiveView, QuestLogState};
     use crate::script::{QuestItemView, UiScript};
 
-    /// The server clock lent at `now`, with the daily reset at `reset`, until the loan drops; a later loan in the same test reads over it.
-    fn clock_at(
-        now: f64,
-        reset: Option<f64>,
-    ) -> crate::script::LiveLoan<crate::script::live::TestView> {
-        let view = crate::script::live::TestView {
+    /// The server clock at `now`, with the daily reset at `reset`.
+    fn clock_at(now: f64, reset: Option<f64>) -> crate::script::live::TestView {
+        crate::script::live::TestView {
             server_unix: Some(now),
             quest_reset: reset,
             ..Default::default()
-        };
-        // SAFETY: each test drops its loans on its own thread, in reverse order of their making.
-        unsafe { crate::script::LiveLoan::new(view) }
+        }
     }
 
     fn two_quests() -> QuestLogState {
@@ -1907,36 +1904,44 @@ mod tests {
             .eval::<bool>("return GetQuestLogTimeLeft() == nil")
             .unwrap());
 
-        let _clock = clock_at(1_000_400.0, None);
-        assert_eq!(s.arity("GetQuestTimers()").unwrap(), 1);
-        assert_eq!(s.eval::<i64>("return (GetQuestTimers())").unwrap(), 499);
-        assert_eq!(s.eval::<i64>("return GetQuestIndexForTimer(1)").unwrap(), 2);
-        assert!(s
-            .eval::<bool>("return GetQuestIndexForTimer(2) == nil")
-            .unwrap());
+        let mut clock_v = clock_at(1_000_400.0, None);
+        crate::script::live::lending(&mut clock_v, || {
+            assert_eq!(s.arity("GetQuestTimers()").unwrap(), 1);
+            assert_eq!(s.eval::<i64>("return (GetQuestTimers())").unwrap(), 499);
+            assert_eq!(s.eval::<i64>("return GetQuestIndexForTimer(1)").unwrap(), 2);
+            assert!(s
+                .eval::<bool>("return GetQuestIndexForTimer(2) == nil")
+                .unwrap());
 
-        s.run("SelectQuestLogEntry(1)").unwrap();
-        assert!(s
-            .eval::<bool>("return GetQuestLogTimeLeft() == nil")
-            .unwrap());
-        s.run("SelectQuestLogEntry(2)").unwrap();
-        assert_eq!(s.eval::<i64>("return GetQuestLogTimeLeft()").unwrap(), 499);
+            s.run("SelectQuestLogEntry(1)").unwrap();
+            assert!(s
+                .eval::<bool>("return GetQuestLogTimeLeft() == nil")
+                .unwrap());
+            s.run("SelectQuestLogEntry(2)").unwrap();
+            assert_eq!(s.eval::<i64>("return GetQuestLogTimeLeft()").unwrap(), 499);
 
-        // Only the clock moves, and the number falls.
-        let _clock = clock_at(1_000_880.0, None);
-        assert_eq!(s.eval::<i64>("return GetQuestLogTimeLeft()").unwrap(), 19);
+            // Only the clock moves, and the number falls.
+            let mut clock_v = clock_at(1_000_880.0, None);
+            crate::script::live::lending(&mut clock_v, || {
+                assert_eq!(s.eval::<i64>("return GetQuestLogTimeLeft()").unwrap(), 19);
 
-        // The last second reads 0.
-        let _clock = clock_at(1_000_899.0, None);
-        assert_eq!(s.eval::<i64>("return GetQuestLogTimeLeft()").unwrap(), 0);
+                // The last second reads 0.
+                let mut clock_v = clock_at(1_000_899.0, None);
+                crate::script::live::lending(&mut clock_v, || {
+                    assert_eq!(s.eval::<i64>("return GetQuestLogTimeLeft()").unwrap(), 0);
 
-        // Past the deadline the lists drop the row and `GetQuestLogTimeLeft` clamps to 0.
-        let _clock = clock_at(1_000_910.0, None);
-        assert_eq!(s.eval::<i64>("return GetQuestLogTimeLeft()").unwrap(), 0);
-        assert_eq!(s.arity("GetQuestTimers()").unwrap(), 0);
-        assert!(s
-            .eval::<bool>("return GetQuestIndexForTimer(1) == nil")
-            .unwrap());
+                    // Past the deadline the lists drop the row and `GetQuestLogTimeLeft` clamps to 0.
+                    let mut clock_v = clock_at(1_000_910.0, None);
+                    crate::script::live::lending(&mut clock_v, || {
+                        assert_eq!(s.eval::<i64>("return GetQuestLogTimeLeft()").unwrap(), 0);
+                        assert_eq!(s.arity("GetQuestTimers()").unwrap(), 0);
+                        assert!(s
+                            .eval::<bool>("return GetQuestIndexForTimer(1) == nil")
+                            .unwrap());
+                    });
+                });
+            });
+        });
     }
 
     /// vmangos sets a failed quest's timer to 1 and leaves it in the log (`Player::FailQuest`).
@@ -1948,15 +1953,16 @@ mod tests {
         state.entries[1].timer = 1; // failed: the server's sentinel
         state.entries[1].complete = -1;
         s.seed_quest_log(state);
-        let _clock = clock_at(1_000_400.0, None);
-
-        assert_eq!(s.arity("GetQuestTimers()").unwrap(), 1);
-        assert_eq!(s.eval::<i64>("return (GetQuestTimers())").unwrap(), 499);
-        assert_eq!(s.eval::<i64>("return GetQuestIndexForTimer(1)").unwrap(), 1);
-        s.run("SelectQuestLogEntry(2)").unwrap();
-        assert!(s
-            .eval::<bool>("return GetQuestLogTimeLeft() == nil")
-            .unwrap());
+        let mut clock_v = clock_at(1_000_400.0, None);
+        crate::script::live::lending(&mut clock_v, || {
+            assert_eq!(s.arity("GetQuestTimers()").unwrap(), 1);
+            assert_eq!(s.eval::<i64>("return (GetQuestTimers())").unwrap(), 499);
+            assert_eq!(s.eval::<i64>("return GetQuestIndexForTimer(1)").unwrap(), 1);
+            s.run("SelectQuestLogEntry(2)").unwrap();
+            assert!(s
+                .eval::<bool>("return GetQuestLogTimeLeft() == nil")
+                .unwrap());
+        });
     }
 
     #[test]
@@ -2121,10 +2127,14 @@ mod tests {
     fn quest_reset_time_counts_down_on_the_server_clock() {
         let s = UiScript::new().unwrap();
         assert_eq!(s.eval::<i64>("return GetQuestResetTime()").unwrap(), 0);
-        let _clock = clock_at(1_000_000.0, Some(1_003_600.0));
-        assert_eq!(s.eval::<i64>("return GetQuestResetTime()").unwrap(), 3600);
-        let _clock = clock_at(1_000_100.5, Some(1_003_600.0));
-        assert_eq!(s.eval::<i64>("return GetQuestResetTime()").unwrap(), 3500);
+        let mut clock_v = clock_at(1_000_000.0, Some(1_003_600.0));
+        crate::script::live::lending(&mut clock_v, || {
+            assert_eq!(s.eval::<i64>("return GetQuestResetTime()").unwrap(), 3600);
+            let mut clock_v = clock_at(1_000_100.5, Some(1_003_600.0));
+            crate::script::live::lending(&mut clock_v, || {
+                assert_eq!(s.eval::<i64>("return GetQuestResetTime()").unwrap(), 3500);
+            });
+        });
     }
 
     /// A header at row 1, then [`two_quests`] at rows 2 and 3.
@@ -2489,34 +2499,43 @@ mod tests {
             quest_titles: [(783, "The Fargodeep Mine".to_string())].into(),
             ..Default::default()
         };
-        // SAFETY: the test drops its loan on its own thread.
-        let clock = unsafe { crate::script::LiveLoan::new(view) };
-        s.model_mut().pending_events.clear();
+        let mut clock_v = view;
+        crate::script::live::lending(&mut clock_v, || {
+            s.model_mut().pending_events.clear();
 
-        assert_eq!(s.arity("GetQuestTimers()").unwrap(), 0);
-        assert!(s
-            .eval::<bool>("local _, _, _, _, _, _, done = GetQuestLogTitle(1) return done == -1")
-            .unwrap());
-        s.run("SelectQuestLogEntry(1)").unwrap();
-        assert!(s
-            .eval::<bool>("return IsCurrentQuestFailed() == 1")
-            .unwrap());
-        assert!(s
-            .eval::<bool>("local _, _, _, _, _, _, done = GetQuestLogTitle(2) return done == 1")
-            .unwrap());
-        assert_eq!(clock.with_view(|v| v.expired.clone()), vec![783]);
-        assert_eq!(
-            s.take_ui_errors_s(),
-            vec![("ERR_QUEST_FAILED_S", "The Fargodeep Mine".to_string())]
-        );
-        assert!(s
-            .model_ref()
-            .pending_events
-            .iter()
-            .any(|(e, _)| e == "QUEST_LOG_UPDATE"));
-        // Marked once: the next call finds it failed.
-        s.run("GetQuestTimers()").unwrap();
-        assert_eq!(clock.with_view(|v| v.expired.clone()), vec![783]);
-        assert!(s.take_ui_errors_s().is_empty());
+            assert_eq!(s.arity("GetQuestTimers()").unwrap(), 0);
+            assert!(s
+                .eval::<bool>(
+                    "local _, _, _, _, _, _, done = GetQuestLogTitle(1) return done == -1"
+                )
+                .unwrap());
+            s.run("SelectQuestLogEntry(1)").unwrap();
+            assert!(s
+                .eval::<bool>("return IsCurrentQuestFailed() == 1")
+                .unwrap());
+            assert!(s
+                .eval::<bool>("local _, _, _, _, _, _, done = GetQuestLogTitle(2) return done == 1")
+                .unwrap());
+            assert_eq!(
+                crate::script::live::test_view(|v| v.expired.clone()),
+                vec![783]
+            );
+            assert_eq!(
+                s.take_shown_s(),
+                vec![("ERR_QUEST_FAILED_S", "The Fargodeep Mine".to_string())]
+            );
+            assert!(s
+                .model_ref()
+                .pending_events
+                .iter()
+                .any(|(e, _)| e == "QUEST_LOG_UPDATE"));
+            // Marked once: the next call finds it failed.
+            s.run("GetQuestTimers()").unwrap();
+            assert_eq!(
+                crate::script::live::test_view(|v| v.expired.clone()),
+                vec![783]
+            );
+            assert!(s.take_shown_s().is_empty());
+        });
     }
 }

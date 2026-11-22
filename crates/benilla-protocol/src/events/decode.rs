@@ -315,6 +315,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 spell_id: s.spell_id,
                 cast_flags: s.cast_flags,
                 runes,
+                start: true,
             }));
             events
         }
@@ -325,6 +326,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 spell_id: s.spell_id,
                 cast_flags: s.cast_flags,
                 runes,
+                start: false,
             });
             let mut events = vec![SessionEvent::SpellGo {
                 caster,
@@ -1133,7 +1135,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         }],
         ServerPacket::TransferPending { map, transport } => vec![SessionEvent::TransferPending {
             map_id: map,
-            transport_entry: transport.map(|(entry, _old_map)| entry),
+            transport_entry: transport.map(|(entry, _)| entry),
+            transport_map: transport.map(|(_, old_map)| old_map),
         }],
         ServerPacket::TransferAborted { map, reason, arg } => {
             vec![SessionEvent::TransferAborted { map, reason, arg }]
@@ -1226,9 +1229,8 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
         ServerPacket::TalentWipeConfirm { trainer, cost } => {
             vec![SessionEvent::TalentWipeConfirm { trainer, cost }]
         }
-        ServerPacket::PetUnlearnConfirm { trainer, cost } => {
-            vec![SessionEvent::PetUnlearnConfirm { trainer, cost }]
-        }
+        // 12340 registers no handler for 0x2F1: the packet is dropped.
+        ServerPacket::PetUnlearnConfirm { .. } => Vec::new(),
         ServerPacket::RaidGroupOnly { delay_ms, reason } => {
             vec![SessionEvent::RaidGroupOnly { delay_ms, reason }]
         }
@@ -1335,6 +1337,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 civilian,
                 racial_leader,
                 modifiers,
+                movement_id,
             ) = match info {
                 Some(i) => (
                     Some(i.name),
@@ -1350,8 +1353,22 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                     i.civilian,
                     i.racial_leader,
                     (i.health_modifier, i.power_modifier),
+                    i.movement_id,
                 ),
-                None => (None, None, None, None, 0, 0, 0, 0, false, false, (0.0, 0.0)),
+                None => (
+                    None,
+                    None,
+                    None,
+                    None,
+                    0,
+                    0,
+                    0,
+                    0,
+                    false,
+                    false,
+                    (0.0, 0.0),
+                    0,
+                ),
             };
             vec![SessionEvent::CreatureName {
                 entry,
@@ -1366,6 +1383,7 @@ pub fn decode(packet: ServerPacket) -> Vec<SessionEvent> {
                 civilian,
                 racial_leader,
                 modifiers,
+                movement_id,
             }]
         }
         ServerPacket::PageTextQueryResponse {

@@ -137,6 +137,11 @@ struct Shadow {
     power: [Option<u32>; 7],
     health: Option<u32>,
     dismounted: bool,
+    /// The mount a dismount kept while passengers ride (`[unit+0xa30]` bit `0x10000000` set, its
+    /// display left in `[unit+0x9c0]`), 0 when the bit is clear.
+    mount_kept: u32,
+    /// The form our own cancel dropped ahead of the server (`[unit+0x9f4]`, `0x721d82`), until the form byte next moves (`0x6da174`).
+    form_suppressed: bool,
 }
 
 /// An object's descriptor length in dwords: the `*_END` of its innermost block, so a Player spans
@@ -412,7 +417,7 @@ impl ObjectFields {
                     );
                     if old != new {
                         changed(index, old, new);
-                        follow_shadow(&mut self.shadow, index, new);
+                        follow_shadow(&mut self.shadow, index, old, new);
                     }
                 }
             }
@@ -424,7 +429,7 @@ impl ObjectFields {
                 let old = self.get_raw(index).unwrap_or(0);
                 if old != value {
                     changed(index, old, value);
-                    follow_shadow(&mut self.shadow, index, value);
+                    follow_shadow(&mut self.shadow, index, old, value);
                 }
                 self.insert(index, value);
             }
@@ -471,6 +476,27 @@ impl ObjectFields {
         true
     }
 
+    /// A dismount held while passengers ride (`0x741a7f`, `0x74046f`): `mount`, the unit's own
+    /// copy, stays and the unit reads unmounted until the field moves to another display.
+    pub fn hold_mount(&mut self, mount: u32) {
+        if mount != 0 {
+            self.shadow.get_or_insert_default().mount_kept = mount;
+        }
+    }
+
+    /// The unit's own mount copy (`[unit+0x9c0]`): a held mount, else the field less a dropped one.
+    pub fn unit_mount_copy(&self) -> u32 {
+        match self.shadow.as_deref().map_or(0, |s| s.mount_kept) {
+            0 => self.unit_mount_display_id(),
+            kept => kept,
+        }
+    }
+
+    /// Mounted (`0x51a230`): a mount copy and no held dismount.
+    pub fn unit_is_mounted(&self) -> bool {
+        self.shadow.as_deref().is_none_or(|s| s.mount_kept == 0) && self.unit_mount_display_id() > 0
+    }
+
     /// The predicted power of type `ty` while one stands.
     fn predicted_power(&self, ty: u8) -> Option<u32> {
         self.shadow
@@ -478,6 +504,16 @@ impl ObjectFields {
             .power
             .get(usize::from(ty))
             .copied()?
+    }
+
+    /// The early form cancel (`0x721cf0`): the form reads none until the form byte next moves.
+    pub fn suppress_form(&mut self) {
+        self.shadow.get_or_insert_default().form_suppressed = true;
+    }
+
+    /// Whether an early form cancel stands (`[unit+0x9f4]`).
+    pub fn unit_form_suppressed(&self) -> bool {
+        self.shadow.as_deref().is_some_and(|s| s.form_suppressed)
     }
 
     /// Whether `SMSG_DISMOUNT` dropped the mount the field still names.
@@ -488,7 +524,7 @@ impl ObjectFields {
 
 /// Drop the copy a moved field re-seeds: its power type's for a power or maximum, the new display
 /// type's for `UNIT_FIELD_BYTES_0` (`0x723620`), the dropped mount for the mount field.
-fn follow_shadow(shadow: &mut Option<Box<Shadow>>, index: u16, new: u32) {
+fn follow_shadow(shadow: &mut Option<Box<Shadow>>, index: u16, old: u32, new: u32) {
     let Some(s) = shadow.as_deref_mut() else {
         return;
     };
@@ -501,9 +537,17 @@ fn follow_shadow(shadow: &mut Option<Box<Shadow>>, index: u16, new: u32) {
     }
     if index == FIELD_UNIT_MOUNTDISPLAYID {
         s.dismounted = false;
+        // The change handler is a no-op on the copy it holds, and clears the hold on any other (`0x740450`).
+        if new != s.mount_kept {
+            s.mount_kept = 0;
+        }
     }
     if index == FIELD_UNIT_HEALTH {
         s.health = None;
+    }
+    // The form byte's mirror handler (`0x6e538a`, offset `0x1d3`) clears the early cancel.
+    if index == FIELD_UNIT_BYTES_2 && (old >> 24) != (new >> 24) {
+        s.form_suppressed = false;
     }
 }
 
