@@ -115,6 +115,37 @@ pub trait LiveState {
         0
     }
 
+    /// `UnitAura`'s walk over `guid`'s auras at the call (`0x6147c0`): a held unit's listed auras
+    /// in display order behind its unit gate, else its roster record's block; `pick` sees each in
+    /// order, the first it takes is built with its times on `ui_now`'s clock, and `raid` decides
+    /// each one's second-list membership. `Some(None)` for no aura taken.
+    fn find_unit_aura(
+        &self,
+        _guid: u64,
+        _ui_now: f64,
+        _raid: bool,
+        _pick: &mut dyn FnMut(&super::AuraFacts<'_>) -> bool,
+    ) -> Option<Option<super::AuraState>> {
+        None
+    }
+
+    /// `guid`'s raw aura slots at the call, unfiltered, times on `ui_now`'s clock; `Some(None)` for
+    /// a unit neither held nor on the roster.
+    fn unit_aura_slots(&self, _guid: u64, _ui_now: f64) -> Option<Option<super::UnitAuraSlots>> {
+        None
+    }
+
+    /// The minimap's tracking spell (`0xbeba68`), a session global the aura handler writes.
+    fn tracking_spell(&self) -> Option<u32> {
+        None
+    }
+
+    /// Write the tracking spell inside the call, as `SetTracking()` zeroes it (`0x57f4c2`); false
+    /// where no view is lent.
+    fn set_tracking_spell(&mut self, _spell_id: u32) -> bool {
+        false
+    }
+
     /// An item spell's range check from us toward `target` at the call (`0x809610`): `Some(None)` with no answer, `None` where no view lends the check.
     fn item_spell_in_range(&self, _spell_id: u32, _target: u64) -> Option<Option<bool>> {
         None
@@ -123,6 +154,16 @@ pub trait LiveState {
     /// Queue `event` with the frame's unique signals (`0x615020`); false where no queue is lent.
     fn unique_signal(&mut self, _event: &'static str) -> bool {
         false
+    }
+
+    /// Add `text` to the chat log on the catalog row's `chat_type` inside the call (`0x509dd0`): the
+    /// line recorded and its event's name and arguments handed back to fire; `None` with no chat log.
+    fn add_chat_line(
+        &mut self,
+        _chat_type: u8,
+        _text: &str,
+    ) -> Option<(&'static str, Vec<super::ScriptValue>)> {
+        None
     }
 
     /// The world-state readout's admitted row count at the call (`0x548720`), `None` without one.
@@ -232,6 +273,11 @@ pub trait LiveState {
 
     /// The interact target (`0xbd07a8`), the `"npc"` unit's guid; `None` with none held.
     fn interact_target(&self) -> Option<u64> {
+        None
+    }
+
+    /// The carried-count check (`0x754dd0`) on `count` more of `item_id`, its record cached: why it refuses, `None` when it passes, the record is not cached or no view lends the bags.
+    fn carry_refusal(&self, _item_id: u32, _count: u32) -> Option<super::CarryRefusal> {
         None
     }
 
@@ -362,13 +408,13 @@ pub trait LiveState {
     /// `RequestBattlefieldPositions` (`0x54cf60`): cleared without an active slot, else sent at most every 5000 ms.
     fn request_battlefield_positions(&self) {}
 
-    /// `NotifyInspect`'s `CMSG_INSPECT` and target (`0x5228c3`, `0x52291a`); whether the target moved (`0x5e76c1`).
-    fn notify_inspect(&self, _guid: u64) -> bool {
+    /// `NotifyInspect`'s `CMSG_INSPECT` and target (`0x5228c3`, `0x52291a`); a moved target resets the inspected talent tabs to its class (`0x5e76f2`); whether it moved (`0x5e76c1`).
+    fn notify_inspect(&mut self, _guid: u64) -> bool {
         true
     }
 
-    /// `ClearInspectPlayer`'s target clear (`0x5e78ae`).
-    fn clear_inspect_target(&self) {}
+    /// `ClearInspectPlayer`'s target clear (`0x5e78ae`); a held one resets the inspected talent tabs (`0x5e78d5`).
+    fn clear_inspect_target(&mut self) {}
 
     /// Companion list `ty`'s spells in order (`0xbe8df4`), as the known-spell adds file them.
     fn companion_spells(&self, _ty: super::CompanionType) -> Vec<u32> {
@@ -549,6 +595,13 @@ pub trait LiveState {
         self.spell_known(spell_id)
     }
 
+    /// Whether the pet knows `spell_id` or a higher rank of it, the talent tooltip's pet side
+    /// (`0x5c60c0`): our player and the pet list's head held (`0x5c60f4`, `0x5c6120`), then the
+    /// pet's list (`0x7260e0` into `0x53b900`) or its family's rank chain (`0x726160`).
+    fn pet_spell_known_or_higher(&self, _spell_id: u32) -> bool {
+        false
+    }
+
     /// A player book spell's texture at the call (`0x53dc20`): the weapon faces for the melee
     /// auto-attack and a ranged shot (`0x5a84d0`, `0x5a85e0`), else the record's icon.
     fn book_spell_texture(&self, spell_id: u32) -> Option<String> {
@@ -564,6 +617,11 @@ pub trait LiveState {
     /// spell, or a shapeshift into the player's current form.
     fn spell_selected(&self, _spell_id: u32) -> bool {
         false
+    }
+
+    /// The bar's usable update at the call (`0x5aa470`), with whether equipment sets can be used (`0x5ad6b0`): whether a slot's bytes moved, `None` with no bar lent.
+    fn bar_usable_update(&mut self, _sets_usable: bool) -> Option<bool> {
+        None
     }
 
     /// `IsUsableAction`'s pair for the 1-based `action` off the bar's usable cache (`0x5a7e60`);
@@ -667,6 +725,15 @@ pub trait LiveState {
     /// recomputed and the slot sent (`0x5aa390`); `Some(false)` while the bar is locked
     /// (`0x5aaec1`, `0x5aaac2`), `None` without a view. The caller signals the slot.
     fn set_action_word(&mut self, _slot: u32, _word: u32) -> Option<bool> {
+        None
+    }
+
+    /// A macro verb's binding change (`0x565c40` -> `0x5650c0`, `0x566d50`), stored for the bar; every binding returned by index. `None` without a view.
+    fn macros_changed(
+        &mut self,
+        _macros: &super::MacroState,
+        _change: super::MacroChange,
+    ) -> Option<std::collections::HashMap<u32, super::MacroBinding>> {
         None
     }
 
@@ -923,6 +990,388 @@ pub trait LiveState {
 
     /// A bound item's trade-window stamp read off its fields at the call (`0x708b40`); `Some(None)` when it has none.
     fn bound_trade_stamp(&self, _item: u64) -> Option<Option<u32>> {
+        None
+    }
+
+    /// The item swap's gate over its two ends, each `(bag, 1-based slot)` (`0x6df890`); `None` with no active player held.
+    fn swap_gate(&self, _src: (i64, u32), _dst: (i64, u32)) -> Option<super::SwapGate> {
+        None
+    }
+
+    /// `AutoEquipCursorItem`'s gate over the held item at `(bag, 1-based slot)` and whether it is ammunition (`0x6dfd45`-`0x6dfe51`); `None` with no active player held.
+    fn auto_equip_gate(&self, _bag: i64, _slot: u32) -> Option<(super::SwapGate, bool)> {
+        None
+    }
+
+    /// `f` over the client's faction list (`0xc23370`-`0xc2347c`) and the faction table and reputation store it reads, at the call; `false` where no view lends them.
+    fn reputation(
+        &mut self,
+        _f: &mut dyn FnMut(&mut super::FactionList, &mut dyn super::FactionTable),
+    ) -> bool {
+        false
+    }
+
+    /// The achievement tables the game start indexes (`0x5b6df0`), `None` before they load.
+    fn achievement_db(&self) -> Option<std::sync::Arc<super::AchievementDb>> {
+        None
+    }
+
+    /// The client's achievement lists at the call (`0xacfd98`-`0xacfde0`, `[0xc1f454]`, `[0xc1f458]`).
+    fn achievement_book(&self) -> Option<&super::AchievementBook> {
+        None
+    }
+
+    /// The achievement lists, for a binding that writes them in its call (the tracked list, the compared guid).
+    fn achievement_book_mut(&mut self) -> Option<&mut super::AchievementBook> {
+        None
+    }
+
+    /// A held player's PvP faction index (`0x6d6e90`), `None` for a guid that is no held player
+    /// (the lookup with the player type mask, `0x5b3d0a`, `0x5b3bf0`).
+    fn player_pvp_faction(&self, _guid: u64) -> Option<i32> {
+        None
+    }
+
+    /// A player's name-cache record read with no callback, which asks nothing (`0x5b58b0`'s owner name).
+    fn cached_player_name(&self, _guid: u64) -> Option<String> {
+        None
+    }
+
+    /// A player's name-cache record read with a callback: the name, or `None` with the query sent (`0x627220`).
+    fn player_name_or_ask(&mut self, _guid: u64) -> Option<String> {
+        None
+    }
+
+    /// `CMSG_QUERY_INSPECT_ACHIEVEMENTS` for `guid`, sent in the call (`0x5b1ab0`).
+    fn query_inspect_achievements(&mut self, _guid: u64) {}
+
+    /// `CharTitles.dbc`'s row count (`[0xad337c]`), 0 before the table loads.
+    fn char_title_count(&self) -> usize {
+        0
+    }
+
+    /// The `CharTitles.dbc` row whose mask id is `mask`, the first in file order (`0x719900`).
+    fn char_title(&self, _mask: i64) -> Option<super::TitleRow> {
+        None
+    }
+
+    /// The active player's title fields at the call, `None` with no active player held (`0x51b440`).
+    fn player_titles(&self) -> Option<super::PlayerTitles> {
+        None
+    }
+
+    /// `CMSG_SET_TITLE` with `mask`, sent in the call (`0x522efb`).
+    fn send_set_title(&mut self, _mask: i32) {}
+
+    /// The active player's sheet figures at the call, its fields, worn weapons and skill pairs, read where 12340's stat verbs read them (`0x610300`, `0x60ddb0`); `None` with no active player held.
+    fn player_combat_stats(&self) -> Option<super::UnitCombatStats> {
+        None
+    }
+
+    /// The active player's doll id `slot` (0 the ammo, 1..=23 the worn slots and equipped bags) at the call, its slot field and item object as the slot reader resolves them (`0x5e7c00`); `Some(None)` for an empty slot, `None` with no active player held.
+    fn inventory_slot(&self, _slot: usize) -> Option<Option<super::InvSlotView>> {
+        None
+    }
+
+    /// The active player's bank bag slot `i` (0..7, live ids 68..=74) at the call (`0x5e7c00`); `Some(None)` for an empty slot, `None` with no active player held.
+    fn bank_bag_slot(&self, _i: usize) -> Option<Option<super::InvSlotView>> {
+        None
+    }
+
+    /// Both weapons' temporary enchantment at the call, main hand then off hand (`0x5eaca0`); `None` with no active player held.
+    fn weapon_enchants(&self) -> Option<[Option<super::WeaponEnchant>; 2]> {
+        None
+    }
+
+    /// The active player's skill slot for line `skill_id` at the call, as `GetSkillLineInfo` reads it (`0x5cdfe7`), slot -1 for a line the player lacks (`0x6dc222`); `None` with no active player held.
+    fn skill_slot(&self, _skill_id: u32) -> Option<super::SkillLive> {
+        None
+    }
+
+    /// A line's `(rank, max)` as the trade-link builder reads the active player at the call (`0x5db120`-`0x5db134`); `None` with no active player held (`0x5db08f`).
+    fn skill_link_ranks(&self, _skill_id: u32) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// The client's skill list at the call (`0xc22ae8`-`0xc22b18`), which a UI reload keeps; `None` where no view lends it.
+    fn skill_list(&self) -> Option<&super::SkillList> {
+        None
+    }
+
+    /// The skill list, for a binding that writes it in its call (the fold, the selection, the skill-ups).
+    fn skill_list_mut(&mut self) -> Option<&mut super::SkillList> {
+        None
+    }
+
+    /// The active player's `PLAYER_CHARACTER_POINTS2` at the call (`0x5cd970`), `None` with no active player held.
+    fn skill_points(&self) -> Option<u32> {
+        None
+    }
+
+    /// `CMSG_UNLEARN_SKILL` for `skill_id`, sent in the call (`0x5ce368`).
+    fn send_unlearn_skill(&mut self, _skill_id: u32) {}
+
+    /// A skill buy, sent in the call (`0x5ce686`, `0x5ce849`).
+    fn send_skill_request(&mut self, _request: super::SkillRequest) {}
+
+    /// The client's talent state at the call; `None` where no view lends it.
+    fn talent_info(&self) -> Option<&super::TalentInfo> {
+        None
+    }
+
+    /// The client's talent state at the call, for a verb that writes it; `None` where no view lends it.
+    fn talent_info_mut(&mut self) -> Option<&mut super::TalentInfo> {
+        None
+    }
+
+    /// The unit a talent verb acts for (`0x5c81df`): the pet's first guid held as a unit, else the active player held; `None` without it.
+    fn talent_unit(&self, _pet: bool) -> Option<u64> {
+        None
+    }
+
+    /// The pet's family category through its creature record (`0x5c5a28`), `None` without the pet held or the family's row.
+    fn pet_family_category(&self) -> Option<i32> {
+        None
+    }
+
+    /// `CMSG_LEARN_TALENT`, or with the pet's guid `CMSG_PET_LEARN_TALENT`, sent in the call (`0x5c8288`).
+    fn send_learn_talent(&mut self, _pet: Option<u64>, _talent: u32, _rank: u32) {}
+
+    /// `CMSG_LEARN_PREVIEW_TALENTS`, or with the pet's guid its pet form, sent in the call (`0x5c6a10`).
+    fn send_learn_preview_talents(&mut self, _pet: Option<u64>, _talents: Vec<(u32, u32)>) {}
+
+    /// The active player's `PLAYER_CHARACTER_POINTS1/2` at the call; `None` with no active player held.
+    fn character_points(&self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// The `GlyphProperties.dbc` row `id` with its spell's name, read at the call; `None` without the row.
+    fn glyph(&self, _id: u32) -> Option<super::GlyphView> {
+        None
+    }
+
+    /// The `GlyphSlot.dbc` row `id`, read at the call; `None` without the row.
+    fn glyph_slot(&self, _id: u32) -> Option<super::GlyphSlotView> {
+        None
+    }
+
+    /// The active player's glyph fields at the call (`+0x1230`, `+0x1248`, `+0x1260`); `None` with no active player held.
+    fn glyph_sockets(&self) -> Option<super::GlyphSockets> {
+        None
+    }
+
+    /// The targeting cast's glyph effects at the call (`0x7fd640` and its `Spell.dbc` row); `None` without a targeting cast or its row.
+    fn glyph_targeting(&self) -> Option<super::GlyphTargeting> {
+        None
+    }
+
+    /// `CMSG_REMOVE_GLYPH` with the 0-based `socket`, sent in the call (`0x5b76ea`).
+    fn send_remove_glyph(&mut self, _socket: u32) {}
+
+    /// The trade's network cells at the call: the partner's offered coins (`0xca0b78`) and each window's enchant spell (`0xca0ff0`); `None` where no view lends them.
+    fn trade_cells(&self) -> Option<super::TradeCells> {
+        None
+    }
+
+    /// The group loot roll `roll_id` on the client's list (`0x6fb150`), its record read with no callback and its time left off the clock at the call (`0x5889d0`, `0x588cc0`); `Some(None)` for no such roll, `None` where no view lends it.
+    fn loot_roll(&self, _roll_id: i64) -> Option<Option<super::LootRollEntry>> {
+        None
+    }
+
+    /// The open loot window resolved at the call: its coin slot and its 18 rows, each row's record read with no callback (`0x588310`, `0x5884a0`); `Some(None)` with no loot open, `None` where no view lends it.
+    fn loot_window(&self) -> Option<Option<super::LootState>> {
+        None
+    }
+
+    /// The looted object (`[0xbfa8d8]`), 0 with no loot open; `None` where no view lends it.
+    fn loot_source(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether the last window's loot type (`[0xbfa68c]`) is fishing; `None` where no view lends it.
+    fn loot_fishing(&self) -> Option<bool> {
+        None
+    }
+
+    /// The master-loot candidate at 0-based `index` (`0x6fa770`) named off the name cache, a miss asking with the list's callback (`0x58899d` -> `0x588150`); `Some(None)` for nobody, `None` where no view lends it.
+    fn master_loot_candidate(&mut self, _index: u32) -> Option<Option<String>> {
+        None
+    }
+
+    /// The inbox's shown rows and the server's whole count (`[0xbeb1d8]`, `[0xbeb1dc]`); `None` where no view lends the mail.
+    fn mail_inbox_counts(&self) -> Option<(usize, u32)> {
+        None
+    }
+
+    /// Inbox row `index` (0-based) resolved at the call, `text` the global strings and `military` the 24-hour clock: each record `read` names leaves its callback on a miss (`0x56d4b0`, `0x56d460`); `Some(None)` past the rows, `None` where no view lends the mail.
+    fn mail_row(
+        &mut self,
+        _index: usize,
+        _read: super::MailRead,
+        _text: &dyn Fn(&str) -> Option<String>,
+        _military: bool,
+    ) -> Option<Option<super::MailInboxRow>> {
+        None
+    }
+
+    /// The mark-as-read of inbox row `index` (0-based) inside the call (`0x56fe30`): the packet sent and the row turned read, then the signals it raises in order, none for no unread row; `None` where no view lends the mail.
+    fn mail_mark_read(&mut self, _index: usize) -> Option<Vec<&'static str>> {
+        None
+    }
+
+    /// A return or delete in flight on inbox row `index` (0-based) (`+0x2940`); `None` where no view lends the mail.
+    fn mail_mark_delete_pending(&mut self, _index: usize) -> Option<()> {
+        None
+    }
+
+    /// `HasNewMail()`'s test (`0x56f350`); `None` where no view lends the mail.
+    fn mail_has_new(&self) -> Option<bool> {
+        None
+    }
+
+    /// The delivered senders' names (`0x56f3a0`), a miss leaving the sender's callback (`0x56f3e0`); `None` where no view lends the mail.
+    fn mail_latest_senders(
+        &mut self,
+        _text: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<Vec<Option<String>>> {
+        None
+    }
+
+    /// The usable stationery list, rebuilt first (`0x56fc80`) on `rebuild` with no stationery record in flight; `None` where no view lends the mail.
+    fn mail_stationeries(&mut self, _rebuild: bool) -> Option<Vec<super::StationeryView>> {
+        None
+    }
+
+    /// `Package.dbc`'s rows; `None` where no view lends the mail.
+    fn mail_packages(&self) -> Option<Vec<super::PackageView>> {
+        None
+    }
+
+    /// Send `packet` to the open mailbox inside the call, as the verb's own send does; a take
+    /// with `auto_loot` keeps looting its mail (`0x5703c5`). `None` where no view lends the mail.
+    fn mail_send(&mut self, _packet: super::MailPacket) -> Option<()> {
+        None
+    }
+
+    /// The complaint about the sender of the mail `message_id` inside the call (`0x56faf0`): with
+    /// the complaint system on, a repeat is told back, else the sender joins the complained list
+    /// and the report goes out; `None` where no view lends the mail.
+    fn mail_complain(&mut self, _message_id: u32) -> Option<super::MailComplaint> {
+        None
+    }
+
+    /// `CloseMail`'s state legs inside the call (`0x571a40`): with a mailbox open, the interact
+    /// target cleared on it (`0x571a5e`), then the mailbox and the auto-loot zeroed (`0x571a6a`).
+    /// `Some(held)`, `held` when the mailbox held the target, whose interaction close ran the mail
+    /// close too (`0x51302d`); `Some(None)` with no mailbox; `None` where no view lends the mail.
+    fn mail_close(&mut self) -> Option<Option<bool>> {
+        None
+    }
+
+    /// The close's tail (`0x571a99`, `0x5717a7`): the query an arrival deferred while the mailbox
+    /// was open, sent once.
+    fn mail_close_query(&mut self) {}
+
+    /// The auctioneer (`[0xc0f3e8]`), `Some(None)` with none; `None` where no view lends the
+    /// auction house.
+    fn auction_auctioneer(&self) -> Option<Option<u64>> {
+        None
+    }
+
+    /// One list's rows and its total (`0x59c1a0`); `None` where no view lends the auction house.
+    fn auction_counts(&self, _list: usize) -> Option<(usize, u32)> {
+        None
+    }
+
+    /// Row `index` (0-based) of `list` read at the call; `info`, `GetAuctionItemInfo`'s read, leaves
+    /// the list's callback on each name in flight once (`0x59d8dd`, `0x59d946`). `Some(None)` past the
+    /// rows, `None` where no view lends the auction house.
+    fn auction_row(
+        &mut self,
+        _list: usize,
+        _index: usize,
+        _info: bool,
+    ) -> Option<Option<super::AuctionItemRow>> {
+        None
+    }
+
+    /// The 0-based row of `auction_id` on `list` (`0x59b3a0`); `None` where no view lends the
+    /// auction house.
+    fn auction_find(&self, _list: usize, _auction_id: u32) -> Option<Option<usize>> {
+        None
+    }
+
+    /// The house's `AuctionHouse.dbc` deposit rate (`0x59bc90`), `Some(None)` with no row; `None`
+    /// where no view lends the auction house.
+    fn auction_deposit_rate(&self) -> Option<Option<u32>> {
+        None
+    }
+
+    /// The query gate of `list` (`0x59a2f0`) and the get-all one (`0x59c7ce`); `None` where no view
+    /// lends the auction house.
+    fn auction_can_send(&self, _list: usize) -> Option<(bool, bool)> {
+        None
+    }
+
+    /// `list`'s sort criteria, front first; `None` where no view lends the auction house.
+    fn auction_criteria(&self, _list: usize) -> Option<Vec<(u8, bool)>> {
+        None
+    }
+
+    /// Replace `list`'s sort criteria; `None` where no view lends the auction house.
+    fn set_auction_criteria(&mut self, _list: usize, _criteria: Vec<(u8, bool)>) -> Option<()> {
+        None
+    }
+
+    /// Sort `list` in place by its criteria (`0x59b980`, `0x59b9e0`, `0x59cab0`), the verb raising
+    /// its update; `None` where no view lends the auction house.
+    fn auction_sort(&mut self, _list: usize) -> Option<()> {
+        None
+    }
+
+    /// Send `packet` inside the verb's call, behind the gate its send reads; `None` where no view
+    /// lends the auction house.
+    fn auction_send(&mut self, _packet: super::AuctionPacket) -> Option<()> {
+        None
+    }
+
+    /// `StartAuction`'s multi-sell state (`0x59fc92`-`0x59fcf3`), pending with more than one stack;
+    /// `None` where no view lends the auction house.
+    fn auction_multisell_start(&mut self, _sell: super::AuctionMultiSell) -> Option<()> {
+        None
+    }
+
+    /// The next-item sell (`0x59ba80`); `None` where no view lends the auction house.
+    fn auction_sell_next(&mut self) -> Option<super::AuctionSellStep> {
+        None
+    }
+
+    /// Whether a multi-sell is pending (`[0xc0f434]`), with `end` ending it (`0x59ab26`); `None`
+    /// where no view lends the auction house.
+    fn auction_pending_sell(&mut self, _end: bool) -> Option<bool> {
+        None
+    }
+
+    /// The close's interact-target clear on the auctioneer (`0x59f189`): whether the auctioneer held
+    /// the target, whose interaction close runs the house's close again (`0x51304a`); `None` where no
+    /// view lends the auction house.
+    fn auction_clear_target(&mut self) -> Option<bool> {
+        None
+    }
+
+    /// The close's state (`0x59f198`-`0x59f22b`); `None` where no view lends the auction house.
+    fn auction_end_session(&mut self) -> Option<()> {
+        None
+    }
+
+    /// The auction expiry (`0x59f2f0`) of `auction_id`: the events it raises, in order; `None`
+    /// where no view lends the auction house.
+    fn auction_expired(&mut self, _auction_id: u32) -> Option<Vec<&'static str>> {
+        None
+    }
+
+    /// What the trade offer's gates read off held item `item` (`0x587aff`-`0x587bcf`, `0x5877b0`, `0x5d896d`); `None` with no item store held.
+    fn trade_item_facts(&self, _item: u64) -> Option<super::TradeItemFacts> {
         None
     }
 
@@ -1243,6 +1692,16 @@ pub trait LiveState {
         self.guild_bank_slot(tab, slot).and_then(|s| s.texture)
     }
 
+    /// The item lock (`item+0x394` bit 0) of `guid`; `None` with no item store lent.
+    fn item_locked(&self, _guid: u64) -> Option<bool> {
+        None
+    }
+
+    /// Lock (`0x706fe0`) or unlock (`0x707020`) the item `guid`: whether its bit moved; `None` with no item store lent.
+    fn set_item_lock(&mut self, _guid: u64, _locked: bool) -> Option<bool> {
+        None
+    }
+
     /// Whether slot `(tab, slot)` holds `item_id` locked (`0x5a4c40`).
     fn guild_bank_locked(&self, _tab: u8, _slot: u8, _item_id: u32) -> bool {
         false
@@ -1309,10 +1768,10 @@ pub(crate) fn has_control() -> bool {
     read_live(|l| l.has_control()).unwrap_or(true)
 }
 
-/// Queue `event` with the frame's unique signals (`0x615020`), which fire once each after the frame's packets (`0x614760`); with no queue lent, the model's pending events take it.
+/// Queue `event` with the frame's unique signals (`0x615020`), which fire once each after the frame's packets (`0x614760`); with no queue lent, the model's deferred events take it.
 pub(crate) fn unique_signal(model: &mut super::model::Model, event: &'static str) {
     if write_live(|l| l.unique_signal(event)) != Some(true) {
-        model.pending_events.push((event.to_string(), Vec::new()));
+        model.defer_event(event, Vec::new());
     }
 }
 
@@ -1361,6 +1820,9 @@ pub(crate) fn arena_teams(slots: [super::ArenaTeamSlotView; 3]) -> TestView {
 pub(crate) struct TestView {
     /// The active player's guid.
     pub player: Option<u64>,
+    /// The carried-count check's answer, and the `(item_id, count)` it was asked, in order.
+    pub carry: Option<super::CarryRefusal>,
+    pub carry_asks: std::cell::RefCell<Vec<(u32, u32)>>,
     /// Each held unit's `(flags, health)`.
     pub units: std::collections::HashMap<u64, (u32, u32)>,
     /// The control flag; the default view has lost control.
@@ -1494,6 +1956,45 @@ pub(crate) struct TestView {
     pub trainer_is_open: Option<bool>,
     /// The trainer zero legs run.
     pub trainer_zeroes: u32,
+    /// The chat lines the display added inside its calls, with their wire chat type.
+    pub chat_lines: Vec<(u8, String)>,
+    /// The client's faction list and the faction table it reads.
+    pub faction_list: super::FactionList,
+    pub factions: super::StaticFactions,
+    /// The achievement tables and lists, the cached player names, the name queries and the
+    /// comparison queries sent, in order.
+    pub achievement_db: Option<std::sync::Arc<super::AchievementDb>>,
+    pub achievements: super::AchievementBook,
+    pub player_names: std::collections::HashMap<u64, String>,
+    pub name_asks: Vec<u64>,
+    pub inspect_achievement_queries: Vec<u64>,
+    /// Each held player's PvP faction index; a guid absent here is no held player.
+    pub player_factions: std::collections::HashMap<u64, i32>,
+    /// `CharTitles.dbc`'s rows, our title fields, and the `CMSG_SET_TITLE` masks sent, in order.
+    pub char_titles: Vec<super::TitleRow>,
+    pub player_titles: Option<super::PlayerTitles>,
+    pub title_sends: Vec<i32>,
+    /// Our sheet figures, our skill slots by line, and the skill sends made, in order.
+    pub combat_stats: Option<super::UnitCombatStats>,
+    pub skills: Option<std::collections::HashMap<u32, super::SkillLive>>,
+    /// What a line missing from `skills` reads: slot -1 (`0x6dc222`).
+    pub skill_slot_minus_one: super::SkillLive,
+    pub unlearn_sends: Vec<u32>,
+    pub skill_sends: Vec<super::SkillRequest>,
+    /// The talent state, the talent unit per side `(player, pet)`, the pet's family category, our character points, and the learn sends in order.
+    pub talent_info: Option<super::TalentInfo>,
+    pub talent_units: (Option<u64>, Option<u64>),
+    pub pet_category: Option<i32>,
+    /// The pet's known spells, its higher ranks included.
+    pub pet_known: Vec<u32>,
+    pub character_points: Option<(u32, u32)>,
+    pub talent_learns: Vec<(Option<u64>, u32, u32)>,
+    pub talent_preview_learns: Vec<super::PreviewLearn>,
+    /// The glyph tables, our glyph fields (`None` without the active player), the targeting cast's glyphs, and the `CMSG_REMOVE_GLYPH` sockets sent, in order.
+    pub glyph_catalog: super::GlyphCatalogView,
+    pub glyph_sockets: Option<super::GlyphSockets>,
+    pub glyph_targeting: Option<super::GlyphTargeting>,
+    pub glyph_removes: Vec<u32>,
 }
 
 /// The gossip globals a test view lends.
@@ -1550,6 +2051,147 @@ impl TestView {
 
 #[cfg(test)]
 impl LiveState for TestView {
+    fn reputation(
+        &mut self,
+        f: &mut dyn FnMut(&mut super::FactionList, &mut dyn super::FactionTable),
+    ) -> bool {
+        f(&mut self.faction_list, &mut self.factions);
+        true
+    }
+
+    fn carry_refusal(&self, item_id: u32, count: u32) -> Option<super::CarryRefusal> {
+        self.carry_asks.borrow_mut().push((item_id, count));
+        self.carry.clone()
+    }
+
+    fn achievement_db(&self) -> Option<std::sync::Arc<super::AchievementDb>> {
+        self.achievement_db.clone()
+    }
+
+    fn achievement_book(&self) -> Option<&super::AchievementBook> {
+        Some(&self.achievements)
+    }
+
+    fn achievement_book_mut(&mut self) -> Option<&mut super::AchievementBook> {
+        Some(&mut self.achievements)
+    }
+
+    fn player_pvp_faction(&self, guid: u64) -> Option<i32> {
+        self.player_factions.get(&guid).copied()
+    }
+
+    fn cached_player_name(&self, guid: u64) -> Option<String> {
+        self.player_names.get(&guid).cloned()
+    }
+
+    fn player_name_or_ask(&mut self, guid: u64) -> Option<String> {
+        let name = self.player_names.get(&guid).cloned();
+        if name.is_none() {
+            self.name_asks.push(guid);
+        }
+        name
+    }
+
+    fn query_inspect_achievements(&mut self, guid: u64) {
+        self.inspect_achievement_queries.push(guid);
+    }
+
+    fn char_title_count(&self) -> usize {
+        self.char_titles.len()
+    }
+
+    fn char_title(&self, mask: i64) -> Option<super::TitleRow> {
+        super::title_row(&self.char_titles, mask).cloned()
+    }
+
+    fn player_titles(&self) -> Option<super::PlayerTitles> {
+        self.player_titles.clone()
+    }
+
+    fn send_set_title(&mut self, mask: i32) {
+        self.title_sends.push(mask);
+    }
+
+    fn player_combat_stats(&self) -> Option<super::UnitCombatStats> {
+        self.combat_stats.clone()
+    }
+
+    fn skill_slot(&self, skill_id: u32) -> Option<super::SkillLive> {
+        let skills = self.skills.as_ref()?;
+        Some(
+            skills
+                .get(&skill_id)
+                .copied()
+                .unwrap_or(self.skill_slot_minus_one),
+        )
+    }
+
+    fn send_unlearn_skill(&mut self, skill_id: u32) {
+        self.unlearn_sends.push(skill_id);
+    }
+
+    fn send_skill_request(&mut self, request: super::SkillRequest) {
+        self.skill_sends.push(request);
+    }
+
+    fn talent_info(&self) -> Option<&super::TalentInfo> {
+        self.talent_info.as_ref()
+    }
+
+    fn talent_info_mut(&mut self) -> Option<&mut super::TalentInfo> {
+        self.talent_info.as_mut()
+    }
+
+    fn talent_unit(&self, pet: bool) -> Option<u64> {
+        if pet {
+            self.talent_units.1
+        } else {
+            self.talent_units.0
+        }
+    }
+
+    fn pet_family_category(&self) -> Option<i32> {
+        self.pet_category
+    }
+
+    fn pet_spell_known_or_higher(&self, spell_id: u32) -> bool {
+        self.talent_units.0.is_some()
+            && self.talent_units.1.is_some()
+            && self.pet_known.contains(&spell_id)
+    }
+
+    fn send_learn_talent(&mut self, pet: Option<u64>, talent: u32, rank: u32) {
+        self.talent_learns.push((pet, talent, rank));
+    }
+
+    fn send_learn_preview_talents(&mut self, pet: Option<u64>, talents: Vec<(u32, u32)>) {
+        self.talent_preview_learns.push((pet, talents));
+    }
+
+    fn character_points(&self) -> Option<(u32, u32)> {
+        self.character_points
+    }
+
+    fn glyph(&self, id: u32) -> Option<super::GlyphView> {
+        self.glyph_catalog.glyph(id).cloned()
+    }
+
+    fn glyph_slot(&self, id: u32) -> Option<super::GlyphSlotView> {
+        self.glyph_catalog.slot(id).copied()
+    }
+
+    fn glyph_sockets(&self) -> Option<super::GlyphSockets> {
+        self.glyph_sockets
+    }
+
+    fn glyph_targeting(&self) -> Option<super::GlyphTargeting> {
+        self.glyph_targeting
+    }
+
+    fn send_remove_glyph(&mut self, socket: u32) {
+        self.glyph_removes.push(socket);
+    }
+
     fn unit_cast(&self, guid: u64, channel: bool) -> Option<super::UnitCast> {
         self.unit_casts.get(&(guid, channel)).cloned()
     }
@@ -1628,6 +2270,21 @@ impl LiveState for TestView {
     fn taxi_act(&mut self, act: super::TaxiAct) -> Option<super::TaxiOutcome> {
         self.taxi_acts.push(act);
         None
+    }
+
+    /// A system line fires `CHAT_MSG_SYSTEM`, a skill line `CHAT_MSG_SKILL`, with the text alone.
+    fn add_chat_line(
+        &mut self,
+        chat_type: u8,
+        text: &str,
+    ) -> Option<(&'static str, Vec<super::ScriptValue>)> {
+        self.chat_lines.push((chat_type, text.to_string()));
+        let event = if chat_type == 26 {
+            "CHAT_MSG_SKILL"
+        } else {
+            "CHAT_MSG_SYSTEM"
+        };
+        Some((event, vec![super::ScriptValue::Str(text.to_string())]))
     }
 
     fn trainer_buy(&mut self, spell_id: u32) -> bool {
@@ -2012,11 +2669,11 @@ impl LiveState for TestView {
             .and_then(|s| s.record.clone())
     }
 
-    fn notify_inspect(&self, guid: u64) -> bool {
+    fn notify_inspect(&mut self, guid: u64) -> bool {
         self.inspect_target.replace(guid) != guid
     }
 
-    fn clear_inspect_target(&self) {
+    fn clear_inspect_target(&mut self) {
         self.inspect_target.set(0);
     }
 

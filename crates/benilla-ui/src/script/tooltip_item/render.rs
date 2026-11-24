@@ -394,7 +394,7 @@ fn render_lines(
         let worn: Vec<WornPiece> = match &set_view {
             Some(_) => {
                 let ids: Vec<u32> = model
-                    .inventory_slots
+                    .worn_slots()
                     .iter()
                     .take(19)
                     .flatten()
@@ -508,7 +508,7 @@ fn render_lines(
             keyed("ITEM_CONJURED", &[], WHITE, false)?;
         }
         let bound = inst.is_some_and(|i| i.already_bound);
-        let loot_source = crate::script::model_mut_of(lua).loot_source;
+        let loot_source = crate::script::loot::source(&crate::script::model_mut_of(lua));
         if let Some(key) = bind_key(v, bound, flags.requester.is_loot_source(loot_source)) {
             keyed(key, &[], WHITE, false)?;
         }

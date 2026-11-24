@@ -74,10 +74,31 @@ pub struct ActionState {
 }
 
 /// [`ActionState`] with its cooldown in `GetTime` seconds.
+#[cfg(any(test, feature = "fixtures"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct StoredActionState {
     pub(crate) state: ActionState,
     pub(crate) cooldown: Option<(f64, f64, bool)>,
+}
+
+/// A stand-in's state and its cooldown in `GetTime` seconds.
+type StandIn = (ActionState, Option<(f64, f64, bool)>);
+
+/// The stand-in state a test or fixture pushed for `action`, read with no view lent; none in the player build.
+#[cfg(any(test, feature = "fixtures"))]
+fn stand_in(lua: &Lua, action: u32) -> Option<StandIn> {
+    let model = lua
+        .app_data_ref::<crate::script::ModelCell>()
+        .expect("model app_data");
+    model
+        .action_states
+        .get(&action)
+        .map(|s| (s.state, s.cooldown))
+}
+
+#[cfg(not(any(test, feature = "fixtures")))]
+fn stand_in(_: &Lua, _: u32) -> Option<StandIn> {
+    None
 }
 
 /// One queued `UseAction` press.
@@ -106,8 +127,8 @@ impl super::UiScript {
         }
     }
 
-    /// Push (or clear) one action's state; the cooldown start is already on the `GetTime` clock,
-    /// so storing only converts milliseconds to seconds.
+    /// Push (or clear) one action's stand-in state, read with no view lent; the cooldown start is on the `GetTime` clock.
+    #[cfg(any(test, feature = "fixtures"))]
     pub fn set_action_state(&mut self, action: u32, state: Option<ActionState>) {
         let mut model = self.model_mut();
         match state {
@@ -155,12 +176,6 @@ impl super::UiScript {
     #[cfg(any(test, feature = "fixtures"))]
     pub fn take_action_sets(&mut self) -> Vec<(u32, u32)> {
         drain_field!(self, action_sets)
-    }
-
-    /// Drain the GlobalStrings keys of engine-side refusals; the app fires `UI_ERROR_MESSAGE` for
-    /// each, where the reference calls its error display inline.
-    pub fn take_ui_errors(&mut self) -> Vec<&'static str> {
-        drain_field!(self, ui_errors)
     }
 
     /// Drain the catalog keys of lines verbs displayed inline, for the app to sound.
@@ -409,12 +424,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             if let Some(refusal) =
                 super::cursor::use_action_places(&mut model, action, in_binding, &mut changed)
             {
-                let grid = super::cursor::take_grid_edge(&mut model);
                 drop(model);
                 if let Some(line) = refusal {
                     crate::script::ui_errors::show_line_now(lua, line);
                 }
-                super::action_slots::signal_all(lua, grid, changed);
+                super::action_slots::signal_all(lua, changed);
                 return Ok(());
             }
             // A set slot wears the set (`0x5abdcc` → the equipment manager's set equip `0x5ae660`).
@@ -498,11 +512,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
     // reads the bar at the call; with no view lent, the stand-in state a test or fixture pushed.
 
     fn state_flag(lua: &Lua, action: u32, pick: impl Fn(&ActionState) -> bool) -> Value {
-        let model = lua
-            .app_data_ref::<crate::script::ModelCell>()
-            .expect("model app_data");
-        match model.action_states.get(&action) {
-            Some(s) if pick(&s.state) => Value::Integer(1),
+        match stand_in(lua, action) {
+            Some((s, _)) if pick(&s) => Value::Integer(1),
             _ => Value::Nil,
         }
     }
@@ -548,14 +559,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             if let Some(near) = super::read_live(|l| l.action_in_range(slot, target)).flatten() {
                 return Ok(super::spell_info::range_answer(near));
             }
-            let model = lua
-                .app_data_ref::<crate::script::ModelCell>()
-                .expect("model app_data");
             Ok(super::spell_info::range_answer(
-                model
-                    .action_states
-                    .get(&action)
-                    .and_then(|s| s.state.in_range),
+                stand_in(lua, action).and_then(|(s, _)| s.in_range),
             ))
         })?,
     )?;
@@ -661,8 +666,9 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     i32::from(enabled),
                 ));
             }
+            drop(model);
             Ok(
-                match model.action_states.get(&action).and_then(|s| s.cooldown) {
+                match stand_in(lua, action).and_then(|(_, cooldown)| cooldown) {
                     Some((start, duration, enabled)) if start + duration > now || !enabled => {
                         (start, duration, i32::from(enabled))
                     }

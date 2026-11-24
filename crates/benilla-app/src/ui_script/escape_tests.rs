@@ -2,7 +2,7 @@
 //! focused edit box preempts. The bag windows are recycled, so a bag is asked of `IsBagOpen`,
 //! never by frame name.
 
-use super::test_live::SpellAnswersExt;
+use super::test_live::{LootVerbsExt, SpellAnswersExt};
 use benilla_ui::script::{ContainerSlot, ContainerState, LootRow, LootState, UiScript};
 
 use super::test_ui::{bag_open, bag_slot_button, click, load_ui as load_xml, BAG_UI};
@@ -72,6 +72,7 @@ fn escape_closes_bag_and_panel_releases_loot_and_keeps_the_held_item() {
     // Open the bag and the loot window; drain their open sounds.
     s.run("MainMenuBarBackpackButton:Click()").unwrap();
     s.set_loot(Some(LootState {
+        coin_slot: false,
         source_unit: false,
         source_level: 0,
         fishing: false,
@@ -83,6 +84,7 @@ fn escape_closes_bag_and_panel_releases_loot_and_keeps_the_held_item() {
             quantity: 1,
             quality: Some(1),
             is_coin: false,
+            coins: 0,
             link: None,
             random_property_id: 0,
             locked: false,

@@ -270,6 +270,7 @@ mod stdlib;
 pub use stdlib::lua_message;
 mod summon;
 mod talent;
+mod talent_info;
 mod taxi;
 mod threat;
 mod tick;
@@ -309,10 +310,12 @@ pub use arena_team::{
     ArenaTeamSlotView,
 };
 pub use auction::{
-    AuctionBid, AuctionCategory, AuctionHighBidder, AuctionItemRow, AuctionListState, AuctionQuery,
-    AuctionStartRequest, AuctionState, AuctionSubCategory, BIDDER, LIST, OWNER, SORT_COLUMNS,
+    auction_default_criteria, auction_sort_order, AuctionCategory, AuctionHighBidder,
+    AuctionItemRow, AuctionListState, AuctionMultiSell, AuctionPacket, AuctionQuery,
+    AuctionSellStep, AuctionState, AuctionSubCategory, CarryRefusal, BIDDER, LIST, OWNER,
+    SORT_COLUMNS,
 };
-pub use aura::AuraState;
+pub use aura::{AuraFacts, AuraState, UnitAuraSlots};
 pub(crate) use backdrop::set_edge_blend as backdrop_set_edge_blend;
 pub use backdrop::{inset_atlas_bleed, pieces, Backdrop, BackdropPiece, Insets};
 pub use barber::{BarberRead, BarberStyle};
@@ -326,7 +329,10 @@ pub use battlefield_score::{
     BattlefieldScoreRow, BattlefieldScores, BattlefieldStatColumn, BattlefieldTeamView, ScoreName,
 };
 pub use bind_confirm::PendingEquipAnswer;
-pub use calls::{apply_queued, set_apply, ApplyCall, CastAt, NearestMode, ScriptCall, VerbPress};
+pub use calls::{
+    apply_queued, set_answer, set_apply, AnswerHost, ApplyCall, CastAt, GuildBankVerdict,
+    HostAnswer, HostAsk, LootVerb, NearestMode, ScriptCall, VerbPress,
+};
 pub use camera_view::{CameraViewRequest, CAMERA_VIEW_COUNT};
 pub use channel::{ChannelCommand, ZoneChannelRow};
 pub use channel_pane::ChannelSlotInfo;
@@ -349,7 +355,7 @@ pub use combat_log::{
 pub use container::{
     BagAutoStore, ContainerMove, ContainerSlot, ContainerState, EnchantConditionTest,
     EnchantConditionView, EnchantRequirementView, EnchantView, PendingWrap, PetitionSlotView,
-    RandomPropertyView, UiCursorMode,
+    RandomPropertyView, SwapGate, UiCursorMode,
 };
 pub use cursor::item_lock_args;
 pub use cursor::money::coin_icon;
@@ -395,9 +401,10 @@ pub use video_pairs::VIDEO_PAIR_CVARS;
 pub use worldmap_arrow::ARROW_MODEL;
 
 pub use achievement::{
-    achievement_hyperlink, decode_tracked, encode_tracked, AchievementBook, AchievementCategoryRow,
-    AchievementCriteriaRow, AchievementDb, AchievementRow, AchievementUpdate, CriteriaWire,
-    WowDate,
+    achievement_hyperlink, decode_tracked, encode_tracked, handle_achievement_packet,
+    upgrade_tracked, AchievementBook, AchievementCategoryRow, AchievementCriteriaRow,
+    AchievementDb, AchievementEvent, AchievementHost, AchievementRow, AchievementUpdate,
+    CriteriaWire, WowDate,
 };
 pub use calendar::{
     date_time_text, CalendarCatalogView, CalendarCommandResultView, CalendarEventRowView,
@@ -439,12 +446,13 @@ pub use lfg::{
 pub use loot::{LootRow, LootState, LOOT_PORTRAIT_UNIT};
 pub use loot_roll::{LootRollEntry, LootRollsState};
 pub use macros::{
-    MacroBinding, MacroState, MacroView, MAX_ACCOUNT_MACROS, MAX_MACRO_BODY, MAX_MACRO_INDEX,
-    MAX_MACRO_NAME,
+    MacroBinding, MacroChange, MacroState, MacroView, MAX_ACCOUNT_MACROS, MAX_MACRO_BODY,
+    MAX_MACRO_INDEX, MAX_MACRO_NAME,
 };
 pub use mail::{
-    MailAttachmentView, MailCommand, MailInboxRow, MailInvoice, MailSendRequest, MailState,
-    PackageView, StationeryView, MAIL_ATTACHMENT_SLOTS, MAIL_SEND_SLOTS, STATIONERY_GM,
+    MailAttachmentView, MailComplaint, MailInboxRow, MailInvoice, MailPacket, MailRead,
+    MailSendRequest, MailState, PackageView, StationeryView, MAIL_ATTACHMENT_SLOTS,
+    MAIL_SEND_SLOTS, STATIONERY_GM,
 };
 pub use measure::TextMeasure;
 pub use merchant::{
@@ -473,7 +481,9 @@ pub use quest_log::{
 pub use quest_poi::QuestPoiLines;
 pub use quest_watch::{QuestPoiRegion, QuestPoiView, QuestSpecialItemView};
 pub(crate) use region::{apply_font_parts, implicit_creation_anchor_lua, store_text};
-pub use reputation::{FactionEntry, ReputationSend, ReputationState};
+pub use reputation::{
+    FactionEntry, FactionFlag, FactionList, FactionTable, ReputationSend, StaticFactions,
+};
 pub use rune::{RuneEvent, RuneRegen, RuneState, MAX_RUNES, RUNE_KINDS};
 pub use session::SessionRequest;
 pub use shapeshift::ShapeshiftFormView;
@@ -481,7 +491,7 @@ pub(crate) use simplehtml::{
     apply_element_font_parts as apply_simplehtml_font_parts,
     element_of_xml_tag as simplehtml_element_of_xml_tag,
 };
-pub use skills::{SkillEntry, SkillRequest, SkillsState};
+pub use skills::{SkillEntry, SkillList, SkillLive, SkillRequest, SkillsState};
 pub use social::{FriendInfo, SocialRequest, SocialState, WhoInfo, WhoRecords};
 pub use sound::{MusicRequest, SoundRequest};
 pub use spell_info::{SpellInfo, SpellInfoSource, SpellStatEffect, SpellStatEffects};
@@ -492,15 +502,17 @@ pub use spellbook::{
 pub use stable::{
     StableCallback, StableFamily, StableIntent, StableList, StableRow, NUM_STABLE_SLOTS,
 };
-pub use talent::{
-    TalentGroupView, TalentPrereqView, TalentRankView, TalentTabView, TalentUiState, TalentView,
+pub use talent::{TalentPrereqView, TalentRankView, TalentTabView, TalentView};
+pub use talent_info::{
+    GroupTab, PreviewLearn, TalentGroup, TalentInfo, TalentItem, TalentPacket, TalentPacketGroup,
+    TalentPages, TalentSide,
 };
 pub use taxi::{TaxiAct, TaxiNodeType, TaxiOutcome, TaxiUiNode, TaxiUiState};
 pub use threat::{ThreatEntry, ThreatList, ThreatReading, ThreatView};
 pub use title::{chosen_title_name, title_row, PlayerTitles, TitleRow};
 pub use tooltip_spell::SpellTooltipView;
 pub use totem::{TotemView, MAX_TOTEM_SLOTS};
-pub use trade::{TradeSideState, TradeSlotItem, TradeState, TRADE_SLOTS};
+pub use trade::{TradeCells, TradeItemFacts, TradeItemSend, TradeTargetItem, TRADE_SLOTS};
 pub use tradeskill::{
     TradeSkillDifficulty, TradeSkillGroup, TradeSkillReagent, TradeSkillRecipe, TradeSkillState,
 };
@@ -851,46 +863,103 @@ pub const INSTRUCTION_HOOK_STEP: u32 = 1_000_000;
 /// The host's mutable borrow of the model: [`ModelCell`] through mlua's app-data borrow. Under
 /// `WOW_UI_EPOCH=1` the borrow's end charges its caller what the count moved.
 pub(crate) struct ModelGuard<'a> {
-    inner: mlua::AppDataRefMut<'a, ModelCell>,
+    lua: &'a mlua::Lua,
+    /// `None` only inside [`ModelGuard::raise`], while the listeners run.
+    inner: Option<mlua::AppDataRefMut<'a, ModelCell>>,
     at: u64,
     who: (&'static str, u32),
+}
+
+impl<'a> ModelGuard<'a> {
+    fn borrow(lua: &'a mlua::Lua, who: &std::panic::Location<'static>) -> Self {
+        let inner = lua.app_data_mut::<ModelCell>().expect("model app_data set");
+        let at = inner.epoch();
+        ModelGuard {
+            lua,
+            inner: Some(inner),
+            at,
+            who: (who.file(), who.line()),
+        }
+    }
+
+    /// Charge the caller what the count moved under this borrow; nothing while a raise that unwound holds none.
+    fn charge(&mut self) {
+        if !epoch_trace::enabled() {
+            return;
+        }
+        if let Some(now) = self.inner.as_ref().map(|inner| inner.epoch()) {
+            if now > self.at {
+                epoch_trace::note_host(self.who, now - self.at);
+            }
+        }
+    }
+
+    /// Signal `event` at this step, as the event signal (`0x81b530`) runs its listeners inside the caller: the borrow is released for them and taken back, so they read every write made so far and the code after reads theirs.
+    pub(crate) fn raise(&mut self, event: &str, args: Vec<ScriptValue>) {
+        self.charge();
+        self.inner = None;
+        tick::fire_event_into(self.lua, event, args);
+        let inner = self
+            .lua
+            .app_data_mut::<ModelCell>()
+            .expect("model app_data set");
+        self.at = inner.epoch();
+        self.inner = Some(inner);
+    }
+
+    /// Make `call` at this step, applied before this returns where the host's state is lent ([`calls::make`]); the borrow is released for it and taken back.
+    pub(crate) fn call(&mut self, call: ScriptCall) {
+        self.released(|lua| calls::make(lua, call));
+    }
+
+    /// Ask the host at this step ([`calls::ask_host`]), the borrow released for it and taken back.
+    pub(crate) fn ask(&mut self, ask: &HostAsk) -> Option<HostAnswer> {
+        self.released(|lua| calls::ask_host(lua, ask))
+    }
+
+    /// The message display at this step (`0x5216f0`), the borrow released for its listeners and taken back.
+    pub(crate) fn show(&mut self, key: &'static str) {
+        self.released(|lua| ui_errors::show_now(lua, key));
+    }
+
+    /// Run `f` with the model's borrow released, then take it back.
+    fn released<R>(&mut self, f: impl FnOnce(&'a mlua::Lua) -> R) -> R {
+        self.charge();
+        self.inner = None;
+        let out = f(self.lua);
+        let inner = self
+            .lua
+            .app_data_mut::<ModelCell>()
+            .expect("model app_data set");
+        self.at = inner.epoch();
+        self.inner = Some(inner);
+        out
+    }
 }
 
 impl std::ops::Deref for ModelGuard<'_> {
     type Target = ModelCell;
     fn deref(&self) -> &ModelCell {
-        &self.inner
+        self.inner.as_ref().expect("the model is borrowed")
     }
 }
 
 impl std::ops::DerefMut for ModelGuard<'_> {
     fn deref_mut(&mut self) -> &mut ModelCell {
-        &mut self.inner
+        self.inner.as_mut().expect("the model is borrowed")
     }
 }
 
 impl Drop for ModelGuard<'_> {
     fn drop(&mut self) {
-        if epoch_trace::enabled() {
-            let now = self.inner.epoch();
-            if now > self.at {
-                epoch_trace::note_host(self.who, now - self.at);
-            }
-        }
+        self.charge();
     }
 }
 
 /// [`ModelGuard`] for a caller holding `&Lua` (a binding): the model's mutable borrow.
 #[track_caller]
 pub(crate) fn model_mut_of(lua: &mlua::Lua) -> ModelGuard<'_> {
-    let inner = lua.app_data_mut::<ModelCell>().expect("model app_data set");
-    let at = inner.epoch();
-    let l = std::panic::Location::caller();
-    ModelGuard {
-        inner,
-        at,
-        who: (l.file(), l.line()),
-    }
+    ModelGuard::borrow(lua, std::panic::Location::caller())
 }
 
 /// `WOW_UI_EPOCH=1`: who moves the model's mutation count ([`ModelCell`]) every frame. Host
@@ -2135,17 +2204,7 @@ impl UiScript {
     /// A mutable borrow, which counts as a visual mutation ([`ModelCell`]).
     #[track_caller]
     fn model_mut(&self) -> ModelGuard<'_> {
-        let inner = self
-            .lua
-            .app_data_mut::<ModelCell>()
-            .expect("model app_data set");
-        let at = inner.epoch();
-        let l = std::panic::Location::caller();
-        ModelGuard {
-            inner,
-            at,
-            who: (l.file(), l.line()),
-        }
+        ModelGuard::borrow(&self.lua, std::panic::Location::caller())
     }
 
     /// The model's mutation count ([`ModelCell::epoch`]): a frame on which it stands where the

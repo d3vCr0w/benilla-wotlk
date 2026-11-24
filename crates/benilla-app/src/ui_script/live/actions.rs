@@ -15,7 +15,7 @@ use super::LiveView;
 /// `Spell.dbc`'s auto-attack effect, `IsAttackAction`'s test (`0x5a96d0`).
 const EFFECT_ATTACK: u32 = 78;
 
-/// `AttributesExB & 0x40000`: a pet-bar spell the player casts (`0x5a8cb5`).
+/// `AttributesExB & 0x40000`: a pet-bar spell the player casts (`0x5a8cf5`).
 const EX2_CAST_BY_PLAYER: u32 = 0x0004_0000;
 
 /// A bar slot as the resolvers read it.
@@ -33,7 +33,7 @@ pub(super) struct Resolved {
     pet_word: Option<PetActionEntry>,
 }
 
-/// Pet action word kinds: a spell, a reaction, a command, and the spell kinds 8-17 (`0x5a8113`).
+/// Pet action word kinds: a spell, a reaction, a command, and the spell kinds 8-17 (`0x5a8136`-`0x5a8141`).
 const PET_KIND_SPELL: u8 = 1;
 const PET_KIND_REACTION: u8 = 6;
 const PET_KIND_COMMAND: u8 = 7;
@@ -62,6 +62,7 @@ impl<'w, 's> LiveView<'w, 's> {
             objects,
             auras: &self.auras,
             place: self.place.as_deref(),
+            pending: self.pending.as_deref(),
             world: &self.usable_world,
             factions: self.factions.as_deref(),
             reputations: self.reputations.as_deref(),
@@ -279,8 +280,7 @@ impl<'w, 's> LiveView<'w, 's> {
         self.answers(|a| a.spell_has_range(r.spell, r.pet)) == Some(true)
     }
 
-    /// `IsEquippedAction` (`0x5a88b0`): an item with an inventory type worn, a copy with charges
-    /// left counting first when the item's use spell has finite charges (`0x5a894b`-`0x5a8990`).
+    /// `IsEquippedAction` (`0x5a88b0`): an item worn, a copy with charges left first for a finite use spell (`0x5a8949`-`0x5a8990`).
     pub(super) fn slot_equipped(&self, r: Resolved) -> bool {
         let (Some((objects, items, commands)), Some((_, me))) =
             (self.containers.as_ref().map(|c| c.item_reads()), self.me())
@@ -474,6 +474,19 @@ impl<'w, 's> LiveView<'w, 's> {
             .map(|w| w.action())
     }
 
+    /// The bar's walk at a verb's site (`0x5aa470`), `sets_usable` as the verb reads it: whether a slot's bytes moved.
+    pub(super) fn bar_update(&mut self, sets_usable: bool) -> Option<bool> {
+        let mut caches = self.usable.as_deref()?.clone();
+        caches.sets_usable = sets_usable;
+        let changed = self.usable_reads(|r| {
+            let mut out = Vec::new();
+            crate::ui_action::usable_cache::bar_pass(r, &mut caches, &mut out);
+            !out.is_empty()
+        })?;
+        *self.usable.as_deref_mut()? = caches;
+        Some(changed)
+    }
+
     /// The slot write (`0x5aae80`, `0x5aaa90` for 0): stored and sent, then the slot's usable bytes
     /// recomputed (`0x5aa390`); `Some(false)` on a locked bar.
     pub(super) fn write_slot_word(&mut self, slot: u32, word: u32) -> Option<bool> {
@@ -486,7 +499,8 @@ impl<'w, 's> LiveView<'w, 's> {
         let net = self.commands.as_deref()?;
         let written = self.slots.as_deref_mut()?.write_slot(slot, word, net);
         if written {
-            if let Some(fresh) = self.usable_reads(|r| r.slot(slot)) {
+            let sets_usable = self.usable.as_deref().is_some_and(|c| c.sets_usable);
+            if let Some(fresh) = self.usable_reads(|r| r.slot(slot, sets_usable)) {
                 if let Some(caches) = self.usable.as_deref_mut() {
                     caches.slots[usize::from(slot)] = fresh;
                 }

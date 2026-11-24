@@ -12,6 +12,7 @@
 //! - The Sound panel's side of the engine ([`super::engine`]): the cached device list into the VM,
 //!   and its restart out.
 
+use bevy::ecs::system::RunSystemOnce;
 use bevy::prelude::*;
 
 use benilla_formats::{ItemGesture, ItemGroupSoundsCatalog};
@@ -34,6 +35,9 @@ fn drain_ui_sounds(
     assets: Option<Res<WorldAssets>>,
     mut out: NonSendMut<SoundOutput>,
     config: Res<SoundConfig>,
+    items: Option<Res<Items>>,
+    displays: Option<Res<ItemDisplays>>,
+    sounds: Option<Res<ItemSounds>>,
 ) {
     let Some(mut script) = script.turn() else {
         return;
@@ -52,6 +56,28 @@ fn drain_ui_sounds(
     for req in requests {
         let kit_ref = match &req {
             SoundRequest::KitName(name) => KitRef::Name(name),
+            // The item's own put-down kit (`0x4d0020`); a record not cached or a missing link is silent.
+            SoundRequest::ItemPutDown(item_id) => {
+                let display = items
+                    .as_deref()
+                    .and_then(|items| items.template_cached(*item_id))
+                    .map(|t| t.display_info_id);
+                if let (Some(display_id), Some(displays), Some(sounds)) =
+                    (display, displays.as_deref(), sounds.as_deref())
+                {
+                    play_item_gesture(
+                        display_id,
+                        ItemGesture::PutDown,
+                        displays,
+                        sounds,
+                        &mut kits,
+                        &assets,
+                        &mut out,
+                        &config,
+                    );
+                }
+                continue;
+            }
             SoundRequest::File(path) => {
                 // `PlaySoundFile`: by path, with no kit gates or variation.
                 if let Err(e) = kit::play_file(
@@ -263,8 +289,39 @@ fn play_item_gesture(
     }
 }
 
-/// A looted row's pickup sound, written by [`crate::ui_loot::drain_loot`]. The client plays it at
-/// the loot-slot click; `SMSG_ITEM_PUSH` itself is silent, so a purchase makes no pickup sound.
+/// The item sound play at its caller's step (`0x4d0090`): `gesture`'s kit of the display's sound
+/// group, 2D on SFX; a missing link is silent.
+pub(crate) fn play_item_sound(world: &mut World, display_id: u32, gesture: ItemGesture) {
+    debug!("sound(ui): item {gesture:?} sound for display {display_id}");
+    let _ = world.run_system_once_with(
+        |In((display_id, gesture)): In<(u32, ItemGesture)>,
+         displays: Option<Res<ItemDisplays>>,
+         sounds: Option<Res<ItemSounds>>,
+         kits: Option<ResMut<SoundKits>>,
+         assets: Option<Res<WorldAssets>>,
+         out: Option<NonSendMut<SoundOutput>>,
+         config: Option<Res<SoundConfig>>| {
+            let (
+                Some(displays),
+                Some(sounds),
+                Some(mut kits),
+                Some(assets),
+                Some(mut out),
+                Some(config),
+            ) = (displays, sounds, kits, assets, out, config)
+            else {
+                return;
+            };
+            play_item_gesture(
+                display_id, gesture, &displays, &sounds, &mut kits, &assets, &mut out, &config,
+            );
+        },
+        (display_id, gesture),
+    );
+}
+
+/// A looted row's pickup sound, written by [`crate::ui_loot::drain_loot`]: the client plays it at
+/// the loot-slot click.
 #[derive(Message, Clone, Copy)]
 pub(crate) struct LootPickupSound {
     pub(crate) display_id: u32,

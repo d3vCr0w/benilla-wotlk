@@ -563,6 +563,9 @@ pub(crate) fn load_ingame_ui_on_world_entry(world: &mut World) {
     let ui_scale = world
         .get_resource::<super::UiScaleCvar>()
         .map_or(1.0, |c| c.0);
+    let tracking = world
+        .get_resource::<crate::unit_auras::TrackingSpell>()
+        .map_or(0, |t| t.0);
     // No sound during the load edge, as in the reference's UI init. Every call into Lua reads the
     // client through the lent `World`.
     silenced_ui_load(&mut script, |script| {
@@ -585,9 +588,17 @@ pub(crate) fn load_ingame_ui_on_world_entry(world: &mut World) {
             world,
             script,
             identity.as_ref(),
-            // Before `VARIABLES_LOADED`: the minimap's town type restores there
-            // (`0x5128d0`).
-            |script| script.load_tracked_state(class_id),
+            // Before `VARIABLES_LOADED`: the minimap's town type restores there (`0x5128d0`);
+            // a tracking spell the session already holds clears it, as its setter did
+            // (`0x57ea41`), where it landed before this UI stood.
+            |script| {
+                script.load_tracked_state(class_id);
+                // `0x5128d0` loads the tracked achievements after the town type (`0x5b3840`).
+                script.load_tracked_achievements();
+                if tracking != 0 {
+                    script.tracking_spell_moved(tracking);
+                }
+            },
             |world, script| {
                 crate::ui_chat::restore_chat_looks(world, script);
                 // `UIParent` scales last, so the whole load read a bare root (`0x52a980` runs
@@ -777,6 +788,8 @@ pub(crate) fn shutdown_ui_state(
         script.fire_event("PLAYER_LEAVING_WORLD", vec![]);
     }
     script.fire_event("PLAYER_LOGOUT", vec![]);
+    // The tracked achievements save before the saved variables (`0x528f00` -> `0x5b1fa0`).
+    script.save_tracked_achievements();
     crate::ui_saved::save(script, identity);
     addons::save_addon_variables(script, identity);
     addons::save_enable_state(script, identity);
@@ -814,6 +827,11 @@ fn close_ui_session(world: &mut World) {
         .and_then(|id| id.0.clone());
     // Spent at the root: of this edge and the worldport's, the first to a departure owns it.
     let leaving_world = run_leave_world_sweep(world);
+    // Past the latch the UI shutdown leaves the world (`0x52901a` -> `0x528c30`): its module parts
+    // run ahead of `PLAYER_LEAVING_WORLD` (`0x528edc`) and `PLAYER_LOGOUT` (`0x52902a`).
+    if leaving_world {
+        crate::ui_battlefield::leave_world(world);
+    }
     if !ui_never_loaded {
         super::live::with_live_world(world, |script| {
             shutdown_ui_state(script, identity.as_ref(), leaving_world);
@@ -880,8 +898,6 @@ pub(crate) fn run_pending_reload(world: &mut World) {
         return;
     }
     info!("ui_script: ReloadUI — ending the UI session and building a new one");
-    // The teardown leaves the world (`0x528c30`).
-    crate::ui_battlefield::leave_world(world);
     // The combat log's store outlives a reload, as the reference keeps it outside the VM.
     let combat_log = world
         .get_non_send_resource_mut::<UiScript>()
@@ -940,28 +956,38 @@ pub(crate) fn run_pending_reload(world: &mut World) {
 }
 
 /// `AppExit`, the quit roots, read as a message because a quit from in-world never leaves
-/// `InWorld`. A quit from the character screen, or on a worldport's loading screen, finds the
-/// latch spent, so `PLAYER_LEAVING_WORLD` does not fire.
+/// `InWorld`. A quit on a worldport's loading screen finds the latch spent, so
+/// `PLAYER_LEAVING_WORLD` does not fire; a quit from the character screen runs no tail at all.
 pub(crate) fn shutdown_on_exit(world: &mut World) {
     let Ok(Some((identity, leaving_world))) = world.run_system_cached(exit_sweep) else {
         return;
     };
+    // The game's destroy runs the UI shutdown, whose world leave runs past the latch (`0x52901a`).
+    if leaving_world {
+        crate::ui_battlefield::leave_world(world);
+    }
     super::safe_world::lend(world, |script| {
         shutdown_ui_state(script, identity.as_ref(), leaving_world);
     });
 }
 
 /// [`shutdown_on_exit`]'s gate and sweep: the identity and whether the world is left, on a quit
-/// with a UI to save.
+/// with an in-game UI to shut down.
 fn exit_sweep(
     id: Res<AddOnIdentity>,
     pending_entry: Option<Res<PendingEntryUiLoad>>,
+    state: Option<Res<State<crate::char_select::ClientState>>>,
     mut sweep: LeaveWorldSweep,
     mut exits: MessageReader<AppExit>,
 ) -> Option<(Option<(String, String)>, bool)> {
     exits.read().next()?;
     // Same guard as [`end_ui_session`]: a quit inside the entry-load window has no UI to save.
     if pending_entry.is_some() {
+        return None;
+    }
+    // The game's destroy skips its UI shutdown with no game up (`0x406516`-`0x40651c`), so a quit
+    // from the login or character screen fires no event and saves nothing.
+    if !state.is_some_and(|s| *s.get() == crate::char_select::ClientState::InWorld) {
         return None;
     }
     Some((id.0.clone(), sweep.run()))
@@ -1147,6 +1173,64 @@ mod tests {
             .expect("the parked VM is back");
         assert_eq!(vm.session(), session, "the same VM, no session moved");
         assert!(world.get_non_send_resource::<ParkedBootVm>().is_none());
+    }
+
+    /// The UI shutdown leaves the world past the latch (`0x52901a` -> `0x528c30`): its auction
+    /// part (`0x528d55`) raises ahead of `PLAYER_LEAVING_WORLD` (`0x528edc`) and `PLAYER_LOGOUT`
+    /// (`0x52902a`), and its talent part unbuilds the tabs (`0x528d4b`); a spent latch runs none.
+    #[test]
+    fn the_ui_shutdown_runs_the_world_leave_past_the_latch() {
+        use benilla_ui::script::{TalentPages, TalentSide, TalentTabView};
+        let close = |armed: bool| {
+            let mut world = World::new();
+            world.insert_resource(State::new(crate::char_select::ClientState::InWorld));
+            world.init_resource::<Messages<WorldLeaveSweepMessage>>();
+            world.init_resource::<LeavingWorldArmed>();
+            if armed {
+                world.resource_mut::<LeavingWorldArmed>().arm();
+            }
+            world.init_resource::<super::super::live::UiEvents>();
+            let mut house = crate::ui_auction::AuctionOpen::default();
+            house.auctioneer = Some(9);
+            world.insert_resource(house);
+            let pages = |n: usize| TalentPages {
+                tabs: vec![TalentTabView::default(); n],
+                talents: vec![vec![]; n],
+            };
+            let mut talents = benilla_ui::script::TalentInfo::default();
+            talents.enter_world(|| Some(pages(1)));
+            world.insert_resource(crate::ui_talent::TalentState(talents));
+            let script = UiScript::new().unwrap();
+            script
+                .run(
+                    "SEEN = {} local f = CreateFrame('Frame')                      f:RegisterEvent('AUCTION_HOUSE_CLOSED')                      f:RegisterEvent('PLAYER_LEAVING_WORLD') f:RegisterEvent('PLAYER_LOGOUT')                      f:SetScript('OnEvent', function(_, e) SEEN[#SEEN + 1] = e end)",
+                )
+                .unwrap();
+            world.insert_non_send_resource(script);
+            close_ui_session(&mut world);
+            let seen = world
+                .non_send_resource::<UiScript>()
+                .eval::<String>("return table.concat(SEEN, ' ')")
+                .unwrap();
+            // The next entry builds again only on unbuilt tabs.
+            let state = &mut world.resource_mut::<crate::ui_talent::TalentState>().0;
+            state.enter_world(|| Some(pages(2)));
+            let tabs = state.pages(TalentSide::Player).tabs.len();
+            (seen, tabs)
+        };
+        assert_eq!(
+            close(true),
+            (
+                "AUCTION_HOUSE_CLOSED PLAYER_LEAVING_WORLD PLAYER_LOGOUT".to_string(),
+                2
+            ),
+            "the world leave's parts run ahead of its event"
+        );
+        assert_eq!(
+            close(false),
+            ("PLAYER_LOGOUT".to_string(), 1),
+            "a spent latch leaves nothing"
+        );
     }
 
     /// A `ReloadUI()` runs the leave-world sweep (past the armed latch) and then re-enters the

@@ -33,13 +33,13 @@ pub struct SocketInfo {
 
 /// An item the player holds, found by guid: its slot, as the lock and the tooltip address it.
 #[derive(Clone)]
-pub(super) enum Held<'a> {
+pub(super) enum Held {
     /// A bag slot, read off the World at the call.
     Bag(i64, u32, Box<ContainerSlot>),
-    Worn(u32, &'a InvSlotView),
+    Worn(u32, Box<InvSlotView>),
 }
 
-impl<'a> Held<'a> {
+impl Held {
     /// The Lua `(bag, slot)` the item's lock and events name.
     pub(super) fn position(&self) -> (i64, u32) {
         match self {
@@ -105,13 +105,13 @@ impl<'a> Held<'a> {
 }
 
 /// The player's item with `guid`, in a bag, the bank or worn; `None` for 0 or one not held.
-pub(super) fn find(model: &Model, guid: u64) -> Option<Held<'_>> {
+pub(super) fn find(model: &Model, guid: u64) -> Option<Held> {
     if guid == 0 {
         return None;
     }
-    for (i, slot) in model.inventory_slots.iter().enumerate() {
-        if let Some(s) = slot.as_ref().filter(|s| s.guid == guid) {
-            return Some(Held::Worn(i as u32, s));
+    for (i, slot) in model.worn_slots().into_iter().enumerate() {
+        if let Some(s) = slot.filter(|s| s.guid == guid) {
+            return Some(Held::Worn(i as u32, Box::new(s)));
         }
     }
     super::container::live_bags(model)
@@ -124,13 +124,37 @@ pub(super) fn find(model: &Model, guid: u64) -> Option<Held<'_>> {
         })
 }
 
-/// Whether the socketed item sits at `(bag, slot)`: it reads locked there (`0x5c4680`).
-pub(super) fn holds_slot(model: &Model, bag: i64, slot: u32) -> bool {
-    find(model, model.socket_info.item).is_some_and(|h| h.position() == (bag, slot))
+/// A held item as the cursor carries it, whole (`0x5c4e76`: no split).
+fn cursor_item(held: &Held) -> cursor::CursorItem {
+    let (bag, slot) = held.position();
+    match held {
+        Held::Bag(_, _, s) => cursor::CursorItem {
+            bag,
+            slot,
+            item_id: s.item_id,
+            texture: s.texture.clone(),
+            link: s.link.clone(),
+            quality: s.quality,
+            count: None,
+            bar_placeable: s.bar_placeable,
+            equip_slots: s.equip_slots.clone(),
+        },
+        Held::Worn(_, s) => cursor::CursorItem {
+            bag,
+            slot,
+            item_id: s.item_id,
+            texture: s.icon.clone(),
+            link: s.link.clone(),
+            quality: Some(u32::try_from(s.quality).unwrap_or(0)),
+            count: None,
+            bar_placeable: s.bar_placeable,
+            equip_slots: s.equip_slots.clone(),
+        },
+    }
 }
 
 /// `GetNumSockets` (`0x7094e0`): the template's coloured sockets plus a prismatic enchant's.
-pub(super) fn num_sockets(model: &Model, held: &Held<'_>) -> u32 {
+pub(super) fn num_sockets(model: &Model, held: &Held) -> u32 {
     let colored = super::item_stats::item_record(model, held.item_id()).map_or(0, |t| {
         t.socket_colors.iter().filter(|&&c| c != 0).count() as u32
     });
@@ -160,40 +184,49 @@ pub(super) fn gem_matches(
             .is_some_and(|g| g.gem_type & color & 0xf != 0)
 }
 
-/// Set the socketed item (`0x5c4680`): unlocks the old item, clears the gems, then locks the new one and
-/// signals `SOCKET_INFO_UPDATE`, or signals `SOCKET_INFO_CLOSE` for 0 or an unknown template.
-pub(super) fn set_item(model: &mut Model, guid: u64) {
-    let old = find(model, model.socket_info.item).map(|h| h.position());
-    let new = find(model, guid).map(|h| (h.position(), h.item_id(), h.enchants().to_vec()));
-    if let Some((bag, slot)) = old {
-        cursor::queue_lock_changed(model, bag, slot);
+/// Set the socketed item (`0x5c4680`): the old item unlocks while the window still holds it (`0x5c4692`), each placed gem unlocks (`0x5c46b4`), the gems and the item are written (`0x5c46d7`, `0x5c46fa`), then a known item locks and signals `SOCKET_INFO_UPDATE` (`0x5c4751`, `0x5c475d`); 0 or an unknown template signals `SOCKET_INFO_CLOSE` (`0x5c4770`).
+pub(super) fn set_item(model: &mut crate::script::ModelGuard<'_>, guid: u64) {
+    if let Some((bag, slot)) = find(model, model.socket_info.item).map(|h| h.position()) {
+        cursor::set_item_lock(model, bag, slot, false);
+    }
+    for i in 0..MAX_SOCKETS {
+        let gem = model.socket_info.gems[i];
+        if let Some((bag, slot)) = find(model, gem).map(|h| h.position()) {
+            cursor::set_item_lock(model, bag, slot, false);
+        }
     }
     let info = &mut model.socket_info;
     info.gems = [0; MAX_SOCKETS];
     info.item = guid;
+    let new = find(model, guid).map(|h| (h.position(), h.item_id(), h.enchants().to_vec()));
     let stats = new.filter(|&(_, id, _)| super::item_stats::item_record_cached(model, id));
     match stats {
         Some(((bag, slot), _, enchants)) => {
             model.socket_info.seen = enchants;
-            cursor::queue_lock_changed(model, bag, slot);
-            queue(model, "SOCKET_INFO_UPDATE");
+            cursor::set_item_lock(model, bag, slot, true);
+            signal_event(model, "SOCKET_INFO_UPDATE");
         }
+        // No template (`0x5c4740`): every reader tests it beside the guid, so the item reads as none.
         None => {
             model.socket_info.item = 0;
             model.socket_info.seen.clear();
-            queue(model, "SOCKET_INFO_CLOSE");
+            signal_event(model, "SOCKET_INFO_CLOSE");
         }
     }
 }
 
-fn queue(model: &mut Model, event: &str) {
-    model.pending_events.push((event.to_string(), Vec::new()));
+fn signal_event(model: &mut crate::script::ModelGuard<'_>, event: &str) {
+    model.raise(event, Vec::new());
 }
 
 /// Place `gem` (0 empties the socket) in socket `i` (`0x5c4780`). A gem goes only where
 /// its meta bit matches the socket's, else its refusal is handed back for the caller to show at
 /// once. Returns whether it took.
-fn set_gem(model: &mut Model, i: usize, gem: u64) -> Result<bool, &'static str> {
+fn set_gem(
+    model: &mut crate::script::ModelGuard<'_>,
+    i: usize,
+    gem: u64,
+) -> Result<bool, &'static str> {
     let item = model.socket_info.item;
     let Some(socket_stats) =
         find(model, item).and_then(|h| super::item_stats::item_record(model, h.item_id()))
@@ -205,7 +238,7 @@ fn set_gem(model: &mut Model, i: usize, gem: u64) -> Result<bool, &'static str> 
     }
     if gem == 0 {
         model.socket_info.gems[i] = 0;
-        queue(model, "SOCKET_INFO_UPDATE");
+        signal_event(model, "SOCKET_INFO_UPDATE");
         return Ok(true);
     }
     let Some(stats) =
@@ -228,7 +261,7 @@ fn set_gem(model: &mut Model, i: usize, gem: u64) -> Result<bool, &'static str> 
         }
         _ => {
             model.socket_info.gems[i] = gem;
-            queue(model, "SOCKET_INFO_UPDATE");
+            signal_event(model, "SOCKET_INFO_UPDATE");
             Ok(true)
         }
     }
@@ -236,7 +269,7 @@ fn set_gem(model: &mut Model, i: usize, gem: u64) -> Result<bool, &'static str> 
 
 /// The item watchers (`0x5c4ef0`, `0x5c4f40`) off the snapshots: the socketed item gone closes the window, its
 /// enchants changing re-signals it, and a gem gone empties its socket.
-pub(super) fn watch(model: &mut Model) {
+pub(super) fn watch(model: &mut crate::script::ModelGuard<'_>) {
     let item = model.socket_info.item;
     let Some(held) = find(model, item) else {
         set_item(model, 0);
@@ -254,7 +287,7 @@ pub(super) fn watch(model: &mut Model) {
         }
     }
     if changed {
-        queue(model, "SOCKET_INFO_UPDATE");
+        signal_event(model, "SOCKET_INFO_UPDATE");
     }
 }
 
@@ -263,7 +296,7 @@ pub(super) fn watch(model: &mut Model) {
 /// flagged `0x10` count none.
 pub(super) fn equipped_gem_counts(model: &Model) -> [i32; 4] {
     let mut counts = [0; 4];
-    for s in model.inventory_slots.iter().skip(1).take(19).flatten() {
+    for s in model.worn_slots().iter().skip(1).take(19).flatten() {
         let broken =
             s.flags & 0x8 == 0 && s.durability.is_some_and(|(cur, max)| max > 0 && cur == 0);
         if broken || s.flags & 0x10 != 0 {
@@ -291,8 +324,8 @@ pub(super) fn item_id_by_name(model: &Model, name: &str) -> Option<u32> {
     let name = name.to_lowercase();
     let matches = |n: &str| n.to_lowercase() == name;
     model
-        .inventory_slots
-        .iter()
+        .worn_slots()
+        .into_iter()
         .flatten()
         .find(|s| s.item_id != 0 && s.name.as_deref().is_some_and(matches))
         .map(|s| s.item_id)
@@ -311,7 +344,7 @@ pub(super) fn item_id_by_name(model: &Model, name: &str) -> Option<u32> {
 
 /// Whether the item holds an enchant (`0x708ac0`): a permanent enchant, a gem in the first two sockets or a
 /// prismatic socket; the third socket is not read.
-pub(super) fn has_enchantments(held: &Held<'_>) -> bool {
+pub(super) fn has_enchantments(held: &Held) -> bool {
     held.enchants()
         .iter()
         .any(|e| matches!(e.slot, 0 | 2 | 3 | 6))
@@ -445,10 +478,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             if super::cursor::doll::is_inventory_item_locked(&model, id) {
                 return Ok(());
             }
-            if num_sockets(&model, &Held::Worn(id, &s)) == 0 {
+            let guid = s.guid;
+            if num_sockets(&model, &Held::Worn(id, Box::new(s))) == 0 {
                 return Ok(());
             }
-            set_item(&mut model, s.guid);
+            set_item(&mut model, guid);
             Ok(())
         })?,
     )?;
@@ -621,9 +655,10 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
                     return Ok(());
                 }
             }
-            cursor::clear_cursor(&mut model);
-            if let Some((bag, slot)) = find(&model, previous).map(|h| h.position()) {
-                super::container::pickup_container_item(&mut model, bag, slot);
+            // The gem stays locked in its socket (`0x5c4e5c`); the one it replaced comes back through the item setter, locked as it was placed (`0x5c4e85`).
+            cursor::clear_cursor_with(&mut model, false, true);
+            if let Some(back) = find(&model, previous).map(|h| cursor_item(&h)) {
+                cursor::set_cursor(&mut model, CursorPayload::Item(back));
             }
             drop(model);
             super::calls::press_item_picks(lua);
@@ -675,5 +710,156 @@ pub(super) fn accept(model: &mut Model) {
     if info.item != 0 && info.gems.iter().any(|&g| g != 0) {
         let send = (info.item, info.gems);
         model.socket_sends.push(send);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::script::{ContainerSlot, ContainerState, GemView, ItemTemplateView, UiScript};
+
+    /// A backpack holding two socketed chest pieces (slots 1 and 4) and two red gems (2 and 3).
+    fn socketing() -> UiScript {
+        let mut s = UiScript::new().unwrap();
+        let armor = |name: &str| ItemTemplateView {
+            name: name.into(),
+            inventory_type: 5,
+            socket_colors: [2, 8, 0],
+            ..Default::default()
+        };
+        let gem = |name: &str| ItemTemplateView {
+            name: name.into(),
+            gem_properties: 3000,
+            gem: Some(GemView {
+                gem_type: 2,
+                enchant: 3000,
+                enchant_name: None,
+                condition: None,
+                requirement: None,
+            }),
+            ..Default::default()
+        };
+        s.set_item_template(1000, armor("First Chest"));
+        s.set_item_template(1001, armor("Second Chest"));
+        s.set_item_template(2000, gem("Bold Gem"));
+        s.set_item_template(2001, gem("Bright Gem"));
+        let slot = |guid: u64, item_id: u32, name: &str| ContainerSlot {
+            guid,
+            item_id,
+            count: 1,
+            link: Some(format!("|Hitem:{item_id}|h[{name}]|h")),
+            ..Default::default()
+        };
+        s.set_container(
+            0,
+            Some(ContainerState {
+                num_slots: 16,
+                slots: std::collections::HashMap::from([
+                    (1, slot(11, 1000, "First Chest")),
+                    (2, slot(12, 2000, "Bold Gem")),
+                    (3, slot(13, 2001, "Bright Gem")),
+                    (4, slot(14, 1001, "Second Chest")),
+                ]),
+                ..Default::default()
+            }),
+        );
+        s.run(
+            r#"Log = {}
+            local f = CreateFrame("Frame")
+            for _, e in ipairs({"ITEM_LOCK_CHANGED", "ITEM_LOCKED", "ITEM_UNLOCKED",
+                    "SOCKET_INFO_UPDATE", "SOCKET_INFO_CLOSE", "CURSOR_UPDATE"}) do
+                f:RegisterEvent(e)
+            end
+            f:SetScript("OnEvent", function(_, event, bag, slot)
+                Log[#Log + 1] = event .. " " .. tostring(slot) .. " " .. tostring((GetSocketItemInfo()))
+            end)"#,
+        )
+        .unwrap();
+        s
+    }
+
+    fn log(s: &UiScript) -> Vec<String> {
+        s.eval::<Vec<String>>("local l = Log Log = {} return l")
+            .unwrap()
+    }
+
+    fn locked(s: &UiScript, slot: u32) -> bool {
+        s.eval::<bool>(&format!(
+            "return select(3, GetContainerItemInfo(0, {slot})) ~= nil"
+        ))
+        .unwrap()
+    }
+
+    /// The setter unlocks the old item and each placed gem while the window still holds the old item (`0x5c4692`, `0x5c46b4`), writes the new one (`0x5c46fa`), then locks it and signals (`0x5c4751`, `0x5c475d`).
+    #[test]
+    fn the_setter_unlocks_the_old_item_and_its_gems_before_it_writes_the_new_one() {
+        let s = socketing();
+        s.run("SocketContainerItem(0, 1)").unwrap();
+        assert_eq!(
+            log(&s),
+            [
+                "ITEM_LOCK_CHANGED 1 First Chest",
+                "ITEM_LOCKED 1 First Chest",
+                "SOCKET_INFO_UPDATE nil First Chest",
+            ]
+        );
+        s.run("PickupContainerItem(0, 2) ClickSocketButton(1)")
+            .unwrap();
+        let _ = log(&s);
+        s.run("SocketContainerItem(0, 4)").unwrap();
+        assert_eq!(
+            log(&s),
+            [
+                "ITEM_LOCK_CHANGED 1 First Chest",
+                "ITEM_UNLOCKED 1 First Chest",
+                "ITEM_LOCK_CHANGED 2 First Chest",
+                "ITEM_UNLOCKED 2 First Chest",
+                "ITEM_LOCK_CHANGED 4 Second Chest",
+                "ITEM_LOCKED 4 Second Chest",
+                "SOCKET_INFO_UPDATE nil Second Chest",
+            ]
+        );
+        assert!(!locked(&s, 1) && !locked(&s, 2) && locked(&s, 4));
+        s.run("CloseSocketInfo()").unwrap();
+        assert_eq!(
+            log(&s),
+            [
+                "ITEM_LOCK_CHANGED 4 Second Chest",
+                "ITEM_UNLOCKED 4 Second Chest",
+                "SOCKET_INFO_CLOSE nil nil",
+            ]
+        );
+    }
+
+    /// The socket click's clear leaves the placed gem locked (`0x5c4e5c`), and the gem it replaced comes back through the item setter as locked as it was, with no lock signal (`0x5c4e85`).
+    #[test]
+    fn a_placed_gem_stays_locked_and_the_one_it_replaces_comes_back_locked() {
+        let s = socketing();
+        s.run("SocketContainerItem(0, 1) PickupContainerItem(0, 2)")
+            .unwrap();
+        let _ = log(&s);
+        s.run("ClickSocketButton(1)").unwrap();
+        assert_eq!(
+            log(&s),
+            [
+                "SOCKET_INFO_UPDATE nil First Chest",
+                "CURSOR_UPDATE nil First Chest"
+            ]
+        );
+        assert!(locked(&s, 2) && s.cursor_item().is_none());
+        s.run("PickupContainerItem(0, 3)").unwrap();
+        let _ = log(&s);
+        s.run("ClickSocketButton(1)").unwrap();
+        assert_eq!(
+            log(&s),
+            [
+                "SOCKET_INFO_UPDATE nil First Chest",
+                "CURSOR_UPDATE nil First Chest",
+                "CURSOR_UPDATE nil First Chest",
+                "CURSOR_UPDATE nil First Chest",
+            ],
+            "the click's clear, then the setter's clear and its own signal"
+        );
+        assert_eq!(s.cursor_item().map(|c| c.slot), Some(2));
+        assert!(locked(&s, 2) && locked(&s, 3));
     }
 }

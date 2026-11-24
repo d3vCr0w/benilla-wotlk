@@ -25,7 +25,6 @@ enum Applied {
 /// the `World`: its signals, lines and the press's edges queue, and fire as the call returns with
 /// the `World` lent again, so a listener's own call applies nested inside the raise.
 pub(crate) fn apply_in_call(lua: &mlua::Lua, call: ScriptCall) -> bool {
-    use crate::ui_script::live::UiEvents;
     use crate::ui_script::safe_world::with_world;
     // The destroy in its turn, through the lent view (`0x5197d0`), then its signal.
     if let ScriptCall::DestroyTotem(slot) = call {
@@ -41,32 +40,27 @@ pub(crate) fn apply_in_call(lua: &mlua::Lua, call: ScriptCall) -> bool {
         }
         return true;
     }
+    // A loot verb acts and raises inside the call (`0x589140`, `0x589300`, `0x5893a0`, `0x523640`).
+    if let ScriptCall::Loot(verb) = call {
+        return with_world(|world| in_call_step(world, |w| crate::ui_loot::run_verb(w, verb)))
+            .is_some();
+    }
     // The verbs that press off a queued intent: their drain, each press at its own step.
     if let ScriptCall::Press(verb) = call {
         return with_world(|world| press_verb(world, verb)).is_some();
     }
     let applied = with_world(|world| {
-        // What an enclosing turn queued stays its own, fired by it.
-        let earlier = world.get_resource_or_init::<UiEvents>().set_aside();
-        let (applied, raised) = benilla_ui::script::world_loan::raises_in_turn(lua, || {
-            world.run_system_cached_with(apply_one, call).ok()
-        });
         // The setter's tail at the selection write (`0x524f38`-`0x524f54`), ahead of what the call
         // raises after it: the cast's attack pick selects before the send (`0x80d661`, `0x80b556`).
-        if applied.is_some() {
-            crate::ui_unit::target_set_tail(world);
-        }
-        // The applier's raises with the `World` lent again, each last on its path or followed by its rest as a step (`0x5d8ad3`, `0x706feb`, `0x5216f0`, `0x80b556`, `0x806200`, `0x5d4530`).
-        if !raised.is_empty() {
-            crate::ui_script::safe_world::lend(world, |script| {
-                for raise in raised {
-                    raise.run(script);
+        step_then_fire(
+            world,
+            |world| world.run_system_cached_with(apply_one, call).ok(),
+            |world, applied| {
+                if applied.is_some() {
+                    crate::ui_unit::target_set_tail(world);
                 }
-            });
-        }
-        crate::ui_script::live::fire_handler_events(world);
-        world.resource_mut::<UiEvents>().put_back(earlier);
-        applied
+            },
+        )
     })
     .flatten();
     match applied {
@@ -81,6 +75,46 @@ pub(crate) fn apply_in_call(lua: &mlua::Lua, call: ScriptCall) -> bool {
             true
         }
     }
+}
+
+/// Run `step`, a host step that holds the lent `World`, inside the Lua call that reached it: it
+/// raises nothing while it holds the `World`; its signals, lines and a press's edges queue, and
+/// fire as it returns with the `World` lent again, so a listener's own call applies nested.
+pub(crate) fn in_call_step<R>(world: &mut World, step: impl FnOnce(&mut World) -> R) -> R {
+    step_then_fire(world, step, |_, _| ())
+}
+
+/// [`in_call_step`], with `tail` run on the step's result after its borrows end and ahead of its
+/// raises.
+fn step_then_fire<R>(
+    world: &mut World,
+    step: impl FnOnce(&mut World) -> R,
+    tail: impl FnOnce(&mut World, &R),
+) -> R {
+    use crate::ui_script::live::UiEvents;
+    let Some(lua) = world
+        .get_non_send_resource::<UiScript>()
+        .map(|s| s.lua().clone())
+    else {
+        let out = step(world);
+        tail(world, &out);
+        return out;
+    };
+    // What an enclosing turn queued stays its own, fired by it.
+    let earlier = world.get_resource_or_init::<UiEvents>().set_aside();
+    let (out, raised) = benilla_ui::script::world_loan::raises_in_turn(&lua, || step(world));
+    tail(world, &out);
+    // The step's raises with the `World` lent again, each last on its path or followed by its rest as a step (`0x5d8ad3`, `0x706feb`, `0x5216f0`, `0x80b556`, `0x806200`).
+    if !raised.is_empty() {
+        crate::ui_script::safe_world::lend(world, |script| {
+            for raise in raised {
+                raise.run(script);
+            }
+        });
+    }
+    crate::ui_script::live::fire_handler_events(world);
+    world.resource_mut::<UiEvents>().put_back(earlier);
+    out
 }
 
 /// A verb's press inside its call: the drain of the intents it queued, each press at its own step ([`press_step`]), so the line after the call reads what it armed.
@@ -115,6 +149,7 @@ where
             Vec::new(),
         ),
     };
+    assert_one_raise_list(world, !raised.is_empty());
     if !raised.is_empty() {
         crate::ui_script::safe_world::lend(world, |script| {
             for raise in raised {
@@ -127,16 +162,54 @@ where
     out
 }
 
+/// Answer a verb's ask inside the Lua call that made it, over the lent `World`; `None` in a world without the state it reads, where the verb's request waits for its drain. A gate or a filing raises nothing here, and the verb signals what the answer leaves; the bind dialogs' answers run step by step, each raise fired at its own (`0x6e0273`, `0x6e02cd`).
+pub(crate) fn answer_in_call(
+    _lua: &mlua::Lua,
+    ask: &benilla_ui::script::HostAsk,
+) -> Option<benilla_ui::script::HostAnswer> {
+    use benilla_ui::script::{HostAnswer, HostAsk};
+    crate::ui_script::safe_world::with_world(|world| match ask.clone() {
+        HostAsk::GuildBank(request) => world
+            .run_system_cached_with(crate::ui_guild_bank::decide, request)
+            .ok()
+            .map(HostAnswer::GuildBank),
+        HostAsk::BindSwap(mv) => world
+            .run_system_cached_with(crate::ui_bind_confirm::file_swap, mv)
+            .ok()
+            .map(HostAnswer::BindIndex),
+        HostAsk::BindAutoEquip { bag, slot } => world
+            .run_system_cached_with(crate::ui_bind_confirm::file_auto_equip, (bag, slot))
+            .ok()
+            .flatten()
+            .map(HostAnswer::BindIndex),
+        HostAsk::BindAnswers => {
+            crate::ui_items::run_bind_answers(world).then_some(HostAnswer::Done)
+        }
+    })
+    .flatten()
+}
+
 /// A press that did not run drops its whole press silently: a hard failure in a debug build.
-fn step_ran<O, E: std::fmt::Display>(ran: Result<O, E>) -> Option<O> {
+pub(crate) fn step_ran<O, E: std::fmt::Display>(ran: Result<O, E>) -> Option<O> {
     match ran {
         Ok(out) => Some(out),
-        Err(e) if cfg!(debug_assertions) => panic!("script_calls: a press step did not run: {e}"),
+        Err(e) if cfg!(debug_assertions) => panic!("a press or handler step did not run: {e}"),
         Err(e) => {
-            warn!("script_calls: a press step did not run: {e}");
+            warn!("a press or handler step did not run: {e}");
             None
         }
     }
+}
+
+/// A step's raises fire in two lists, the VM's in turn and the handler queue's, so one step never raises on both: a hard failure in a debug build.
+pub(crate) fn assert_one_raise_list(world: &World, raised: bool) {
+    let queued = world
+        .get_resource::<crate::ui_script::live::UiEvents>()
+        .is_some_and(|ui| !ui.is_empty());
+    debug_assert!(
+        !(raised && queued),
+        "a step raised both in turn and on the handler queue: their order is lost"
+    );
 }
 
 /// Apply the calls that waited where no `World` was lent, in call order, in the press pass after
@@ -250,7 +323,7 @@ fn apply_one(
                 }
             }
             // Applied by the caller, which holds no borrow for its view write.
-            ScriptCall::DestroyTotem(_) | ScriptCall::Press(_) => {}
+            ScriptCall::DestroyTotem(_) | ScriptCall::Press(_) | ScriptCall::Loot(_) => {}
             ScriptCall::UseItem { bag, slot } => appliers.p5().use_item(script, bag, slot),
             ScriptCall::InteractObject(guid) => appliers.p0().interact_object(guid),
             ScriptCall::UseContainerItem { bag, slot } => {
@@ -308,6 +381,14 @@ pub(crate) struct InTurn<'a>(pub(crate) &'a mut crate::ui_script::live::UiEvents
 impl crate::ui_action::signals::SignalSink for InTurn<'_> {
     fn signal(&mut self, event: &'static str) {
         self.0.fire(event, Vec::new());
+    }
+
+    fn fire(&mut self, event: &'static str, args: Vec<benilla_ui::script::ScriptValue>) {
+        self.0.fire(event, args);
+    }
+
+    fn unlock_item(&mut self, guid: u64) {
+        crate::ui_action::signals::SignalSink::unlock_item(self.0, guid);
     }
 
     fn line(&mut self, line: crate::ui_action::UiError) {
@@ -428,7 +509,7 @@ mod tests {
 
     /// A press step whose system cannot run loses its whole press (its send, its GCD arm): a debug build fails on it.
     #[test]
-    #[should_panic(expected = "a press step did not run")]
+    #[should_panic(expected = "a press or handler step did not run")]
     fn a_press_step_that_cannot_run_fails_loudly() {
         #[derive(Resource)]
         struct Absent;

@@ -228,11 +228,18 @@ fn a_pending_name_titles_unknownobject_and_the_answer_replaces_it() {
 fn the_tooltip_title_is_the_chosen_title_name() {
     let mut s = script();
     s.set_screen_size(800.0, 600.0);
-    s.set_title_rows(vec![TitleRow {
-        mask_id: 46,
-        name: "%s the Explorer".into(),
-        name1: "%s the Exploress".into(),
-    }]);
+    let mut view = crate::script::live::TestView {
+        char_titles: vec![TitleRow {
+            mask_id: 46,
+            name: "%s the Explorer".into(),
+            name1: "%s the Exploress".into(),
+        }],
+        ..Default::default()
+    };
+    crate::script::live::lending(&mut view, || tooltip_titles(&mut s));
+}
+
+fn tooltip_titles(s: &mut UiScript) {
     let player = |sex: u8, chosen_title: i32| UnitState {
         exists: true,
         is_player: true,
@@ -259,12 +266,12 @@ fn the_tooltip_title_is_the_chosen_title_name() {
 
     s.set_unit("target", Some(player(2, 46)));
     s.run(r#"assert(TT:SetUnit("target") == 1)"#).unwrap();
-    assert_eq!(title(&s), "Pfedh the Explorer");
+    assert_eq!(title(s), "Pfedh the Explorer");
 
     s.set_unit("target", Some(player(3, 46)));
     s.run(r#"assert(TT:SetUnit("target") == 1)"#).unwrap();
     assert_eq!(
-        title(&s),
+        title(s),
         "Pfedh the Exploress",
         "the unit's sex picks the form"
     );
@@ -272,7 +279,7 @@ fn the_tooltip_title_is_the_chosen_title_name() {
     s.set_unit("target", Some(player(2, 0)));
     s.run(r#"assert(TT:SetUnit("target") == 1)"#).unwrap();
     assert_eq!(
-        title(&s),
+        title(s),
         "Pfedh",
         "no chosen title, and the rank byte decorates nothing"
     );
@@ -282,7 +289,7 @@ fn the_tooltip_title_is_the_chosen_title_name() {
     s.set_unit("target", Some(protector));
     s.run(r#"assert(TT:SetUnit("target") == 1)"#).unwrap();
     assert_eq!(
-        title(&s),
+        title(s),
         "Pfedh the Explorer
 Guardian of Stormwind",
         "the medal rides a second line"
@@ -292,7 +299,7 @@ Guardian of Stormwind",
     beast.chosen_title = 46;
     s.set_unit("target", Some(beast));
     s.run(r#"assert(TT:SetUnit("target") == 1)"#).unwrap();
-    assert_eq!(title(&s), "Timber Wolf", "a creature takes no title");
+    assert_eq!(title(s), "Timber Wolf", "a creature takes no title");
     assert!(s.take_errors().is_empty());
 }
 
@@ -791,4 +798,55 @@ fn set_unit_fires_on_tooltip_set_unit_and_is_unit_matches_by_guid() {
     assert_eq!(g, 1.0, "the handler's tint stands");
     let e = s.run("TTSet:IsUnit({})").unwrap_err().to_string();
     assert!(e.contains("Usage: TTSet:IsUnit(\"unit\")"), "{e}");
+}
+
+/// A destructible building's plate carries its health on the bar (`0x626720`), on `0..1`, and the
+/// field watcher (`0x61bf80`) keeps it live; other content hides it, and a plate for any other
+/// object has none.
+#[test]
+fn a_building_plate_shows_its_health_and_follows_it() {
+    let mut s = script();
+    s.run(
+        r#"
+        UIParent = CreateFrame("Frame", "UIParent"); UIParent:SetAllPoints()
+        local tt = CreateFrame("GameTooltip", "GameTooltip"); tt:Hide()
+        tt:SetScript("OnTooltipSetDefaultAnchor", function()
+            GameTooltip:SetOwner(UIParent, "ANCHOR_NONE")
+        end)
+        local bar = CreateFrame("StatusBar", "GameTooltipStatusBar", tt)
+        bar:SetPoint("TOPLEFT", tt, "BOTTOMLEFT", 2, -1); bar:SetWidth(100); bar:SetHeight(8)
+        changed = 0
+        bar:SetScript("OnValueChanged", function() changed = changed + 1 end)
+    "#,
+    )
+    .unwrap();
+    let wall = 0xF110_0000_0002_E72B;
+    assert!(s.world_tooltip_gameobject("Wintergrasp Fortress Wall", &[], false));
+    assert!(s.world_tooltip_object_health(wall, 0.5));
+    s.run(
+        r#"
+        assert(GameTooltipStatusBar:IsShown(), "the building's plate shows the bar")
+        local lo, hi = GameTooltipStatusBar:GetMinMaxValues()
+        assert(lo == 0 and hi == 1, "on 0..1")
+        assert(GameTooltipStatusBar:GetValue() == 0.5, "at its health")
+        assert(changed == 1, "OnValueChanged colours the fill")
+    "#,
+    )
+    .unwrap();
+    // The watcher follows the building, not the hover; another object's push changes nothing.
+    s.object_health(wall, 0.25);
+    s.object_health(wall + 1, 0.0);
+    s.run(r#"assert(GameTooltipStatusBar:GetValue() == 0.25, "the bar follows the building")"#)
+        .unwrap();
+    // A plain object's plate clears the subject and hides the bar.
+    assert!(s.world_tooltip_gameobject("Bench", &[], false));
+    s.object_health(wall, 0.75);
+    s.run(
+        r#"
+        assert(not GameTooltipStatusBar:IsShown(), "no bar on a plain object")
+        assert(GameTooltipStatusBar:GetValue() == 0.25, "the old subject no longer drives it")
+    "#,
+    )
+    .unwrap();
+    assert!(s.take_errors().is_empty());
 }

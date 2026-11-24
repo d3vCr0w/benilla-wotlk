@@ -716,7 +716,7 @@ pub(crate) mod schedule_tests {
     /// - A pure cache, where a miss records itself (`NameCache`, the GameObject templates, the
     ///   page texts, `WorldAssets`, `Creatures`' and `ItemDisplays`' display models): two misses for one key commute.
     ///   A cache that is also a window's state is not pure, and not here.
-    /// - An append-only sink (`ChatLog`, `MessageSounds`, `UiErrorKeys`, `UiErrorTexts`):
+    /// - An append-only sink (`ChatLog`, `MessageSounds`):
     ///   writers commute, and a drain's order against a writer is one frame of latency.
     /// - A random stream (`SoundKits`, `AnimRng`): any interleaving of draws is a valid draw,
     ///   the reference's contract for its single stream.
@@ -828,8 +828,6 @@ pub(crate) mod schedule_tests {
         const SINKS: &[ClassRow] = &[
             ("ChatLog", TypeId::of::<crate::ui_chat::ChatLog>),
             ("MessageSounds", TypeId::of::<crate::sound::MessageSounds>),
-            ("UiErrorKeys", TypeId::of::<crate::ui_action::UiErrorKeys>),
-            ("UiErrorTexts", TypeId::of::<crate::ui_action::UiErrorTexts>),
             // The cast send appends; the vehicle's aim drains it once, after the frame's casts.
             (
                 "TrajectoryCasts",
@@ -978,8 +976,6 @@ pub(crate) mod schedule_tests {
     ///   controller, ordered before it, reads.
     /// - `ui_petition::close_out_of_range` against the motion and booth writers of `Transform`:
     ///   it reads the registrar's and vendor's positions once per frame to close on a walk-away.
-    /// - `ui_glyph::drain_glyph_removes`, an `.after(UiInput)` drain of the VM's own sends, against
-    ///   `terrain_stream::collider::finish_colliders`, as the other such drains pair.
     ///
     /// Raising the ceiling is a claim that a new undeclared order is acceptable: make it with the
     /// reason read off the dump, or declare the order (`.after`, a set, a `chain`). A resource
@@ -1317,7 +1313,8 @@ pub(crate) mod schedule_tests {
         // Counts the five raise steps between the UI phases and the nine chained after holders in
         // turn outside them (the zone feed's and the by-name asks' among them), each run only while
         // raises wait.
-        ("Update", 658, 636),
+        // Counts the four destructible-building systems, each gated on its component.
+        ("Update", 662, 636),
         // Counts `apply_host_sequence` (ship state -> props), gated on `Changed<HostSequence>`.
         ("PostUpdate", 183, 142),
         ("PreUpdate", 60, 60),
@@ -1949,7 +1946,15 @@ pub(crate) mod schedule_tests {
     /// The consumer markers: a VM holder that does one of these to host state has spent
     /// something this frame that nothing can re-spend.
     #[rustfmt::skip]
-    const CONSUMES: &[&str] = &["fire_event(", "edge_now(", "with_edge(", "mem::take(", ".drain("];
+    const CONSUMES: &[&str] = &[
+        // Split so the fired-event walker reads no event name off this list.
+        concat!("fire_event", "("),
+        "edge_now(",
+        "with_edge(",
+        "lock_moved_now(",
+        "mem::take(",
+        ".drain(",
+    ];
 
     /// Why an ungated one-shot consumer holding the VM loses nothing in the one-frame window
     /// where the wire is in world and the boot VM is still live and frameless.
@@ -1981,16 +1986,12 @@ pub(crate) mod schedule_tests {
          "runs in the challenge packet's handler turn, as 12340's handler fires `DUEL_REQUESTED` (`0x5cfd8b`); a packet before the interface loads has no listener in 12340 either"),
         ("ui_unit.rs", "target_set_tail", Because::Deliberate,
          "the selection setter's tail (`0x524f54`), run inside the script call that moved the selection"),
+        ("net/handler_step_tests.rs", "both", Because::Deliberate,
+         "a test's step that raises on both lists, run by `net::handlers::step` alone and never scheduled"),
         ("sound/ui.rs", "feed_drivers", Because::MemoLatched,
          "the device list rides a `VmMemo` seed, glue VM included, which a gate would starve; a `SOUND_DEVICE_UPDATE` taken before the interface is up is the reference's own drop, as the sound device-change handler signals only once the game UI is initialised"),
         ("tutorial.rs", "drain_tutorials", Because::FilledByVm,
          "`sends` exist only after Lua acknowledged, cleared or reset a flag, and go to the wire"),
-        ("ui_auction/mod.rs", "drain_auction", Because::FilledByVm,
-         "VM verbs; the refresh flags act only under an open window and become wire re-asks"),
-        ("ui_guild_bank/mod.rs", "drain_guild_bank", Because::FilledByVm,
-         "the requests are the VM's own guild bank verbs, and the auto-store's event answers one"),
-        ("ui_char.rs", "feed_char", Because::MemoLatched,
-         "`feed.vm: VmMemo<CharFeedMemo>`; `vm_reset` fires every transition on a fresh memo"),
         ("ui_chat.rs", "end_session_chat", Because::Deliberate,
          "the session end in `OnExit(InWorld)`: it empties the chat log and clears the game VM's windows, publishing nothing a VM waits for"),
         ("ui_chat/recruitment.rs", "guild_recruitment_cascade", Because::SelfHealing,
@@ -2003,20 +2004,10 @@ pub(crate) mod schedule_tests {
          "not a system: the lock steps of the item drains here hand it the locks their VM queues filled"),
         ("ui_logout.rs", "feed_logout", Because::PlayerRoundTrip,
          "both packets answer the `CMSG_LOGOUT_REQUEST`/cancel the game menu sent"),
-        ("ui_loot/mod.rs", "drain_loot_asks", Because::Deliberate,
-         "the pre-VM take of `LootMoveStart` is documented at the line and publishes nothing to the VM; the event-firing takes are Lua's queues"),
-        ("ui_loot/mod.rs", "feed_loot", Because::PlayerRoundTrip,
-         "it takes `LootMoveStart` only on a window it has just opened, which answers a loot click"),
-        ("ui_loot_roll.rs", "drain_loot_rolls", Because::FilledByVm,
-         "only a Need/Greed/Pass click queues a confirm or vote, held in the VM"),
-        ("ui_loot_roll.rs", "feed_loot_rolls", Because::PlayerRoundTrip,
-         "a roll exists only after a group member loots under group loot; leftovers are cleared at socket teardown (another player's act: coincidence-only residual)"),
         ("ui_macro/mod.rs", "load_macros", Because::MemoLatched,
          "`MacroFiles.loaded` is a `VmMemo`, so a new session re-reads the files and re-fires UPDATE_MACROS; also `InWorldGated`"),
         ("ui_macro/mod.rs", "note_dirty_macros", Because::FilledByVm,
          "`take_macros_dirty` is raised only by the macro window's Lua"),
-        ("ui_mail/mod.rs", "feed_mail", Because::SelfHealing,
-         "the window queues are mailbox-click replies; the one server push (`SMSG_RECEIVED_MAIL`) is re-asked by `send_query_next_mail_time_on_enter`, whose reply sets `notify` unconditionally"),
         ("ui_quest_log/progress.rs", "announce_notices", Because::Deliberate,
          "runs in the progress packet's handler turn, as 12340's handler shows its line (`0x6d82e9`); a packet before the interface loads has no listener in 12340 either"),
         ("ui_script/extract/mod.rs", "paint_extract", Because::Deliberate,

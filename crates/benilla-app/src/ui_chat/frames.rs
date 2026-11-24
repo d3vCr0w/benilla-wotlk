@@ -28,20 +28,96 @@ pub(crate) fn route(
     windows: &mut ChatWindows,
     event: &ChatEvent,
 ) {
+    // The VM's own globals, so the log line matches the window's.
+    let fire = record(windows, event, &|key| {
+        script.lua().globals().get::<String>(key).ok()
+    });
+    if let Some((name, args)) = fire {
+        script.fire_event(name, args);
+    }
+}
+
+/// [`route`]'s half without the VM: the next line id and the log's tee, then the event's name and
+/// arguments for the caller to fire; `None` for an event with no kind.
+fn record(
+    windows: &mut ChatWindows,
+    event: &ChatEvent,
+    get: &dyn Fn(&str) -> Option<String>,
+) -> Option<(&'static str, Vec<benilla_ui::script::ScriptValue>)> {
     let Some(kind) = event.kind else {
         warn!("chat: unroutable event (no kind): {:?}", event.text);
-        return;
+        return None;
     };
     windows.line_id = windows.line_id.wrapping_add(1);
-    let default_language = windows.default_language.clone();
-    // The VM's own globals, so the log line matches the window's.
-    if let Some(line) = compose(event, kind, &default_language, windows.line_id, &|key| {
-        script.lua().globals().get::<String>(key).ok()
-    }) {
+    if let Some(line) = compose(event, kind, &windows.default_language, windows.line_id, get) {
         windows.logs.0.record(line.as_bytes());
     }
-    let args = event.script_args_with_line(windows.line_id);
-    script.fire_event(event_name(kind), args);
+    Some((
+        event_name(kind),
+        event.script_args_with_line(windows.line_id),
+    ))
+}
+
+/// The message display's chat line added inside a verb's call (`0x52183c` -> `0x509dd0`): `text`
+/// on the catalog row's chat type, the client's own index (26 a skill line, 0 a system line, the
+/// catalog's only two), recorded as [`route`] records it; the event's name and arguments for the
+/// verb to fire. Both compose as their bare text, so no `GlobalStrings` lookup is needed.
+pub(crate) fn add_chat_line(
+    windows: &mut ChatWindows,
+    chat_type: u8,
+    text: &str,
+) -> Option<(&'static str, Vec<benilla_ui::script::ScriptValue>)> {
+    record(
+        windows,
+        &ChatEvent::text_only(kind_of_type(chat_type), text.to_string()),
+        &|_| None,
+    )
+}
+
+/// A chat line an app handler or step adds in its turn (`0x509dd0`): recorded on `chat_type` (`0x50a8a5`) and its event fired with the `World` lent (`0x4fdbc0` at `0x4fdd5c`); with no chat windows the chat feed's queue takes it.
+pub(crate) fn add_chat_line_now(world: &mut World, chat_type: u8, text: String) {
+    add_text_line_now(world, ChatEvent::text_only(kind_of_type(chat_type), text));
+}
+
+/// A bare-text line of any kind added at its step, as [`add_chat_line_now`] adds a system line.
+fn add_text_line_now(world: &mut World, event: ChatEvent) {
+    let fired = match world.get_resource_mut::<ChatWindows>() {
+        Some(mut windows) => record(&mut windows, &event, &|_| None),
+        None => {
+            if let Some(mut log) = world.get_resource_mut::<super::ChatLog>() {
+                log.push_event(event);
+            }
+            return;
+        }
+    };
+    if let Some((event, args)) = fired {
+        crate::ui_script::live::with_live_world(world, |script| script.fire_event(event, args));
+    }
+}
+
+/// A combat-family line an app handler adds at its step, the faction lines' (`0x50b8c0`, `0x50ba10` -> `0x509dd0`): composed off the VM's strings, then added as [`add_chat_line_now`] adds one; with no VM the chat feed's queue takes it.
+pub(crate) fn add_combat_line_now(world: &mut World, line: super::combat::PendingCombat) {
+    let composed = world
+        .get_non_send_resource::<benilla_ui::script::UiScript>()
+        .map(|script| super::combat::compose_line(script, line.family, line.me, &line.fills));
+    match composed {
+        Some(Some(text)) => add_text_line_now(world, ChatEvent::text_only(line.kind, text)),
+        Some(None) => {}
+        None => {
+            if let Some(mut log) = world.get_resource_mut::<super::ChatLog>() {
+                log.push_combat(line);
+            }
+        }
+    }
+}
+
+/// A line's chat type as the event kind: 26 a skill line, 27 a loot line, any other a system line.
+pub(crate) fn kind_of_type(chat_type: u8) -> ChatEventKind {
+    match chat_type {
+        26 => ChatEventKind::Skill,
+        27 => ChatEventKind::Loot,
+        _ => ChatEventKind::System,
+    }
 }
 
 /// `ChatFrame_MessageEventHandler`'s composition (`ChatFrame.lua:2753-2937`) for the line that

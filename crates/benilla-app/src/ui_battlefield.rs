@@ -825,13 +825,14 @@ fn bank_banker(world: &World) -> Option<u64> {
         .banker
 }
 
-/// The world leave's inspect (`0x528cd3`), item text (`0x528ce2`), taxi (`0x528cf6`), trainer (`0x528cfb`), merchant (`0x528d00`), pet (`0x528d14`), duel (`0x528d23`), battlefield (`0x528d46`), stable (`0x528d5a`) and interaction close (`0x528dce`) parts, in its order.
+/// The world leave's inspect (`0x528cd3`), item text (`0x528ce2`), taxi (`0x528cf6`), trainer (`0x528cfb`), merchant (`0x528d00`), trade (`0x528d05`), pet (`0x528d14`), duel (`0x528d23`), battlefield (`0x528d46`), talent (`0x528d4b`), auction house (`0x528d55`), stable (`0x528d5a`) and interaction close (`0x528dce`) parts, in its order.
 pub(crate) fn leave_world(world: &mut World) {
     crate::ui_inspect::leave_world(world);
     crate::ui_item_text::leave_world(world);
     crate::ui_taxi::leave_world(world);
     crate::ui_trainer::leave_world(world);
     crate::ui_merchant::leave_world(world);
+    crate::ui_trade::leave_world(world);
     crate::ui_pet::possess::leave_world(world);
     if let Some(mut duel) = world.get_resource_mut::<crate::ui_duel::DuelState>() {
         duel.leave_world();
@@ -842,6 +843,10 @@ pub(crate) fn leave_world(world: &mut World) {
     if let Some(mut ui) = world.get_resource_mut::<UiEvents>() {
         ui.write(UiScript::leave_battlefield_world);
     }
+    // The talent part (`0x528d4b`, `0x528d50`), ahead of the auction house's.
+    crate::ui_talent::leave_world(world);
+    // The auction house's close (`0x528d55`), ahead of the stable's.
+    crate::ui_auction::leave_world(world);
     crate::ui_stable::leave_world(world);
     // The interaction close zeroes the interact target ahead of its walk (`0x528dce` -> `0x512e89`).
     let held = world
@@ -862,19 +867,27 @@ pub(crate) fn leave_world(world: &mut World) {
 /// Queue the battlefield's world entry (`0x54ca50`) for when the calling system's commands apply.
 pub(crate) fn queue_enter_world(commands: &mut Commands) {
     commands.queue(|world: &mut World| {
-        // The bar's part (`0x5281b8`), then the containers' (`0x5281c7`), ahead of the
-        // battlefield's (`0x528230`).
+        // The bar's part (`0x5281b8`), the character page's (`0x5281bd`), then the containers'
+        // (`0x5281c7`), ahead of the battlefield's (`0x528230`).
         crate::ui_action::bonus::enter_world(world);
+        crate::ui_char::enter_world(world);
         crate::ui_items::watch::enter_world(world);
-        // The merchant's (`0x5281ea`).
+        // The merchant's (`0x5281ea`), then the trade window's (`0x5281ef`).
         crate::ui_merchant::enter_world(world);
+        crate::ui_trade::enter_world(world);
         // The registrar's, the petition window's and the vendor's (`0x528217`, `0x528221`, `0x528258`).
         crate::ui_petition::enter_world(world);
+        // The skill list's rebuild and `SKILL_LINES_CHANGED` (`0x528226` -> `0x5cd9b0`), in turn after the parts ahead of it.
+        crate::ui_script::live::in_turn(world, crate::ui_char::rebuild_skills);
         if let Err(e) = world.run_system_cached(enter_world) {
             warn!("ui_battlefield: the world entry did not run: {e}");
         }
         crate::ui_battlefield_score::enter_world(world);
         crate::ui_arena::enter_world(world);
+        // The talent part (`0x528235`, `0x52823a`), ahead of the auction house's.
+        crate::ui_talent::enter_world(world);
+        // The auction house's part (`0x52823f`), ahead of the stable's (`0x528244`).
+        crate::ui_auction::enter_world(world);
         crate::ui_stable::enter_world(world);
         crate::ui_tabard::enter_world(world);
         crate::ui_currency::enter_world(world);
@@ -1132,17 +1145,29 @@ mod net {
             .as_deref()
             .and_then(|a| a.0.get(here))
             .map_or(0, |r| r.zone_id);
-        if matches!(
+        let cleared_afk = matches!(
             notice,
             benilla_protocol::messages::BattlefieldMgrNotice::Entered {
                 cleared_afk: true,
                 ..
             }
-        ) {
-            ui.system_line("CLEARED_AFK", Vec::new());
+        );
+        if !cleared_afk {
+            let (event, args) = world_pvp.0.apply(notice, (here, parent));
+            ui.fire(event, args);
+            return;
         }
-        let (event, args) = world_pvp.0.apply(notice, (here, parent));
-        ui.fire(event, args);
+        ui.system_line("CLEARED_AFK", Vec::new());
+        // The entry's write and event after the line's add (`0x54992b` before `0x549988`).
+        ui.world(move |world| {
+            let Some(mut world_pvp) = world.get_resource_mut::<WorldPvp>() else {
+                return;
+            };
+            let (event, args) = world_pvp.0.apply(notice, (here, parent));
+            if let Some(mut ui) = world.get_resource_mut::<UiEvents>() {
+                ui.fire(event, args);
+            }
+        });
     }
 }
 

@@ -118,7 +118,7 @@ pub(crate) struct GuildState {
     /// The pushed snapshot is stale; the feed rebuilds only when set.
     dirty: bool,
     /// `/ginfo` answers for [`feed`], which builds their lines where the VM is: their templates are
-    /// not catalog rows, so they cannot ride [`crate::ui_action::UiErrorKeys`].
+    /// not catalog rows, so they cannot ride [`crate::ui_action::UiError`].
     pending_info: Vec<GuildInfo>,
     /// The permissions query owes the server `MSG_GUILD_BANK_MONEY_WITHDRAWN`'s ask.
     bank_withdraw_ask: bool,
@@ -482,6 +482,16 @@ impl GuildState {
             .unwrap_or((0, 0))
     }
 
+    /// Give our rank `rights` and `withdrawals` on bank tab `tab`, as a permissions answer does.
+    #[cfg(test)]
+    pub(crate) fn set_own_bank_tab(&mut self, tab: usize, rights: u32, withdrawals: u32) {
+        let rank = self.rank_index as usize;
+        if self.rank_bank.len() <= rank {
+            self.rank_bank.resize(rank + 1, Default::default());
+        }
+        self.rank_bank[rank].tabs[tab] = (rights, withdrawals);
+    }
+
     /// Our rank's rights word, which every `Can*` predicate tests; `0` (none) before a roster.
     fn own_rights(&self) -> u32 {
         self.rank_rights
@@ -591,7 +601,9 @@ fn guild_emblem(guild_id: u32, guild: &GuildCache, commands: &NetCommands) -> Op
 /// whose catalog rows pick the surface and the sound; the guild events fire from the feed.
 pub(crate) mod net {
     use super::*;
-    use crate::ui_action::{UiError, UiErrorKeys};
+    use crate::ui_action::signals::SignalSink;
+    use crate::ui_action::UiError;
+    use crate::ui_script::live::UiEvents;
     use crate::ui_social::SocialState;
     use benilla_protocol::{SessionEvent, SessionEventKind};
 
@@ -670,7 +682,7 @@ pub(crate) mod net {
         In(ev): In<SessionEvent>,
         mut guild: ResMut<GuildState>,
         mut cache: ResMut<GuildCache>,
-        mut errors: ResMut<UiErrorKeys>,
+        mut ui: ResMut<UiEvents>,
         social: Res<SocialState>,
         notify: Res<GuildMemberNotify>,
         self_guid: Res<crate::net::SelfGuid>,
@@ -679,7 +691,7 @@ pub(crate) mod net {
             event(
                 &mut guild,
                 &mut cache,
-                &mut errors,
+                &mut *ui,
                 &social,
                 &notify,
                 self_guid.0,
@@ -691,26 +703,26 @@ pub(crate) mod net {
     fn on_command_result(
         In(ev): In<SessionEvent>,
         mut guild: ResMut<GuildState>,
-        mut errors: ResMut<UiErrorKeys>,
+        mut ui: ResMut<UiEvents>,
     ) {
         if let SessionEvent::GuildCommandResult(result) = ev {
-            command_result(&mut guild, &mut errors, result);
+            command_result(&mut guild, &mut *ui, result);
         }
     }
 
     fn on_invite(
         In(ev): In<SessionEvent>,
         mut guild: ResMut<GuildState>,
-        mut errors: ResMut<UiErrorKeys>,
+        mut ui: ResMut<UiEvents>,
     ) {
         if let SessionEvent::GuildInvite { inviter, guild: g } = ev {
-            invite(&mut guild, &mut errors, inviter, g);
+            invite(&mut guild, &mut *ui, inviter, g);
         }
     }
 
-    fn on_decline(In(ev): In<SessionEvent>, mut errors: ResMut<UiErrorKeys>) {
+    fn on_decline(In(ev): In<SessionEvent>, mut ui: ResMut<UiEvents>) {
         if let SessionEvent::GuildDecline { name } = ev {
-            decline(&mut errors, &name);
+            decline(&mut *ui, &name);
         }
     }
 
@@ -732,9 +744,11 @@ pub(crate) mod net {
         *cache = GuildCache::default();
     }
 
-    /// Queue the message ids [`lines`] named.
-    fn push_lines(errors: &mut UiErrorKeys, lines: impl IntoIterator<Item = UiError>) {
-        errors.0.extend(lines);
+    /// Show the message ids [`lines`] named, each at the display (`0x5216f0`) in the handler's turn.
+    fn push_lines(errors: &mut impl SignalSink, lines: impl IntoIterator<Item = UiError>) {
+        for line in lines {
+            errors.line(line);
+        }
     }
 
     /// `SMSG_GUILD_QUERY_RESPONSE`.
@@ -763,7 +777,7 @@ pub(crate) mod net {
     pub(crate) fn event(
         guild: &mut GuildState,
         cache: &mut GuildCache,
-        errors: &mut UiErrorKeys,
+        errors: &mut impl SignalSink,
         social: &SocialState,
         notify: &GuildMemberNotify,
         self_guid: Option<u64>,
@@ -795,7 +809,7 @@ pub(crate) mod net {
     /// `SMSG_GUILD_COMMAND_RESULT`.
     pub(crate) fn command_result(
         guild: &mut GuildState,
-        errors: &mut UiErrorKeys,
+        errors: &mut impl SignalSink,
         result: GuildCommandResult,
     ) {
         guild.apply_command_result(&result);
@@ -805,7 +819,7 @@ pub(crate) mod net {
     /// `SMSG_GUILD_INVITE`: the popup's show edge and the notice line printed beside it.
     pub(crate) fn invite(
         guild: &mut GuildState,
-        errors: &mut UiErrorKeys,
+        errors: &mut impl SignalSink,
         inviter: String,
         guild_name: String,
     ) {
@@ -814,7 +828,7 @@ pub(crate) mod net {
     }
 
     /// `SMSG_GUILD_DECLINE`: a line, no state.
-    pub(crate) fn decline(errors: &mut UiErrorKeys, name: &str) {
+    pub(crate) fn decline(errors: &mut impl SignalSink, name: &str) {
         push_lines(errors, [lines::decline_line(name)]);
     }
 

@@ -79,6 +79,18 @@ pub(crate) fn fire_lock_edge(ui: &mut UiEvents, locked: bool, args: Vec<ScriptVa
     }
 }
 
+/// The lock (`0x513740`) or unlock (`0x513770`) a caller holding the VM made: the edge's signals when the bit moved, then the bar's usable update either way (`0x51376b`, `0x51379b`).
+pub(crate) fn lock_moved_now(
+    script: &mut benilla_ui::script::UiScript,
+    locked: bool,
+    moved: Option<Vec<ScriptValue>>,
+) {
+    if let Some(args) = moved {
+        fire_lock_edge_now(script, locked, args);
+    }
+    script.update_bar_usable();
+}
+
 /// [`fire_lock_edge`] for a caller holding the VM.
 pub(crate) fn fire_lock_edge_now(
     script: &mut benilla_ui::script::UiScript,
@@ -101,32 +113,17 @@ pub(crate) struct LockStep {
     pub(crate) args: Option<Vec<ScriptValue>>,
 }
 
-/// Write `lock` and, on the bit's edge, signal at its place with the `World` lent before anything
-/// after it runs (`0x706feb`, `0x70702b`), so its listener reads the later locks still unwritten.
+/// The lock (`0x513740`) or unlock (`0x513770`): write `lock` and, on the bit's edge, signal at its
+/// place with the `World` lent before anything after it runs (`0x706feb`, `0x70702b`), so its
+/// listener reads the later locks still unwritten; then the bar's usable update, an edge or none
+/// (`0x51376b`, `0x51379b`).
 pub(crate) fn lock_now(world: &mut World, lock: LockStep) {
     let LockStep { guid, locked, args } = lock;
     let changed = world
         .get_resource_mut::<PendingItemOps>()
         .is_some_and(|mut p| if locked { p.lock(guid) } else { p.unlock(guid) });
-    if let (true, Some(args)) = (changed, args) {
-        crate::ui_script::safe_world::lend(world, |s| fire_lock_edge_now(s, locked, args));
-    }
-}
-
-/// Run `step`, a send that raises in turn, then fire what it raised and write each lock it made,
-/// each lock's edge signalled before the next is written (`0x706fe0` -> `0x706feb`).
-pub(crate) fn run_lock_step<I: Send + 'static, M>(
-    world: &mut World,
-    step: impl IntoSystem<In<I>, Vec<LockStep>, M> + 'static,
-    input: I,
-) {
-    let locks = world
-        .run_system_cached_with(step, input)
-        .unwrap_or_default();
-    crate::ui_script::live::fire_handler_events(world);
-    for lock in locks {
-        lock_now(world, lock);
-    }
+    let moved = changed.then_some(args).flatten();
+    crate::ui_script::safe_world::lend(world, |s| lock_moved_now(s, locked, moved));
 }
 
 /// Run `step` on the lent `World` in the caller's turn: for a step that holds the `World` while it
@@ -161,8 +158,18 @@ pub(crate) fn send_now(world: &World, send: crate::net::ClientCommand) {
     }
 }
 
-/// The item unlock (`0x513770` -> `0x707020`): a locked item unlocks and signals at its place; an unlocked or absent one does nothing.
+/// The item unlock (`0x513770`): a locked item unlocks and signals at its place (`0x707020`), then the bar's usable update runs, an item or none (`0x51379b`).
 pub(crate) fn unlock_item(world: &mut World, guid: u64) {
+    unlock_item_alone(world, guid);
+    // Its own step, so the unlock's signals fire ahead of it.
+    step(
+        world,
+        crate::ui_action::usable_cache::step(crate::ui_action::usable_cache::Pass::Bar),
+    );
+}
+
+/// The item's own unlock (`0x707020`), as the unlock of a kind calls it (`0x754004`): a locked item unlocks and signals at its place; an unlocked or absent one does nothing.
+pub(crate) fn unlock_item_alone(world: &mut World, guid: u64) {
     let unlocked = world
         .get_resource_mut::<PendingItemOps>()
         .is_some_and(|mut p| p.unlock(guid));
@@ -241,7 +248,7 @@ fn unlock_items_of_type(world: &mut World, entry: u32, bank: bool) {
         )
         .unwrap_or_default();
     for guid in found {
-        step(world, move |world| unlock_item(world, guid));
+        step(world, move |world| unlock_item_alone(world, guid));
     }
 }
 
@@ -513,28 +520,120 @@ pub(crate) fn item_updated(world: &mut World, item: u64) {
     }
 }
 
-/// The character page's item refresh (`0x5e84c0`): a vault or bank-bag slot holding the item, or the bag holding it, fires that slot's `PLAYERBANKSLOTS_CHANGED` (`0x5e855e`).
+/// The character page's item refresh (`0x5e84c0`), on the player slot holding the item, else the one holding its bag when the bag is not our pack (`0x5e851a`-`0x5e855e`): a worn slot or equipped bag fires `UNIT_INVENTORY_CHANGED` with `"player"` (`0x5e8568`, `0x5e85b9`); a vault or bank-bag slot fires its `PLAYERBANKSLOTS_CHANGED` (`0x5e858d`); past those, an item of our ammo's entry fires `UNIT_INVENTORY_CHANGED` (`0x5e85a1`-`0x5e85b9`).
 fn character_item_updated(world: &mut World, item: u64) {
-    let slot = world
+    character_item_refresh(world, item, None);
+}
+
+/// [`character_item_updated`] with the item's entry read by the caller where its object may already be gone.
+fn character_item_refresh(world: &mut World, item: u64, entry: Option<u32>) {
+    let found = world
         .run_system_cached_with(
-            |In(item): In<u64>, objects: Objects, self_guid: Option<Res<crate::net::SelfGuid>>| {
-                let fields = objects.object(item)?;
+            |In((item, entry)): In<(u64, Option<u32>)>,
+             objects: Objects,
+             self_guid: Option<Res<crate::net::SelfGuid>>| {
                 let me = objects.player_object()?;
-                let contained = fields.item_contained()?;
+                let fields = objects.object(item);
                 let slot_of = |g: u64| (0..150u8).find(|&s| me.player_slot(s) == Some(g));
-                let ours = self_guid.and_then(|s| s.0) == Some(contained);
-                slot_of(item).or_else(|| (!ours).then(|| slot_of(contained)).flatten())
+                let mut slot = slot_of(item);
+                if slot.is_none() {
+                    let contained = fields.and_then(|f| f.item_contained());
+                    let ours = contained.is_some() && self_guid.and_then(|s| s.0) == contained;
+                    slot = contained.filter(|_| !ours).and_then(slot_of);
+                }
+                let entry = entry.or_else(|| fields?.object_entry());
+                let ammo = entry.is_some() && entry == me.player_ammo_id();
+                Some((slot, ammo))
             },
-            item,
+            (item, entry),
         )
         .ok()
         .flatten();
-    let bank = slot.filter(|s| (39..=73).contains(s));
-    if let (Some(s), Some(mut ui)) = (bank, world.get_resource_mut::<UiEvents>()) {
+    let Some((slot, ammo)) = found else {
+        return;
+    };
+    let Some(mut ui) = world.get_resource_mut::<UiEvents>() else {
+        return;
+    };
+    let player = || vec![ScriptValue::Str("player".into())];
+    if slot.is_some_and(|s| s <= 22) {
+        ui.fire("UNIT_INVENTORY_CHANGED", player());
+        return;
+    }
+    if let Some(s) = slot.filter(|s| (39..=73).contains(s)) {
         ui.fire(
             "PLAYERBANKSLOTS_CHANGED",
             vec![ScriptValue::Int(i64::from(s) - 38)],
         );
+    }
+    if ammo {
+        ui.fire("UNIT_INVENTORY_CHANGED", player());
+    }
+}
+
+/// The disable's character page refresh on an item of ours, of entry `entry` (`0x70b0fa` -> `0x5e84c0`).
+pub(crate) fn disabled(world: &mut World, item: u64, entry: u32) {
+    character_item_refresh(world, item, Some(entry));
+}
+
+/// Whether item `item` is ours, its owner the active player (`0x707752`-`0x707761`).
+fn owner_is_us(world: &mut World, item: u64) -> bool {
+    world
+        .run_system_cached_with(
+            |In(item): In<u64>, objects: Objects, self_guid: Option<Res<crate::net::SelfGuid>>| {
+                let me = self_guid.and_then(|s| s.0);
+                me.is_some() && objects.object(item).and_then(|f| f.item_owner()) == me
+            },
+            item,
+        )
+        .unwrap_or(false)
+}
+
+/// The count watch's tail on an item of ours: an `Item.dbc` row with `InventoryType` 24 (`INVTYPE_AMMO`) runs the alert recompute (`0x707837`-`0x707864`).
+pub(crate) fn stack_alerts(world: &mut World, item: u64) {
+    if !owner_is_us(world, item) {
+        return;
+    }
+    let ammo = world
+        .run_system_cached_with(
+            |In(item): In<u64>,
+             objects: Objects,
+             displays: Option<Res<crate::entities::ItemDisplays>>| {
+                let entry = objects.object(item)?.object_entry()?;
+                Some(displays?.item_dbc.get(&entry)?.inventory_type == INVTYPE_AMMO)
+            },
+            item,
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if ammo {
+        crate::ui_char::update_inventory_alerts(world);
+    }
+}
+
+/// `INVTYPE_AMMO`, the `Item.dbc` inventory type the count watch's alert leg tests (`0x70785e`).
+const INVTYPE_AMMO: u8 = 24;
+
+/// The flags watch past its `0x10` test (`0x707a30`): an item of the active player worn in slots 0..18 runs the alert recompute (`0x707a97`-`0x707ac6`).
+pub(crate) fn flags_changed(world: &mut World, item: u64) {
+    let worn = world
+        .run_system_cached_with(
+            |In(item): In<u64>, objects: Objects, self_guid: Option<Res<crate::net::SelfGuid>>| {
+                let me = self_guid.and_then(|s| s.0)?;
+                if objects.object(item)?.item_owner() != Some(me) {
+                    return None;
+                }
+                let player = objects.player_object()?;
+                Some((0..=18u8).any(|s| player.player_slot(s) == Some(item)))
+            },
+            item,
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(false);
+    if worn {
+        crate::ui_char::update_inventory_alerts(world);
     }
 }
 
@@ -618,6 +717,8 @@ pub(crate) fn enchants_changed(world: &mut World, item: u64) {
     crate::ui_action::slots::update_item(world, entry);
     item_updated(world, item);
     character_item_updated(world, item);
+    // Then the alert recompute (`0x707ff8`), in turn after the legs above.
+    crate::ui_script::live::in_turn(world, crate::ui_char::update_inventory_alerts);
 }
 
 /// The post-init's unlock on an item we own (`0x70ad20`): a single item unlocks itself (`0x70ad9e`), a stackable kind every item of it outside the bank (`0x70ad8d`); then the bar's faces and item update (`0x70add6`-`0x70adf0`).
@@ -669,8 +770,8 @@ mod tests {
     const A: u64 = 0x4000_0000_0000_0A01;
     const B: u64 = 0x4000_0000_0000_0B02;
 
-    /// A step that locks both ends of a swap.
-    fn swap_locks(In(()): In<()>) -> Vec<LockStep> {
+    /// The locks of both ends of a swap.
+    fn swap_locks() -> Vec<LockStep> {
         [A, B]
             .into_iter()
             .map(|guid| LockStep {
@@ -711,7 +812,9 @@ mod tests {
             )
             .unwrap();
         world.insert_non_send_resource(script);
-        run_lock_step(&mut world, swap_locks, ());
+        for lock in swap_locks() {
+            lock_now(&mut world, lock);
+        }
         let seen = world
             .non_send_resource::<UiScript>()
             .eval::<Vec<String>>("return SEEN")

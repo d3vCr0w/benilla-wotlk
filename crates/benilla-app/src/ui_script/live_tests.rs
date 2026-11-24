@@ -216,6 +216,11 @@ const CALLS_NO_LUA: &[(&str, &str, &str)] = &[
         "reads the focus and the names a token resolves through off the model",
     ),
     (
+        "portrait/mod.rs",
+        "sync_portraits",
+        "reads the focus off the model for the focus portrait",
+    ),
+    (
         "death/mod.rs",
         "death_action",
         "one death intent as a press, its raises queued in turn; `press_step` fires them with the          `World` lent",
@@ -270,6 +275,11 @@ const CALLS_NO_LUA: &[(&str, &str, &str)] = &[
         "ui_summon.rs",
         "drain_summon",
         "takes the answers `ConfirmSummon` and `CancelSummon` queued, a field drain",
+    ),
+    (
+        "ui_char.rs",
+        "sync_char_booth",
+        "reads the character pane's facing off the model",
     ),
     (
         "ui_tabard.rs",
@@ -335,11 +345,6 @@ const CALLS_NO_LUA: &[(&str, &str, &str)] = &[
         "ui_loot/net.rs",
         "on_money_notify",
         "reads the money line's global strings off the VM",
-    ),
-    (
-        "ui_macro/mod.rs",
-        "rebind_macro_spells",
-        "reads the macro bodies and writes their bound spells into the model",
     ),
     (
         "combat_log/mod.rs",
@@ -564,7 +569,7 @@ fn every_scheduled_holder_of_the_vm_lends_the_world() {
         });
     }
     // A floor that proves the census reads the schedule; the #1245 parts shrink the count.
-    assert!(holders > 150, "the census found only {holders} holders");
+    assert!(holders > 100, "the census found only {holders} holders");
     assert!(
         offenders.is_empty(),
         "these scheduled systems hold the VM and lend nothing:\n{}",

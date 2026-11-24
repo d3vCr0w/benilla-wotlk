@@ -1,10 +1,9 @@
 //! The money cursor, payload mode 2: coins taken off a money frame; the purse is never debited.
-//! Deviation: a `CURSOR_UPDATE` handler already sees the coins, because events are queued; the
-//! reference runs it inside the clear, before they land.
+//! The setter's clear signals `CURSOR_UPDATE` before the coins land (`0x5208a1`), and the coins signal their frame (`0x5208da`).
 
 use mlua::{Lua, Value};
 
-use super::{queue_cursor_update, CursorMoney, CursorPayload};
+use super::{CursorMoney, CursorPayload};
 use crate::script::binding_abi::{flag, number_arg};
 use crate::script::Model;
 
@@ -34,27 +33,13 @@ pub(crate) fn cursor_money(model: &Model) -> u32 {
     }
 }
 
-/// Queue `PLAYER_MONEY`, which repaints the money frames less the held coins.
-fn queue_player_money(model: &mut Model) {
-    model
-        .pending_events
-        .push(("PLAYER_MONEY".to_string(), Vec::new()));
-}
-
-/// Put coins on the cursor as the reference does: the inner clear's `CURSOR_UPDATE`, after its own
-/// `PLAYER_MONEY` if coins were already held, then the payload and `PLAYER_MONEY`.
-fn install_money(model: &mut Model, copper: u32) {
-    if matches!(model.cursor, Some(CursorPayload::Money(_))) {
-        queue_player_money(model);
-    }
-    model.cursor = None;
-    queue_cursor_update(model);
-    model.cursor = Some(CursorPayload::Money(CursorMoney { copper }));
-    queue_player_money(model);
+/// Put coins on the cursor through the money setter (`0x520880`): the clear's `CURSOR_UPDATE`, after its own `PLAYER_MONEY` if coins were already held, then the payload and `PLAYER_MONEY`.
+fn install_money(model: &mut crate::script::ModelGuard<'_>, copper: u32) {
+    super::set_cursor(model, CursorPayload::Money(CursorMoney { copper }));
 }
 
 /// `PickupPlayerMoney` after the argument gate; each refusal is silent.
-pub(crate) fn pickup_player_money(model: &mut Model, copper: u32) -> bool {
+pub(crate) fn pickup_player_money(model: &mut crate::script::ModelGuard<'_>, copper: u32) -> bool {
     if copper == 0
         || !crate::script::live::has_control()
         || u64::from(copper) > crate::script::live::money(model)
@@ -66,62 +51,63 @@ pub(crate) fn pickup_player_money(model: &mut Model, copper: u32) -> bool {
 }
 
 /// `DropCursorMoney`: `PLAYER_MONEY`, then the clear's `CURSOR_UPDATE`, and no packet.
-pub(crate) fn drop_cursor_money(model: &mut Model) -> bool {
+pub(crate) fn drop_cursor_money(model: &mut crate::script::ModelGuard<'_>) -> bool {
     if !matches!(model.cursor, Some(CursorPayload::Money(_))) || !crate::script::live::has_control()
     {
         return false;
     }
-    model.cursor = None;
-    queue_player_money(model);
-    queue_cursor_update(model);
+    super::clear_cursor(model);
     true
 }
 
-/// `AddTradeMoney`, also run first by `ClickTradeButton`, `ClickTargetTradeButton` and the trade
-/// window's open: the offer becomes offer plus cursor, if the purse covers it.
-pub(crate) fn add_trade_money(model: &mut Model) -> bool {
+/// `AddTradeMoney`'s add (`0x704220`), also run first by `ClickTradeButton`, `ClickTargetTradeButton` and the trade window's open: the offer (`0xca0b74`) becomes offer plus cursor and goes out if the purse covers it (`0x704293`), with or without a window.
+pub(crate) fn add_trade_money(model: &mut crate::script::ModelGuard<'_>) -> bool {
     let copper = cursor_money(model);
     if copper == 0 {
         return false;
     }
-    let offer = model.trade.as_ref().map_or(0, |t| t.player.gold);
-    let total = u64::from(offer) + u64::from(copper);
-    if total > crate::script::live::money(model) {
+    // The sum wraps as the reference's 32-bit add does (`0x70423c`).
+    let total = model.trade_offer_gold.wrapping_add(copper);
+    if u64::from(total) > crate::script::live::money(model) {
         return false;
     }
-    let total = total as u32;
-    model.trade_set_money = Some(total);
-    if let Some(t) = model.trade.as_mut() {
-        t.player.gold = total;
-    }
+    model.trade_set_money.push(total);
+    model.trade_offer_gold = total;
     // `ClearCursor(1, 0)`: no PLAYER_MONEY, the clear's own CURSOR_UPDATE.
-    model.cursor = None;
-    queue_cursor_update(model);
+    super::clear_cursor_with(model, true, false);
     true
 }
 
-/// `PickupTradeMoney` after the argument gate: signed gates, then `CMSG_SET_TRADE_GOLD` (`0x11F`)
-/// with the trimmed offer, then the coins onto the cursor.
-pub(crate) fn pickup_trade_money(model: &mut Model, amount: i32) -> bool {
-    let offer = model.trade.as_ref().map_or(0, |t| t.player.gold) as i32;
+/// `PickupTradeMoney` after the argument gate (`0x586810`): signed gates against the offer (`0xca0b74`), with or without a window, then `CMSG_SET_TRADE_GOLD` with the trimmed offer (`0x704320`), then the coins onto the cursor (`0x58685f`).
+pub(crate) fn pickup_trade_money(model: &mut crate::script::ModelGuard<'_>, amount: i32) -> bool {
+    let offer = model.trade_offer_gold as i32;
     if amount <= 0 || amount > offer {
         return false;
     }
     let left = (offer - amount) as u32;
-    model.trade_set_money = Some(left);
-    if let Some(t) = model.trade.as_mut() {
-        t.player.gold = left;
-    }
+    model.trade_set_money.push(left);
+    model.trade_offer_gold = left;
     install_money(model, amount as u32);
     true
 }
 
-impl crate::script::UiScript {
-    /// The trade window's open folds held coins into the offer.
-    pub fn fold_cursor_money_into_trade(&mut self) -> Option<u32> {
-        let mut model = self.model_mut();
-        add_trade_money(&mut model).then(|| model.trade.as_ref().map_or(0, |t| t.player.gold))
-    }
+/// The coin text (`0x7e7d80`): each denomination present through `GOLD_AMOUNT`, `SILVER_AMOUNT`
+/// or `COPPER_AMOUNT`, gold first, joined by `separator`; "" for no coin.
+pub(crate) fn currency_text(lua: &Lua, copper: u32, separator: &str) -> String {
+    [
+        (copper / 10_000, "GOLD_AMOUNT"),
+        (copper / 100 % 100, "SILVER_AMOUNT"),
+        (copper % 100, "COPPER_AMOUNT"),
+    ]
+    .into_iter()
+    .filter(|&(v, _)| v != 0)
+    .map(|(v, key)| {
+        crate::strings::global(lua, key)
+            .unwrap_or_default()
+            .replacen("%d", &v.to_string(), 1)
+    })
+    .collect::<Vec<_>>()
+    .join(separator)
 }
 
 pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
@@ -186,20 +172,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         lua.create_function(|lua, (amount, separator): (Value, Option<mlua::String>)| {
             let n = number_arg(lua, amount, "Usage: GetCoinText(amount [,separator])")? as u32;
             let separator = separator.map_or_else(|| ", ".to_string(), |s| s.to_string_lossy());
-            let parts: Vec<String> = [
-                (n / 10_000, "GOLD_AMOUNT"),
-                (n / 100 % 100, "SILVER_AMOUNT"),
-                (n % 100, "COPPER_AMOUNT"),
-            ]
-            .into_iter()
-            .filter(|&(v, _)| v != 0)
-            .map(|(v, key)| {
-                crate::strings::global(lua, key)
-                    .unwrap_or_default()
-                    .replacen("%d", &v.to_string(), 1)
-            })
-            .collect();
-            Ok(parts.join(&separator))
+            Ok(currency_text(lua, n, &separator))
         })?,
     )?;
     // GetCoinTextureString(amount [, fontHeight]) (`0x510d00` → `0x7e7e10`): each denomination
@@ -276,14 +249,15 @@ mod tests {
     use crate::script::cursor::CursorPayload;
     use crate::script::UiScript;
 
+    /// The money and cursor events heard since the last read.
     fn events(s: &mut UiScript) -> Vec<String> {
         s.run(
-            r#"EV = {} F = F or CreateFrame("Frame") F:RegisterEvent("PLAYER_MONEY")
-               F:RegisterEvent("CURSOR_UPDATE") F:SetScript("OnEvent", function() table.insert(EV, event) end)"#,
+            r#"EV = EV or {} if not F then F = CreateFrame("Frame") F:RegisterEvent("PLAYER_MONEY")
+               F:RegisterEvent("CURSOR_UPDATE") F:SetScript("OnEvent", function() table.insert(EV, event) end) end"#,
         )
         .unwrap();
-        s.tick(0.0);
-        s.eval::<Vec<String>>("return EV").unwrap()
+        s.eval::<Vec<String>>("local heard = EV EV = {} return heard")
+            .unwrap()
     }
 
     #[test]
@@ -367,7 +341,7 @@ mod tests {
     fn the_trade_pair_moves_coins_between_the_cursor_and_the_offer() {
         let mut s = UiScript::new().unwrap();
         s.set_money(1_000);
-        s.set_trade(Some(crate::script::TradeState::default()));
+        s.open_trade_partner(0x7, false);
         s.run("PickupPlayerMoney(300) AddTradeMoney()").unwrap();
         assert_eq!(
             s.take_trade_money(),
@@ -386,6 +360,7 @@ mod tests {
         s.run("PickupTradeMoney(0) PickupTradeMoney(301) PickupTradeMoney(-1)")
             .unwrap();
         assert_eq!(s.take_trade_money(), None);
+        assert_eq!(s.eval::<i64>("return GetCursorMoney()").unwrap(), 0);
         s.run("PickupTradeMoney(100)").unwrap();
         assert_eq!(s.take_trade_money(), Some(200));
         assert_eq!(s.eval::<i64>("return GetCursorMoney()").unwrap(), 100);

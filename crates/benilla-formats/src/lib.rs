@@ -1,4 +1,4 @@
-//! `benilla-formats`: the schema layer over the 1.12.1 (build 5875) asset formats, the patch chain
+//! `benilla-formats`: the schema layer over the 3.3.5a (build 12340) asset formats, the patch chain
 //! ([`Chain`]) and the `benilla-extract` CLI. Data stays in raw WoW coordinates; the Bevy transform
 //! lives in `benilla`.
 
@@ -22,8 +22,8 @@ pub use tga::tga_to_rgba;
 mod install;
 pub use install::{
     addon_corpus, addon_corpus_candidates, candidates, drop_in_install, project_folder,
-    set_drop_in_install, set_project_folder, skipped, wow_data, wow_exe, wow_exe_candidates,
-    wow_install,
+    set_drop_in_install, set_project_folder, skipped, skipped_corpus, wow_data, wow_exe,
+    wow_exe_candidates, wow_install,
 };
 /// The reference executable's sections, mapped read-only from disk.
 mod pe;
@@ -71,8 +71,8 @@ pub use summon_properties::{
     load_summon_properties, SummonPropertiesCatalog, SUMMON_CONTROL_POSSESSED,
 };
 pub use vehicle::{
-    load_vehicles, IndicatorSeat, OverrideSpellsRec, VehicleCatalog, VehicleRec, VehicleSeatRec,
-    VehicleUiIndicator, OVERRIDE_SPELLS, VEHICLE_SEATS,
+    load_vehicles, IndicatorSeat, MissileTargeting, OverrideSpellsRec, VehicleCatalog, VehicleRec,
+    VehicleSeatRec, VehicleUiIndicator, OVERRIDE_SPELLS, VEHICLE_SEATS,
 };
 mod glyphs;
 pub use glyphs::{load_glyph_catalog, GlyphCatalog, GlyphProperty, GlyphSlot};
@@ -130,6 +130,10 @@ pub use languages::{
 mod creature_families;
 pub use creature_families::{
     load_creature_families, load_pet_food_names, CreatureFamilies, CreatureFamily, PetFoodNames,
+};
+mod destructible_model_data;
+pub use destructible_model_data::{
+    load_destructible_models, DestructibleModel, DestructibleModels, DESTRUCTIBLE_STATES,
 };
 mod gameobject_art_kit;
 pub use gameobject_art_kit::{

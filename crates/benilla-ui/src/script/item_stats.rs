@@ -130,7 +130,7 @@ pub struct ItemTemplateView {
     /// The socket bonus's `SpellItemEnchantment` row, 0 for none, and its name.
     pub socket_bonus: u32,
     pub socket_bonus_name: Option<String>,
-    /// `GemProperties` (template `+0x1e8`), nonzero on a gem; a socket takes only such an item.
+    /// `GemProperties` (template `+0x1dc`), nonzero on a gem; a socket takes only such an item.
     pub gem_properties: u32,
     /// The gem's `GemProperties.dbc` row: its colour mask (`Type`), its socket enchant
     /// (`EnchantID`) and that enchant's name, the gem tooltip's line and a socket's once filled.
@@ -567,6 +567,14 @@ pub enum ItemRecordWait {
     QuestItem,
     /// A quest tooltip's, one per build (`0x622984`).
     QuestTooltip(crate::widget::FrameHandle),
+    /// `AutoEquipCursorItem`'s, which equips the held item again if it is still that item (`0x6dfd99` -> `0x6dbbe0`).
+    AutoEquip,
+    /// An item swap kept for the record of the item it equips, one per swap (`0x6dfa1d`).
+    Swap(super::container::ContainerMove),
+    /// A trade slot's read, one per `GetTradeTargetItemInfo` or `GetTradePlayerItemInfo` miss (`0x587ce4`, `0x587fe0`).
+    Trade,
+    /// The ammo slot's texture or quality read, one per miss (`0x5e9c69`, `0x5ea0ca`).
+    Inventory,
 }
 
 impl ItemRecordWait {
@@ -604,7 +612,22 @@ impl super::UiScript {
                 self.fire_event("LFG_UPDATE_RANDOM_INFO", Vec::new())
             }
             ItemRecordWait::QuestItem if landed => self.fire_event("QUEST_ITEM_UPDATE", vec![]),
+            // `0x586080`: a found record signals `TRADE_UPDATE`.
+            ItemRecordWait::Trade if landed => self.fire_event("TRADE_UPDATE", vec![]),
+            // `0x5e7660`: a found record fires `UNIT_INVENTORY_CHANGED` with `"player"` (`0x5e7678`).
+            ItemRecordWait::Inventory if landed => self.fire_event(
+                "UNIT_INVENTORY_CHANGED",
+                vec![super::ScriptValue::Str("player".into())],
+            ),
             ItemRecordWait::QuestTooltip(h) if landed => self.quest_tooltip_callback(h),
+            ItemRecordWait::Swap(mv) if landed => self.swap_record_landed(mv),
+            ItemRecordWait::AutoEquip if landed => {
+                let mut model = self.model_mut();
+                let held = matches!(&model.cursor, Some(super::cursor::CursorPayload::Item(i)) if i.item_id == item_id);
+                if held {
+                    super::cursor::doll::auto_equip_cursor_item(&mut model);
+                }
+            }
             _ => {}
         }
     }
@@ -682,6 +705,20 @@ pub(crate) fn with_item_tables<R>(f: impl FnOnce(&ItemTables) -> R) -> R {
         (Some(r), _) => r,
         (None, Some(f)) => f(&ItemTables::default()),
         (None, None) => unreachable!("the tables call runs once"),
+    }
+}
+
+/// The item's name with its roll's suffix (`0x706d70`), through `ITEM_SUFFIX_TEMPLATE`.
+pub(crate) fn rolled_name(lua: &mlua::Lua, name: &str, roll: i32) -> String {
+    match (
+        roll_suffix(roll),
+        crate::strings::global(lua, "ITEM_SUFFIX_TEMPLATE"),
+    ) {
+        (Some(sfx), Some(t)) => crate::strings::fill(
+            &t,
+            &[crate::strings::Arg::S(name), crate::strings::Arg::S(&sfx)],
+        ),
+        _ => name.to_string(),
     }
 }
 

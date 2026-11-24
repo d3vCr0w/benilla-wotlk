@@ -11,7 +11,7 @@
 
 use mlua::{Lua, MultiValue, Value};
 
-use super::cursor::{queue_cursor_update, CursorMacro, CursorPayload};
+use super::cursor::{set_cursor, CursorMacro, CursorPayload};
 use super::Model;
 
 /// Account macros (`MAX_ACCOUNT_MACROS`), and so the character set's base.
@@ -50,6 +50,15 @@ pub struct MacroBinding {
     pub pet_book: bool,
 }
 
+/// A macro verb's table change: a body set parses that macro alone (`0x5663a0` -> `0x565c40`), a delete shifts its set's later bindings (`0x566d50`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MacroChange {
+    /// The 1-based index whose body was set.
+    Parsed(u32),
+    /// The 1-based index deleted.
+    Deleted(u32),
+}
+
 /// The macro table: the account and character lists.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MacroState {
@@ -65,6 +74,17 @@ pub(crate) struct MacroIndex {
     /// True for 37..=54.
     per_character: bool,
     pos: usize,
+}
+
+impl MacroState {
+    /// The 1-based index of the first slot holding no macro, as the id lookup finds id 0 (`0x564ab0`): the account list's end, else the character list's.
+    pub(crate) fn first_empty_index(&self) -> u32 {
+        if self.account.len() < MAX_ACCOUNT_MACROS {
+            self.account.len() as u32 + 1
+        } else {
+            (MAX_ACCOUNT_MACROS + self.character.len()) as u32 + 1
+        }
+    }
 }
 
 impl MacroIndex {
@@ -189,6 +209,14 @@ impl super::UiScript {
     }
 }
 
+/// A verb's binding change at the call, before the slot signals (`0x565c40` -> `0x5650c0`).
+fn rebind(lua: &mlua::Lua, change: MacroChange) {
+    let macros = crate::script::model_mut_of(lua).macros.clone();
+    if let Some(bindings) = super::write_live(|l| l.macros_changed(&macros, change)).flatten() {
+        crate::script::model_mut_of(lua).macro_bindings = bindings;
+    }
+}
+
 /// The bar's macro update (`0x5aa920`): each slot whose macro `touched` names signals
 /// `ACTIONBAR_SLOT_CHANGED` inside the call, in slot order.
 fn signal_macro_slots(lua: &mlua::Lua, touched: impl Fn(u32) -> bool) {
@@ -245,6 +273,29 @@ fn create_macro(
     Some(MacroIndex { per_character, pos }.lua_index())
 }
 
+/// The macro a verb's first argument names (`0x566df0`), as its 1-based index, 0 for none: a
+/// number or a numeric string is the index, truncated, and any other string the name, case blind.
+pub(crate) fn macro_index(lua: &Lua, model: &Model, arg: &Value) -> usize {
+    if !matches!(arg, Value::Integer(_) | Value::Number(_) | Value::String(_)) {
+        return 0;
+    }
+    match lua.coerce_number(arg.clone()).ok().flatten() {
+        Some(n) => usize::try_from(n.trunc() as i64).unwrap_or(0),
+        None => match lua.coerce_string(arg.clone()).ok().flatten() {
+            Some(name) => model.macros.index_by_name(&name.to_string_lossy()),
+            None => 0,
+        },
+    }
+}
+
+/// The index argument of the macro verbs, resolved against the model.
+fn index_arg(lua: &Lua, arg: Option<&Value>) -> usize {
+    let model = lua
+        .app_data_ref::<crate::script::ModelCell>()
+        .expect("model app_data");
+    macro_index(lua, &model, arg.unwrap_or(&Value::Nil))
+}
+
 /// `EditMacro(index, name, icon, body)` (`0x566fa0`): an omitted argument leaves its field alone, since
 /// the stock UI calls it with disjoint halves, `(sel, name, icon)` from the rename popup and
 /// `(sel, nil, nil, text)` from `MacroFrame_SaveMacro`.
@@ -292,12 +343,8 @@ fn delete_macro(model: &mut Model, index: usize) -> bool {
 }
 
 /// `PickupMacro(index)`: the macro payload (cursor mode 8), which `PlaceAction` packs as
-/// `macroId | 0x40000000`. Refused while the cursor holds anything; the reference's setter clears
-/// the cursor first instead.
-fn pickup_macro(model: &mut Model, index: usize) -> bool {
-    if model.cursor.is_some() {
-        return false;
-    }
+/// `macroId | 0x40000000`, through its setter, which clears whatever the cursor held (`0x520c0f`).
+fn pickup_macro(model: &mut crate::script::ModelGuard<'_>, index: usize) -> bool {
     let Some(entry) = model.macros.get(index) else {
         return false;
     };
@@ -305,8 +352,7 @@ fn pickup_macro(model: &mut Model, index: usize) -> bool {
         index: index as u32,
         texture: entry.texture.clone(),
     };
-    model.cursor = Some(CursorPayload::Macro(payload));
-    queue_cursor_update(model);
+    set_cursor(model, CursorPayload::Macro(payload));
     true
 }
 
@@ -343,7 +389,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "GetMacroInfo",
-        lua.create_function(|lua, index: usize| {
+        lua.create_function(|lua, arg: Value| {
+            let index = index_arg(lua, Some(&arg));
             let model = lua
                 .app_data_ref::<crate::script::ModelCell>()
                 .expect("model app_data");
@@ -419,6 +466,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             let Some(i) = made else {
                 return Ok(Value::Nil);
             };
+            // The create sets its body always (`0x568105`).
+            rebind(lua, MacroChange::Parsed(i as u32));
             signal_macro_slots(lua, |m| m as usize == i);
             Ok(Value::Integer(i as i64))
         })?,
@@ -428,9 +477,7 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
         "EditMacro",
         lua.create_function(|lua, args: MultiValue| {
             let a: Vec<Value> = args.into_iter().collect();
-            let Some(index) = a.first().and_then(|v| v.as_integer()).map(|i| i as usize) else {
-                return Ok(Value::Nil);
-            };
+            let index = index_arg(lua, a.first());
             let mut model = crate::script::model_mut_of(lua);
             // A nil icon leaves the icon alone: `MacroFrame_SaveMacro` passes nil on every save.
             let texture = match a.get(2) {
@@ -439,11 +486,16 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
             };
             let name = opt_string(a.get(1));
             let body = opt_string(a.get(3));
+            let parses = body.is_some();
             let edited = edit_macro(&mut model, index, name, texture, body);
             drop(model);
             let Some(i) = edited else {
                 return Ok(Value::Nil);
             };
+            // Only a passed body is set and parsed (`0x566d1a`, `0x566d20`): a rename binds nothing.
+            if parses {
+                rebind(lua, MacroChange::Parsed(i as u32));
+            }
             signal_macro_slots(lua, |m| m as usize == i);
             Ok(Value::Integer(i as i64))
         })?,
@@ -451,9 +503,11 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "DeleteMacro",
-        lua.create_function(|lua, index: usize| {
+        lua.create_function(|lua, arg: Value| {
+            let index = index_arg(lua, Some(&arg));
             let deleted = delete_macro(&mut crate::script::model_mut_of(lua), index);
             if deleted {
+                rebind(lua, MacroChange::Deleted(index as u32));
                 // The gap closes, so every later index of the same set names another macro now.
                 let last = if index <= MAX_ACCOUNT_MACROS {
                     MAX_ACCOUNT_MACROS
@@ -468,7 +522,8 @@ pub(super) fn install(lua: &Lua) -> mlua::Result<()> {
 
     g.set(
         "PickupMacro",
-        lua.create_function(|lua, index: usize| {
+        lua.create_function(|lua, arg: Value| {
+            let index = index_arg(lua, Some(&arg));
             let mut model = crate::script::model_mut_of(lua);
             Ok(pickup_macro(&mut model, index))
         })?,
@@ -668,8 +723,9 @@ mod tests {
         assert_eq!(s.macros().account.len(), 1);
     }
 
+    /// The macro setter clears whatever the cursor held and takes the macro (`0x520c0f`, `0x520c25`).
     #[test]
-    fn pickup_macro_loads_the_cursor_and_refuses_while_holding() {
+    fn pickup_macro_loads_the_cursor_over_whatever_it_held() {
         use crate::script::cursor::CursorPayload;
 
         let s = seeded();
@@ -689,9 +745,10 @@ mod tests {
             }))
         );
         assert!(
-            !s.eval::<bool>("return PickupMacro(1)").unwrap(),
-            "a macro button is a source, never a drop target"
+            s.eval::<bool>("return PickupMacro(1)").unwrap(),
+            "the setter clears the held macro and takes it again"
         );
+        assert!(matches!(s.cursor_payload(), Some(CursorPayload::Macro(_))));
     }
 
     #[test]

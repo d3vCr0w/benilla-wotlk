@@ -35,11 +35,21 @@ pub(crate) struct LiveView<'w, 's> {
     quest_rows: crate::ui_quest_log::rows::QuestRowLive<'w, 's>,
     net: Option<Res<'w, crate::net::NetCommands>>,
     bank_prices: Option<Res<'w, crate::ui_bank::BankPrices>>,
+    /// The achievement tables and lists, and the name cache the criteria and links read.
+    achievements: crate::ui_achievement::AchievementLive<'w>,
+    /// `CharTitles.dbc`, the title verbs' rows (`0x719900`).
+    char_titles: Option<Res<'w, crate::ui_quest::rewards::QuestRewardTablesRes>>,
+    /// The held objects and gt tables the sheet verbs read (`0x610300`).
+    char_sheet: Option<crate::ui_char::CharLive<'w, 's>>,
+    /// The trade's network cells (`0xca0b68`-`0xca0ff8`), the trade verbs' wire reads.
+    trade_cells: Option<Res<'w, crate::ui_trade::TradeSession>>,
     item_tables: Option<Res<'w, crate::ui_items::feed::ItemTablesLive>>,
     /// The enchant catalog a bound item's trade stamp tests for a binding enchant (`0x708b40`).
     enchants: Option<Res<'w, crate::items::Enchants>>,
     /// The item cache, a refund ask's template test (`0x62d580`).
     items: Option<Res<'w, crate::items::Items>>,
+    /// `ItemLimitCategory.dbc`, the carried-count check's category rows (`0x754e49`).
+    limits: Option<Res<'w, crate::ui_trade::ItemLimitCategories>>,
     /// The item records' callbacks, which a verb's ask joins in turn with every subsystem's.
     record_waits: Option<NonSendMut<'w, crate::items::RecordWaits>>,
     /// The main-thread state a verb writes inside its call.
@@ -61,20 +71,26 @@ pub(crate) struct LiveView<'w, 's> {
     pub(crate) actions: Option<ResMut<'w, crate::ui_action::PlayerActions>>,
     /// The bar's slots, which every loan owns: the bar verbs write them in the call.
     pub(crate) slots: Option<ResMut<'w, crate::ui_action::ActionSlots>>,
-    /// The items a send locked (`item+0x314` bit 0), read into each slot's `locked`.
+    /// The item locks (`item+0x394` bit 0): a verb locks and unlocks in the call (`0x513740`, `0x513770`).
     pub(crate) pending: Option<ResMut<'w, crate::pending_item_ops::PendingItemOps>>,
     /// The open trade-skill book (`[0xc235a4]`), the current and selected tests' trade arm.
     pub(crate) trade: Option<ResMut<'w, crate::ui_tradeskill::TradeSkillOpen>>,
     /// The usable caches (`0x53cf10`), which every loan owns: a verb's site refreshes them.
     pub(crate) usable: Option<ResMut<'w, crate::ui_action::usable_cache::UsableCaches>>,
-    /// The macros' bound spells, a macro slot's spell (`0x5a89f0`), which the rebind owns.
+    /// The macros' bound spells, a macro slot's spell (`0x5a89f0`), which an edit's parse writes.
     pub(crate) bound: Option<ResMut<'w, crate::ui_macro::MacroBoundSpells>>,
+    /// The slash table a macro's `/cast` line is read against.
+    macro_table: Option<Res<'w, crate::ui_chat::commands::SlashCommands>>,
     /// The usable walk's reads beside the player's own state (`0x80b5d0`).
     usable_world: crate::ui_action::usable_cache::UsableWorld<'w>,
     /// The bar's pages: the temporary bar's owners and the bonus offset.
     pages: Option<Res<'w, crate::ui_action::TempActionBar>>,
     /// The talent tables a talent link's rank reads.
     talents: Option<Res<'w, crate::ui_talent::Talents>>,
+    /// The talent state the talent verbs read and write, and the pet reads they make.
+    talent: crate::ui_talent::TalentLive<'w>,
+    /// `GlyphProperties.dbc` and `GlyphSlot.dbc`, the glyph verbs' rows.
+    glyphs: Option<Res<'w, crate::ui_glyph::Glyphs>>,
     /// The bind point and subclass names a spell tooltip reads.
     tooltip: crate::ui_tooltip::spell_view::TooltipTables<'w>,
     /// Our auto-attack lock (`[player+0xa20]`) and auras, the current-spell test's reads.
@@ -88,6 +104,10 @@ pub(crate) struct LiveView<'w, 's> {
         ),
     >,
     auras: Query<'w, 's, &'static crate::unit_auras::UnitAuras>,
+    /// The units' aura tables and the roster records the aura verbs walk (`0x6147c0`).
+    aura: crate::ui_aura::AuraLive<'w, 's>,
+    /// The minimap's tracking spell (`0xbeba68`).
+    tracking: Option<ResMut<'w, crate::unit_auras::TrackingSpell>>,
     /// The wire, for the sends a verb makes inside its call.
     commands: Option<Res<'w, crate::net::NetCommands>>,
     /// The usability walk's other inputs, for `GetPetActionSlotUsable` (`0x5d5400`).
@@ -110,6 +130,8 @@ pub(crate) struct LiveView<'w, 's> {
     /// The player's book, which the book update builds (`0x53ca70`), and the rank chains.
     book: Option<Res<'w, crate::ui_spellbook::SpellBook>>,
     skill_lines: Option<Res<'w, crate::ui_spellbook::SkillLines>>,
+    /// The client's skill list (`0xc22ae8`-`0xc22b18`), which the skill verbs read and write in their call.
+    skills: Option<ResMut<'w, crate::ui_char::SkillInfo>>,
     /// The totem table and the tool search's inputs.
     totems: crate::ui_totem::TotemLive<'w, 's>,
     /// The targeting cursor's unit and range checks, `SpellCanTargetUnit`'s (`0x804190`).
@@ -146,6 +168,14 @@ pub(crate) struct LiveView<'w, 's> {
     item_text: crate::ui_item_text::ItemTextLive<'w, 's>,
     /// The merchant globals and what its rows, costs and sends read.
     merchant: Option<crate::ui_merchant::MerchantLive<'w, 's>>,
+    /// The loot window and what its rows, names and source read.
+    loot: Option<crate::ui_loot::LootLive<'w, 's>>,
+    /// The group loot rolls and what their verbs read.
+    loot_rolls: Option<crate::ui_loot_roll::LootRollsLive<'w>>,
+    /// The inbox, the arrival state and what a row resolves against.
+    mail: Option<crate::ui_mail::MailLive<'w, 's>>,
+    /// The auction house and what its rows resolve against and its sends go out on.
+    auction: Option<crate::ui_auction::AuctionLive<'w, 's>>,
     /// The taxi map's globals and what its fares and activates read.
     taxi: Option<crate::ui_taxi::TaxiLive<'w, 's>>,
     /// The trainer window and what its gates, descriptions and buys read.
@@ -154,6 +184,13 @@ pub(crate) struct LiveView<'w, 's> {
     petition: Option<crate::ui_petition::PetitionLive<'w, 's>>,
     /// Every dressing-room pane's model and what a try-on reads.
     pub(crate) dressup: crate::ui_dressup::DressUpLive<'w>,
+}
+
+impl crate::ui_items::ObjectLookup for LiveView<'_, '_> {
+    fn object(&self, guid: u64) -> Option<&benilla_protocol::ObjectFields> {
+        let &entity = self.index.as_ref()?.0.get(&guid)?;
+        self.stores.get(entity).ok().map(|s| &s.0)
+    }
 }
 
 /// The player's cast state: the pending cast (`0x805f30`), the queued on-swing strike, the
@@ -180,6 +217,8 @@ pub(crate) struct MainState<'w> {
     pub(crate) refunds: Option<NonSendMut<'w, crate::ui_socket::RefundRecords>>,
     pub(crate) guild_bank: Option<NonSendMut<'w, crate::ui_guild_bank::GuildBankState>>,
     pub(crate) spirit: Option<NonSendMut<'w, crate::ui_dialog_verbs::AreaSpiritHealer>>,
+    /// The chat windows, where the message display adds a chat line inside its call (`0x52183c`).
+    pub(crate) chat: Option<ResMut<'w, crate::ui_chat::ChatWindows>>,
 }
 
 mod actions;
@@ -198,6 +237,53 @@ impl LiveView<'_, '_> {
         let fields = &self.stores.get(entity).ok()?.0;
         (fields.object_type() == Some(benilla_protocol::messages::ObjectType::Player))
             .then_some(entity)
+    }
+
+    /// [`LiveState::pet_spell_known_or_higher`]'s read, `None` where a part is missing.
+    fn pet_spell_known(&self, spell_id: u32) -> Option<bool> {
+        self.talent_unit(false)?;
+        let pet = self.unit(self.talent_unit(true)?)?;
+        let words = &self.pet_bar.as_deref()?.spells.spells;
+        let catalog = &self.spells.as_deref()?.catalog;
+        let known = |s: u32| {
+            words.iter().any(|w| w.action() == s) && catalog.get(s).is_some_and(|d| d.in_pet_book())
+        };
+        if known(spell_id) {
+            return Some(true);
+        }
+        let lines = &self.skill_lines.as_deref()?.catalog;
+        let record = pet
+            .object_entry()
+            .filter(|&e| e != 0)
+            .and_then(|e| self.talent.names.as_ref()?.creature_record(e));
+        Some(match record {
+            Some(r) => self
+                .talent
+                .families
+                .as_ref()?
+                .families
+                .get(r.pet_family)
+                .is_some_and(|f| lines.pet_higher_rank_known(spell_id, f.skill_lines, known)),
+            None => {
+                lines.higher_rank_known_by(spell_id, pet.unit_race()?, pet.unit_class()?, known)
+            }
+        })
+    }
+
+    /// The talent target set (`0x5c9f70`) to `guid`, its class's tabs when it is a held player.
+    fn set_talent_target(&mut self, guid: u64) {
+        let class = (guid != 0).then(|| self.player_class(guid)).flatten();
+        let catalog = self.talents.as_deref().map(|t| t.catalog.clone());
+        let Some(state) = self.talent.state.as_deref_mut() else {
+            return;
+        };
+        crate::ui_talent::set_inspect_target(
+            &mut state.0,
+            guid,
+            class,
+            catalog.as_deref(),
+            self.spells.as_deref(),
+        );
     }
 
     /// A held player's `(race, class)`, the talent target's lookup with the player type mask (`0x5c9f8f`).
@@ -329,6 +415,15 @@ impl LiveState for LiveView<'_, '_> {
         self.self_guid.as_ref()?.0
     }
 
+    fn carry_refusal(&self, item_id: u32, count: u32) -> Option<benilla_ui::script::CarryRefusal> {
+        use crate::ui_items::ObjectLookup;
+        let items = self.items.as_deref()?;
+        let record = items.template_cached(item_id)?;
+        let store = self.object(self.active_player()?)?;
+        let limits = self.limits.as_deref().map(|l| &l.0);
+        crate::ui_items::carry_refusal(store, self, items, limits, item_id, record, count)
+    }
+
     /// An app without the net plugin boots in control.
     fn has_control(&self) -> bool {
         self.control.as_ref().is_none_or(|c| c.0)
@@ -414,12 +509,57 @@ impl LiveState for LiveView<'_, '_> {
         Some(self.item_range.in_range(spell_id, target))
     }
 
+    fn find_unit_aura(
+        &self,
+        guid: u64,
+        ui_now: f64,
+        raid: bool,
+        pick: &mut dyn FnMut(&benilla_ui::script::AuraFacts<'_>) -> bool,
+    ) -> Option<Option<benilla_ui::script::AuraState>> {
+        let pet = self.pet_bar.as_deref().map(|b| &b.spells);
+        let book = crate::ui_aura::AuraBook {
+            known: self.actions.as_deref().map(|a| &a.spells),
+            dispel_types: self
+                .book
+                .as_deref()
+                .map_or(&[][..], |b| &b.dispel_types[..]),
+            steal_mask: self.book.as_deref().map_or(0, |b| b.steal_mask),
+            pet: pet.map_or(0, |p| p.pet_guid),
+            pet_spells: pet.map_or(&[][..], |p| &p.spells[..]),
+        };
+        Some(self.aura.find(guid, ui_now, raid, book, pick))
+    }
+
+    fn unit_aura_slots(
+        &self,
+        guid: u64,
+        ui_now: f64,
+    ) -> Option<Option<benilla_ui::script::UnitAuraSlots>> {
+        Some(self.aura.slots(guid, ui_now))
+    }
+
+    fn tracking_spell(&self) -> Option<u32> {
+        self.tracking.as_ref().map(|t| t.0)
+    }
+
+    fn set_tracking_spell(&mut self, spell_id: u32) -> bool {
+        self.tracking.as_mut().map(|t| t.0 = spell_id).is_some()
+    }
+
     fn unique_signal(&mut self, event: &'static str) -> bool {
         self.lent
             .signals
             .as_deref_mut()
             .map(|s| s.unique_signal(event))
             .is_some()
+    }
+
+    fn add_chat_line(
+        &mut self,
+        chat_type: u8,
+        text: &str,
+    ) -> Option<(&'static str, Vec<ScriptValue>)> {
+        crate::ui_chat::add_chat_line(self.lent.chat.as_deref_mut()?, chat_type, text)
     }
 
     fn world_state_ui_count(&self) -> Option<usize> {
@@ -709,12 +849,18 @@ impl LiveState for LiveView<'_, '_> {
         self.positions.request();
     }
 
-    fn notify_inspect(&self, guid: u64) -> bool {
-        self.inspect.notify(guid, || self.player_class(guid))
+    fn notify_inspect(&mut self, guid: u64) -> bool {
+        let moved = self.inspect.notify(guid);
+        if moved {
+            self.set_talent_target(guid);
+        }
+        moved
     }
 
-    fn clear_inspect_target(&self) {
-        self.inspect.clear();
+    fn clear_inspect_target(&mut self) {
+        if self.inspect.clear() {
+            self.set_talent_target(0);
+        }
     }
 
     fn companion_spells(&self, ty: benilla_ui::script::CompanionType) -> Vec<u32> {
@@ -1278,6 +1424,21 @@ impl LiveState for LiveView<'_, '_> {
         self.write_slot_word(slot, word)
     }
 
+    fn macros_changed(
+        &mut self,
+        macros: &benilla_ui::script::MacroState,
+        change: benilla_ui::script::MacroChange,
+    ) -> Option<std::collections::HashMap<u32, benilla_ui::script::MacroBinding>> {
+        let (table, book) = (self.macro_table.as_deref()?, self.book.as_deref()?);
+        let bound = &mut self.bound.as_deref_mut()?.0;
+        crate::ui_macro::apply_change(table, macros, &book.live.book, bound, change);
+        Some(crate::ui_macro::vm_bindings(bound))
+    }
+
+    fn bar_usable_update(&mut self, sets_usable: bool) -> Option<bool> {
+        self.bar_update(sets_usable)
+    }
+
     fn action_usable(&self, action: u32) -> Option<(bool, bool)> {
         let caches = self.usable.as_deref()?;
         let cell = action
@@ -1587,6 +1748,19 @@ impl LiveState for LiveView<'_, '_> {
         self.guild_bank.as_ref()?.texture(s.item_id)
     }
 
+    fn item_locked(&self, guid: u64) -> Option<bool> {
+        Some(self.pending.as_deref()?.is_locked(guid))
+    }
+
+    fn set_item_lock(&mut self, guid: u64, locked: bool) -> Option<bool> {
+        let pending = self.pending.as_deref_mut()?;
+        Some(if locked {
+            pending.lock(guid)
+        } else {
+            pending.unlock(guid)
+        })
+    }
+
     fn guild_bank_locked(&self, tab: u8, slot: u8, item_id: u32) -> bool {
         self.lent
             .guild_bank
@@ -1789,6 +1963,529 @@ impl LiveState for LiveView<'_, '_> {
         let records = self.lent.refunds.as_deref()?;
         let held = self.index.as_ref()?.0.contains_key(&item);
         Some(held.then(|| records.view(item)).flatten())
+    }
+
+    fn swap_gate(&self, src: (i64, u32), dst: (i64, u32)) -> Option<benilla_ui::script::SwapGate> {
+        let (objects, items, _) = self.containers.as_ref()?.item_reads();
+        let me = objects.player_object()?;
+        Some(crate::ui_items::swap_gate(
+            me,
+            objects,
+            items,
+            self.enchants.as_deref(),
+            src,
+            dst,
+        ))
+    }
+
+    fn auto_equip_gate(&self, bag: i64, slot: u32) -> Option<(benilla_ui::script::SwapGate, bool)> {
+        let (objects, items, _) = self.containers.as_ref()?.item_reads();
+        let me = objects.player_object()?;
+        Some(crate::ui_items::auto_equip_gate(
+            me,
+            objects,
+            items,
+            self.enchants.as_deref(),
+            bag,
+            slot,
+        ))
+    }
+
+    fn loot_window(&self) -> Option<Option<benilla_ui::script::LootState>> {
+        Some(self.loot.as_ref()?.window())
+    }
+
+    fn loot_roll(&self, roll_id: i64) -> Option<Option<benilla_ui::script::LootRollEntry>> {
+        Some(self.loot_rolls.as_ref()?.entry(roll_id))
+    }
+
+    fn loot_source(&self) -> Option<u64> {
+        Some(self.loot.as_ref()?.source())
+    }
+
+    fn loot_fishing(&self) -> Option<bool> {
+        Some(self.loot.as_ref()?.fishing())
+    }
+
+    fn master_loot_candidate(&mut self, index: u32) -> Option<Option<String>> {
+        Some(self.loot.as_mut()?.master_candidate(index))
+    }
+
+    fn achievement_db(&self) -> Option<std::sync::Arc<benilla_ui::script::AchievementDb>> {
+        self.achievements.db()
+    }
+
+    fn achievement_book(&self) -> Option<&benilla_ui::script::AchievementBook> {
+        self.achievements.book()
+    }
+
+    fn achievement_book_mut(&mut self) -> Option<&mut benilla_ui::script::AchievementBook> {
+        self.achievements.book_mut()
+    }
+
+    fn player_pvp_faction(&self, guid: u64) -> Option<i32> {
+        self.player_side(guid).map(i32::from)
+    }
+
+    fn cached_player_name(&self, guid: u64) -> Option<String> {
+        self.achievements.cached_name(guid)
+    }
+
+    fn player_name_or_ask(&mut self, guid: u64) -> Option<String> {
+        self.achievements.name_or_ask(guid)
+    }
+
+    fn query_inspect_achievements(&mut self, guid: u64) {
+        self.achievements.query_inspect(guid);
+    }
+
+    fn char_title_count(&self) -> usize {
+        self.char_titles
+            .as_ref()
+            .map_or(0, |t| t.0.char_titles().len())
+    }
+
+    fn char_title(&self, mask: i64) -> Option<benilla_ui::script::TitleRow> {
+        let tables = self.char_titles.as_ref()?;
+        crate::ui_title::title_row(&tables.0, mask)
+    }
+
+    fn player_titles(&self) -> Option<benilla_ui::script::PlayerTitles> {
+        let entity = self.player_entity(self.active_player()?)?;
+        Some(crate::ui_title::player_titles(
+            &self.stores.get(entity).ok()?.0,
+        ))
+    }
+
+    fn talent_info(&self) -> Option<&benilla_ui::script::TalentInfo> {
+        self.talent.state.as_deref().map(|s| &s.0)
+    }
+
+    fn talent_info_mut(&mut self) -> Option<&mut benilla_ui::script::TalentInfo> {
+        self.talent.state.as_deref_mut().map(|s| &mut s.0)
+    }
+
+    fn talent_unit(&self, pet: bool) -> Option<u64> {
+        if pet {
+            // The pet list's first guid held as a unit.
+            let head = self.talent.pets.as_deref()?.head()?;
+            let &entity = self.index.as_ref()?.0.get(&head)?;
+            self.stores.get(entity).ok()?.0.is_unit().then_some(head)
+        } else {
+            let me = self.active_player()?;
+            self.player_entity(me).map(|_| me)
+        }
+    }
+
+    /// The talent tooltip's pet side (`0x5c60c0`): our player and the pet held, then the pet's
+    /// list, the words past the add gate (`0x53b900`, `0x542ee0`), or a later rank on its
+    /// family's skill lines (`0x726160`, `0x71a6b0`); a pet with no creature record walks its
+    /// race and class (`0x71a6d2`).
+    fn pet_spell_known_or_higher(&self, spell_id: u32) -> bool {
+        self.pet_spell_known(spell_id).unwrap_or(false)
+    }
+
+    fn pet_family_category(&self) -> Option<i32> {
+        let head = self.talent_unit(true)?;
+        let &entity = self.index.as_ref()?.0.get(&head)?;
+        let entry = self
+            .stores
+            .get(entity)
+            .ok()?
+            .0
+            .object_entry()
+            .filter(|&e| e != 0)?;
+        let family = self
+            .talent
+            .names
+            .as_ref()?
+            .creature_record(entry)?
+            .pet_family;
+        Some(
+            self.talent
+                .families
+                .as_ref()?
+                .families
+                .get(family)?
+                .category,
+        )
+    }
+
+    fn send_learn_talent(&mut self, pet: Option<u64>, talent_id: u32, rank: u32) {
+        debug!("ui_talent: learn talent {talent_id} rank {rank} (pet {pet:?})");
+        let Some(commands) = self.commands.as_deref() else {
+            return;
+        };
+        let _ = commands.0.send(match pet {
+            Some(pet_guid) => crate::net::ClientCommand::PetLearnTalent {
+                pet_guid,
+                talent_id,
+                rank,
+            },
+            None => crate::net::ClientCommand::LearnTalent { talent_id, rank },
+        });
+    }
+
+    fn send_learn_preview_talents(&mut self, pet: Option<u64>, talents: Vec<(u32, u32)>) {
+        debug!("ui_talent: learn preview talents {talents:?} (pet {pet:?})");
+        let Some(commands) = self.commands.as_deref() else {
+            return;
+        };
+        let _ = commands.0.send(match pet {
+            Some(pet_guid) => {
+                crate::net::ClientCommand::LearnPreviewTalentsPet { pet_guid, talents }
+            }
+            None => crate::net::ClientCommand::LearnPreviewTalents { talents },
+        });
+    }
+
+    fn character_points(&self) -> Option<(u32, u32)> {
+        let entity = self.player_entity(self.active_player()?)?;
+        let fields = &self.stores.get(entity).ok()?.0;
+        Some((
+            fields.player_talent_points().unwrap_or(0),
+            fields.player_free_professions().unwrap_or(0),
+        ))
+    }
+
+    fn glyph(&self, id: u32) -> Option<benilla_ui::script::GlyphView> {
+        let spells = self.spells.as_deref().map(|s| &s.catalog);
+        crate::ui_glyph::glyph_view(&self.glyphs.as_deref()?.catalog, spells, id)
+    }
+
+    fn glyph_slot(&self, id: u32) -> Option<benilla_ui::script::GlyphSlotView> {
+        crate::ui_glyph::slot_view(&self.glyphs.as_deref()?.catalog, id)
+    }
+
+    fn glyph_sockets(&self) -> Option<benilla_ui::script::GlyphSockets> {
+        let entity = self.player_entity(self.active_player()?)?;
+        Some(crate::ui_glyph::sockets_of(
+            &self.stores.get(entity).ok()?.0,
+        ))
+    }
+
+    fn glyph_targeting(&self) -> Option<benilla_ui::script::GlyphTargeting> {
+        crate::ui_glyph::targeting_of(
+            self.cast.targeting.as_deref()?,
+            &self.spells.as_deref()?.catalog,
+        )
+    }
+
+    fn send_remove_glyph(&mut self, socket: u32) {
+        debug!("ui_glyph: remove glyph from socket {socket}");
+        if let Some(commands) = self.commands.as_deref() {
+            let _ = commands
+                .0
+                .send(crate::net::ClientCommand::RemoveGlyph { socket });
+        }
+    }
+
+    fn send_set_title(&mut self, mask: i32) {
+        debug!("ui_title: set title {mask}");
+        if let Some(commands) = self.commands.as_deref() {
+            let _ = commands
+                .0
+                .send(crate::net::ClientCommand::SetTitle { mask_id: mask });
+        }
+    }
+
+    fn player_combat_stats(&self) -> Option<benilla_ui::script::UnitCombatStats> {
+        let entity = self.player_entity(self.active_player()?)?;
+        let store = self.stores.get(entity).ok()?;
+        let (sheet, items, commands) = (
+            self.char_sheet.as_ref()?,
+            self.items.as_deref()?,
+            self.commands.as_deref()?,
+        );
+        Some(sheet.combat_stats(
+            store,
+            items,
+            commands,
+            self.classes.as_deref().map(|t| &t.0),
+        ))
+    }
+
+    fn inventory_slot(&self, slot: usize) -> Option<Option<benilla_ui::script::InvSlotView>> {
+        let entity = self.player_entity(self.active_player()?)?;
+        let store = self.stores.get(entity).ok()?;
+        Some(self.char_sheet.as_ref()?.inventory_slot(
+            store,
+            self.items.as_deref()?,
+            self.enchants.as_deref(),
+            self.commands.as_deref()?,
+            self.pending.as_deref()?,
+            self.classes.as_deref().map(|t| &t.0),
+            slot,
+        ))
+    }
+
+    fn bank_bag_slot(&self, i: usize) -> Option<Option<benilla_ui::script::InvSlotView>> {
+        let entity = self.player_entity(self.active_player()?)?;
+        let store = self.stores.get(entity).ok()?;
+        Some(self.char_sheet.as_ref()?.bank_bag_slot(
+            store,
+            self.items.as_deref()?,
+            self.enchants.as_deref(),
+            self.commands.as_deref()?,
+            self.pending.as_deref()?,
+            i,
+        ))
+    }
+
+    fn weapon_enchants(&self) -> Option<[Option<benilla_ui::script::WeaponEnchant>; 2]> {
+        let entity = self.player_entity(self.active_player()?)?;
+        let store = self.stores.get(entity).ok()?;
+        Some(self.char_sheet.as_ref()?.weapon_enchants(store))
+    }
+
+    fn skill_slot(&self, skill_id: u32) -> Option<benilla_ui::script::SkillLive> {
+        let entity = self.player_entity(self.active_player()?)?;
+        let fields = &self.stores.get(entity).ok()?.0;
+        let catalog = self.skill_lines.as_deref().map(|l| &*l.catalog);
+        Some(crate::ui_char::skill_slot(fields, catalog, skill_id))
+    }
+
+    fn skill_link_ranks(&self, skill_id: u32) -> Option<(u32, u32)> {
+        let entity = self.player_entity(self.active_player()?)?;
+        Some(crate::ui_char::link_ranks(
+            &self.stores.get(entity).ok()?.0,
+            skill_id,
+        ))
+    }
+
+    fn skill_list(&self) -> Option<&benilla_ui::script::SkillList> {
+        self.skills.as_deref().map(|l| &l.0)
+    }
+
+    fn skill_list_mut(&mut self) -> Option<&mut benilla_ui::script::SkillList> {
+        self.skills.as_deref_mut().map(|l| &mut l.0)
+    }
+
+    fn skill_points(&self) -> Option<u32> {
+        let entity = self.player_entity(self.active_player()?)?;
+        Some(
+            self.stores
+                .get(entity)
+                .ok()?
+                .0
+                .player_free_professions()
+                .unwrap_or(0),
+        )
+    }
+
+    fn send_unlearn_skill(&mut self, skill_id: u32) {
+        debug!("ui_char: abandon skill line {skill_id}");
+        if let Some(commands) = self.commands.as_deref() {
+            let _ = commands
+                .0
+                .send(crate::net::ClientCommand::UnlearnSkill { skill_id });
+        }
+    }
+
+    fn send_skill_request(&mut self, request: benilla_ui::script::SkillRequest) {
+        let Some(commands) = self.commands.as_deref() else {
+            return;
+        };
+        let _ = commands.0.send(match request {
+            benilla_ui::script::SkillRequest::BuyRanks(lines) => {
+                crate::net::ClientCommand::SkillBuyRank { lines }
+            }
+            benilla_ui::script::SkillRequest::BuyTier(line) => {
+                crate::net::ClientCommand::SkillBuyStep { line }
+            }
+        });
+    }
+
+    fn mail_inbox_counts(&self) -> Option<(usize, u32)> {
+        Some(self.mail.as_ref()?.counts())
+    }
+
+    fn mail_row(
+        &mut self,
+        index: usize,
+        read: benilla_ui::script::MailRead,
+        text: &dyn Fn(&str) -> Option<String>,
+        military: bool,
+    ) -> Option<Option<benilla_ui::script::MailInboxRow>> {
+        let waits = self.record_waits.as_deref_mut();
+        Some(self.mail.as_mut()?.row(index, read, text, military, waits))
+    }
+
+    fn mail_mark_read(&mut self, index: usize) -> Option<Vec<&'static str>> {
+        Some(self.mail.as_mut()?.mark_read(index))
+    }
+
+    fn mail_mark_delete_pending(&mut self, index: usize) -> Option<()> {
+        self.mail.as_mut()?.mark_delete_pending(index);
+        Some(())
+    }
+
+    fn mail_send(&mut self, packet: benilla_ui::script::MailPacket) -> Option<()> {
+        self.mail.as_mut()?.send(packet);
+        Some(())
+    }
+
+    fn mail_complain(&mut self, message_id: u32) -> Option<benilla_ui::script::MailComplaint> {
+        Some(self.mail.as_mut()?.complain(message_id))
+    }
+
+    fn mail_close(&mut self) -> Option<Option<bool>> {
+        let mail = self.mail.as_mut()?;
+        let Some(mailbox) = mail.mailbox() else {
+            return Some(None);
+        };
+        // The clear on the mailbox (`0x571a5e`); its window leg runs in the verb.
+        let held = self
+            .tabard
+            .target_mut()
+            .is_some_and(|t| t.clear_in_call(mailbox));
+        mail.end_session();
+        Some(Some(held))
+    }
+
+    fn mail_close_query(&mut self) {
+        if let Some(mail) = self.mail.as_mut() {
+            mail.close_query();
+        }
+    }
+
+    fn auction_auctioneer(&self) -> Option<Option<u64>> {
+        Some(self.auction.as_ref()?.auctioneer())
+    }
+
+    fn auction_counts(&self, list: usize) -> Option<(usize, u32)> {
+        Some(self.auction.as_ref()?.counts(list))
+    }
+
+    fn auction_row(
+        &mut self,
+        list: usize,
+        index: usize,
+        info: bool,
+    ) -> Option<Option<benilla_ui::script::AuctionItemRow>> {
+        Some(self.auction.as_mut()?.row(list, index, info))
+    }
+
+    fn auction_find(&self, list: usize, auction_id: u32) -> Option<Option<usize>> {
+        Some(self.auction.as_ref()?.find(list, auction_id))
+    }
+
+    fn auction_deposit_rate(&self) -> Option<Option<u32>> {
+        Some(self.auction.as_ref()?.deposit_rate())
+    }
+
+    fn auction_can_send(&self, list: usize) -> Option<(bool, bool)> {
+        Some(self.auction.as_ref()?.can_send(list))
+    }
+
+    fn auction_criteria(&self, list: usize) -> Option<Vec<(u8, bool)>> {
+        Some(self.auction.as_ref()?.criteria(list))
+    }
+
+    fn set_auction_criteria(&mut self, list: usize, criteria: Vec<(u8, bool)>) -> Option<()> {
+        self.auction.as_mut()?.set_criteria(list, criteria);
+        Some(())
+    }
+
+    fn auction_sort(&mut self, list: usize) -> Option<()> {
+        self.auction.as_mut()?.sort(list);
+        Some(())
+    }
+
+    fn auction_send(&mut self, packet: benilla_ui::script::AuctionPacket) -> Option<()> {
+        self.auction.as_mut()?.send(packet);
+        Some(())
+    }
+
+    fn auction_multisell_start(
+        &mut self,
+        sell: benilla_ui::script::AuctionMultiSell,
+    ) -> Option<()> {
+        self.auction.as_mut()?.multisell_start(sell);
+        Some(())
+    }
+
+    fn auction_sell_next(&mut self) -> Option<benilla_ui::script::AuctionSellStep> {
+        Some(self.auction.as_mut()?.sell_next())
+    }
+
+    fn auction_pending_sell(&mut self, end: bool) -> Option<bool> {
+        Some(self.auction.as_mut()?.pending_sell(end))
+    }
+
+    fn auction_clear_target(&mut self) -> Option<bool> {
+        let auctioneer = self.auction.as_ref()?.auctioneer();
+        // The clear on the auctioneer (`0x59f189`); its window leg runs in the verb.
+        Some(auctioneer.is_some_and(|guid| {
+            self.tabard
+                .target_mut()
+                .is_some_and(|t| t.clear_in_call(guid))
+        }))
+    }
+
+    fn auction_end_session(&mut self) -> Option<()> {
+        self.auction.as_mut()?.end_session();
+        Some(())
+    }
+
+    fn auction_expired(&mut self, auction_id: u32) -> Option<Vec<&'static str>> {
+        Some(self.auction.as_mut()?.expired(auction_id))
+    }
+
+    fn mail_has_new(&self) -> Option<bool> {
+        Some(self.mail.as_ref()?.has_new())
+    }
+
+    fn mail_latest_senders(
+        &mut self,
+        text: &dyn Fn(&str) -> Option<String>,
+    ) -> Option<Vec<Option<String>>> {
+        Some(self.mail.as_mut()?.latest_senders(text))
+    }
+
+    fn mail_stationeries(
+        &mut self,
+        rebuild: bool,
+    ) -> Option<Vec<benilla_ui::script::StationeryView>> {
+        Some(self.mail.as_mut()?.stationeries(rebuild))
+    }
+
+    fn mail_packages(&self) -> Option<Vec<benilla_ui::script::PackageView>> {
+        Some(self.mail.as_ref()?.packages())
+    }
+
+    fn trade_cells(&self) -> Option<benilla_ui::script::TradeCells> {
+        Some(self.trade_cells.as_deref()?.cells())
+    }
+
+    fn trade_item_facts(&self, item: u64) -> Option<benilla_ui::script::TradeItemFacts> {
+        let index = self.index.as_ref()?;
+        let fields = index
+            .0
+            .get(&item)
+            .and_then(|&e| self.stores.get(e).ok())
+            .map(|s| &s.0);
+        let held = |guid: u64| {
+            index
+                .0
+                .get(&guid)
+                .and_then(|&e| self.stores.get(e).ok())
+                .is_some()
+        };
+        let template = fields
+            .and_then(|f| f.object_entry())
+            .zip(self.items.as_deref())
+            .and_then(|(entry, items)| items.template_cached(entry));
+        Some(fields.map_or_else(Default::default, |f| {
+            crate::ui_trade::item_facts(
+                f,
+                template,
+                self.active_player(),
+                self.enchants.as_deref(),
+                self.spells.as_deref(),
+                &held,
+            )
+        }))
     }
 
     fn bound_trade_stamp(&self, item: u64) -> Option<Option<u32>> {
@@ -2261,6 +2958,43 @@ impl UiEvents {
             .collect()
     }
 
+    /// Run the queued `World` steps in order, each replaced in place by what it queued; the rest
+    /// stays queued.
+    #[cfg(test)]
+    pub(crate) fn run_steps(world: &mut World) {
+        let queued = world.resource_mut::<UiEvents>().set_aside();
+        let mut kept = Vec::new();
+        for event in queued.0 {
+            match event {
+                UiEvent::World(step) => {
+                    step(world);
+                    kept.extend(world.resource_mut::<UiEvents>().set_aside().0);
+                }
+                other => kept.push(other),
+            }
+        }
+        world.resource_mut::<UiEvents>().put_back(UiEvents(kept));
+    }
+
+    /// The queued events as `NAME arg ...`, any other entry as `<world>`, in order.
+    #[cfg(test)]
+    pub(crate) fn lines(&self) -> Vec<String> {
+        self.0
+            .iter()
+            .map(|e| match e {
+                UiEvent::Fire(name, args) => std::iter::once(name.to_string())
+                    .chain(args.iter().map(|a| match a {
+                        ScriptValue::Int(i) => i.to_string(),
+                        ScriptValue::Str(s) => s.clone(),
+                        other => format!("{other:?}"),
+                    }))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => "<world>".to_string(),
+            })
+            .collect()
+    }
+
     /// The fired event names, in order.
     #[cfg(test)]
     pub(crate) fn names(&self) -> Vec<&'static str> {
@@ -2346,6 +3080,21 @@ pub(crate) fn in_turn(world: &mut World, step: impl FnOnce(&mut World) + Send + 
     }
 }
 
+/// Fire `events`, raised where no event queue is held, once the system's commands apply, with the
+/// `World` lent.
+pub(crate) fn fire_after(ecs: &mut Commands, events: UiEvents) {
+    if events.is_empty() {
+        return;
+    }
+    ecs.queue(move |world: &mut World| {
+        let Some(mut ui) = world.get_resource_mut::<UiEvents>() else {
+            return;
+        };
+        ui.0.extend(events.0);
+        fire_handler_events(world);
+    });
+}
+
 /// Fires what the handler that just ran queued, in its order, with the `World` lent; it runs after
 /// each handler, not after each packet. With no VM they are dropped, as the reference has no
 /// listener before its UI loads.
@@ -2379,12 +3128,6 @@ pub(crate) fn fire_handler_events(world: &mut World) {
         }
     }
     fire_batch(world, &mut batch, &mut lines);
-    // The chat log carries the line to the chat frame, as the chat feed's other system lines go.
-    if let Some(mut chat) = world.get_resource_mut::<crate::ui_chat::ChatLog>() {
-        for line in lines {
-            crate::ui_chat::away::push_system(&mut chat, line);
-        }
-    }
 }
 
 /// Fire `batch` into the VM, in order, with the `World` lent, collecting the system lines.
@@ -2417,33 +3160,56 @@ fn fire_batch(world: &mut World, batch: &mut Vec<UiEvent>, lines: &mut Vec<Strin
             }
         }
     });
+    // The chat log takes the batch's lines before the next step runs, so a nested step's lines follow them, as the chat feed's other system lines go.
+    if let Some(mut chat) = world.get_resource_mut::<crate::ui_chat::ChatLog>() {
+        for line in lines.drain(..) {
+            crate::ui_chat::away::push_system(&mut chat, line);
+        }
+    }
 }
 
-/// The unique signals queued this frame: each event once, however often it is queued (`0x6143f0`), fired in queue order once per frame after the packets (`0x52b247` -> `0x614760`). Main-thread state the handlers fill and a verb's call queues into ([`Lent`]).
+/// The unique signals queued this frame: each `(guid, event)` once, however often it is queued (`0x6143f0`), fired in queue order once per frame after the packets (`0x52b247` -> `0x614760`), a unit's to every token naming it then (`0x60bf10`). Main-thread state the handlers fill and a verb's call queues into ([`Lent`]).
 #[derive(Default)]
-pub(crate) struct UniqueSignals(Vec<&'static str>);
+pub(crate) struct UniqueSignals {
+    queue: Vec<(u64, &'static str)>,
+    /// The queued pairs, for the once-only test.
+    waiting: std::collections::HashSet<(u64, &'static str)>,
+}
 
 impl UniqueSignals {
-    /// Queue `event` for the frame's flush unless it already waits (`0x615020`).
+    /// Queue `event` for the frame's flush unless it already waits (`0x615020`, the null guid).
     pub(crate) fn unique_signal(&mut self, event: &'static str) {
-        if !self.0.contains(&event) {
-            self.0.push(event);
+        self.unique_unit_signal(0, event);
+    }
+
+    /// Queue `event` for `unit` unless the pair already waits (`0x6143f0`); the flush fires it for
+    /// each token naming the unit.
+    pub(crate) fn unique_unit_signal(&mut self, unit: u64, event: &'static str) {
+        if self.waiting.insert((unit, event)) {
+            self.queue.push((unit, event));
         }
     }
 
     /// The game UI's shutdown empties the queue (`0x52902f`), so nothing waits for the next login.
     pub(crate) fn clear(&mut self) {
-        self.0.clear();
+        self.queue.clear();
+        self.waiting.clear();
     }
 
     /// The queued event names, in order.
     #[cfg(test)]
     pub(crate) fn names(&self) -> Vec<&'static str> {
-        self.0.clone()
+        self.queue.iter().map(|&(_, event)| event).collect()
+    }
+
+    /// The queued `(guid, event)` pairs, in order.
+    #[cfg(test)]
+    pub(crate) fn queued(&self) -> Vec<(u64, &'static str)> {
+        self.queue.clone()
     }
 }
 
-/// The game UI's idle tail (`0x52af40`): the watch timers run (`0x52b229`), then the frame's unique signals fire in queue order without arguments (`0x52b247` -> `0x614760`), after the feeds that queue them; with no VM they are dropped.
+/// The game UI's idle tail (`0x52af40`): the watch timers run (`0x52b229`), then the frame's unique signals fire in queue order (`0x52b247` -> `0x614760`), a unit's with each token naming it as the argument, after the feeds that queue them; with no VM they are dropped.
 pub(crate) fn flush_unique_signals(world: &mut World) {
     if world.get_non_send_resource::<UiScript>().is_none() {
         if let Some(mut signals) = world.get_non_send_resource_mut::<UniqueSignals>() {
@@ -2455,16 +3221,29 @@ pub(crate) fn flush_unique_signals(world: &mut World) {
     // The count taken at entry, its entries still queued while they fire, so a re-queue matches one in flight (`0x6143f0`); the count is zeroed after the loop, dropping what the handlers queued (`0x6147a3`).
     let Some(events) = world
         .get_non_send_resource::<UniqueSignals>()
-        .map(|s| s.0.clone())
+        .map(|s| s.queue.clone())
     else {
         return;
     };
     super::safe_world::lend(world, |script| {
-        for event in events {
-            script.fire_event(event, Vec::new());
+        for (unit, event) in events {
+            if unit == 0 {
+                script.fire_event(event, Vec::new());
+            } else {
+                // The tokens naming the unit as it fires (`0x614784` -> `0x60bf10`).
+                script.fire_unit_event(unit, event, Vec::new());
+            }
         }
     });
     world.non_send_resource_mut::<UniqueSignals>().clear();
+}
+
+/// Queue `event` for `unit` with the frame's unique signals (`0x6143f0`), from a step that runs
+/// in a handler's turn; with no queue, as a bare app has, nothing.
+pub(crate) fn queue_unit_signal(world: &mut World, unit: u64, event: &'static str) {
+    if let Some(mut signals) = world.get_non_send_resource_mut::<UniqueSignals>() {
+        signals.unique_unit_signal(unit, event);
+    }
 }
 
 /// The disconnect runs the game UI's shutdown, which empties the unique signals (`0x52902f`).

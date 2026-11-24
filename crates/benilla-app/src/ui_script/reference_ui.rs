@@ -2003,7 +2003,6 @@ mod tests {
             ("PET_SPELL_POWER_UPDATE", R_1),
             ("PLAYER_ENTERING_BATTLEGROUND", R_1),
             ("PLAYER_ROLES_ASSIGNED", R_1),
-            ("TRADE_POTENTIAL_BIND_ENCHANT", R_1),
             ("UPDATE_STEALTH", R_1),
             ("WORLD_STATE_UI_TIMER_UPDATE", R_1),
             ("WOW_MOUSE_NOT_FOUND", R_1),
@@ -2056,15 +2055,6 @@ mod tests {
             ("VOICE_STATUS_UPDATE", R_6),
             ("VOICE_STOP", R_6),
             (
-                "ADDON_ACTION_FORBIDDEN",
-                "UIParent.lua — the protected-function refusal; no protected function asks \
-                 the taint yet (#1227)",
-            ),
-            (
-                "MACRO_ACTION_FORBIDDEN",
-                "UIParent.lua — the macro half of ADDON_ACTION_FORBIDDEN, same reason",
-            ),
-            (
                 "BILLING_NAG_DIALOG",
                 "UIParent.lua — the subscription-time nag; vmangos never sends it",
             ),
@@ -2100,7 +2090,6 @@ mod tests {
                  event would be a divergence, not a fix",
             ),
             ("SYSMSG", "UIErrorsFrame.lua"),
-            ("UNIT_DEFENSE", "PetPaperDollFrame.lua"),
             (
                 "UNIT_MODEL_CHANGED",
                 "four files — the paperdoll model refresh",
@@ -2175,11 +2164,11 @@ mod tests {
                     // rustfmt splits a long chain at its dots, so the three shapes are matched
                     // with the whitespace before each `.` removed.
                     let text = glue_chains(&text);
-                    // The engine's deferred lane, `pending_events.push((name, args))`, fires too.
+                    // A verb's own event, `model.raise(name, args)`, fires too.
                     const CALLS: [&str; 3] = [
                         concat!("fire_event", "("),
                         concat!("fire_event_into", "("),
-                        concat!("pending_events.push", "(("),
+                        concat!(".raise", "("),
                     ];
                     let mut fires_indirectly = false;
                     for call in CALLS {
