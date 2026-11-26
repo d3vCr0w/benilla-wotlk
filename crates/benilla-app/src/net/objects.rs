@@ -195,8 +195,10 @@ fn on_object_create(In(ev): In<SessionEvent>, mut sc: Scene) {
         // Our own player's init runs its guild change (`0x6e82c0` -> `0x6df7a0`) before the active player's init (`0x6e8378`).
         if sc.self_guid.0 == Some(guid) && kind == EntityKind::Player {
             sc.ui.fire("TABARD_CANSAVE_CHANGED", Vec::new());
+            // Then the guild-recruitment cascade (`0x6e82c5`).
+            sc.ui.world(crate::ui_chat::update_guild_status_step);
         }
-        // Our own create's init replays the known-spell buffer into the companion lists and updates them (`0x6e8378` -> `0x6e7f50`), ahead of the control below.
+        // Our own create's init replays the known-spell buffer into the companion lists and updates them, and files the recipes by line (`0x6e8378` -> `0x6e7f50`), ahead of the control below.
         if sc.self_guid.0 == Some(guid) {
             let me = (
                 fields.unit_race().unwrap_or(0),
@@ -324,6 +326,8 @@ fn on_object_create(In(ev): In<SessionEvent>, mut sc: Scene) {
         // Another player's init runs its guild change (`0x6e82c0` -> `0x6df7a0`).
         if kind == EntityKind::Player && sc.self_guid.0 != Some(guid) {
             sc.ui.fire("TABARD_CANSAVE_CHANGED", Vec::new());
+            // Then the guild-recruitment cascade, whoever the player is (`0x6e82c5`).
+            sc.ui.world(crate::ui_chat::update_guild_status_step);
         }
         // The bool reaches a creature's stand-state seed and an animated GameObject's Spawn.
         if spawned && matches!(kind, EntityKind::Unit | EntityKind::GameObject) {
@@ -623,6 +627,12 @@ fn record_callback(sc: &mut Scene, entry: u32, landed: bool, wait: crate::items:
                 sc.ui.fire("TRAINER_DESCRIPTION_UPDATE", Vec::new());
             }
         }
+        // The list's product callback counts down whatever the answer (`0x5d9f80`).
+        RecordWait::TradeSkillList => sc.ui.world(crate::ui_tradeskill::list_record_callback),
+        // A reagent's or tool's rebuilds on a found record (`0x5de103`).
+        RecordWait::TradeSkillItem => sc
+            .ui
+            .world(move |world| crate::ui_tradeskill::item_record_callback(world, landed)),
         // The petition vendor's callback fires on a found record (`0x5a1f30`).
         RecordWait::PetitionVendor => {
             if landed {
@@ -646,6 +656,23 @@ fn record_callback(sc: &mut Scene, entry: u32, landed: bool, wait: crate::items:
         RecordWait::Auction(callback) => sc.ui.world(move |world| {
             crate::ui_auction::record_callback(world, entry, landed, callback);
         }),
+        // A found record composes the line again with the player read now; a missing one shows
+        // nothing (`0x4fb977`, `0x4fb957`).
+        RecordWait::TradeskillLine(caster) => {
+            if landed {
+                crate::combat_log::chat::tradeskill_create(
+                    &mut sc.ui,
+                    sc.self_guid.0,
+                    caster,
+                    entry,
+                );
+            }
+        }
+        RecordWait::FeedPetLine(caster) => {
+            if landed {
+                crate::combat_log::chat::feed_pet(&mut sc.ui, sc.self_guid.0, caster, entry);
+            }
+        }
     }
 }
 
@@ -1764,6 +1791,9 @@ fn pet_number_watch(sc: &mut Scene, guid: u64) {
 }
 
 /// Our own unit's watches in field order (`0x4d5550`): critter (`0x6cf6c0`), health (`0x73f330`), flags (`0x60c240`), dynamic and player flags (`0x6e103a`, `0x6e10fb`), honor.
+/// `UNIT_FIELD_FLAGS` bit `0x100000`, taxi flight.
+const UNIT_FLAG_TAXI_FLIGHT: u32 = 0x10_0000;
+
 fn own_flags_watch(sc: &mut Scene, guid: u64, merged: Merged) {
     use benilla_protocol::field::{
         FIELD_PLAYER_FARSIGHT, FIELD_PLAYER_FLAGS, FIELD_UNIT_BYTES_2, FIELD_UNIT_DISPLAYID,
@@ -1890,8 +1920,9 @@ fn own_flags_watch(sc: &mut Scene, guid: u64, merged: Merged) {
     // (`0x722c50` -> `0x53d1b0`).
     let target = sc.selection.as_deref().and_then(|s| s.guid);
     if sc.self_guid.0 != Some(guid) {
-        // Another player's visible entry watch (`0x6e1e10`): the alert recompute (`0x6e1ea4`), the rest ours alone (`0x6e1eb6`).
+        // Another player's visible entry watch (`0x6e1e10`): the trade-skill list's refresh in place (`0x6e1e9c`), the alert recompute (`0x6e1ea4`), the rest ours alone (`0x6e1eb6`).
         for _ in 0..merged.other_visible_entries {
+            sc.ui.world(crate::ui_tradeskill::refresh_in_place);
             sc.ui.world(crate::ui_char::update_inventory_alerts);
         }
         if merged.aura_state_moved && target == Some(guid) {
@@ -1959,6 +1990,10 @@ fn own_flags_watch(sc: &mut Scene, guid: u64, merged: Merged) {
             "UNIT_FLAGS",
             vec![benilla_ui::script::ScriptValue::Str("player".into())],
         );
+    }
+    // A landing runs the chat's zone update (`0x728ff9`-`0x729002`).
+    if merged.taxi_landed {
+        sc.ui.world(crate::ui_chat::zone_update_on_landing);
     }
     let split = after.partition_point(|&(index, ..)| index < FIELD_PLAYER_FLAGS);
     let (unit, player) = after.split_at(split);
@@ -2031,6 +2066,9 @@ fn own_flags_watch(sc: &mut Scene, guid: u64, merged: Merged) {
         sc.ui.fire("SPELLS_CHANGED", Vec::new());
     }
     if let Some((old, new)) = merged.pvp_flags {
+        // The player-flags watch's AFK mirror write (`0x6e1026`), ahead of its PvP stamp (`0x6e102c`).
+        sc.ui
+            .world(move |world| crate::ui_chat::away::flags_watch(world, old, new));
         sc.pvp.watch(old, new, std::time::Instant::now());
     }
     let split = player.partition_point(|&(index, ..)| index < FIELD_PLAYER_FARSIGHT);
@@ -2100,12 +2138,13 @@ fn visible_item_field(index: u16) -> Option<(u8, bool)> {
     (r < 38).then_some(((r / 2) as u8, r % 2 == 0))
 }
 
-/// Our visible entry watch on `slot` (`0x6e1e10`), the entry moved by magnitude or sign (`0x6e1e56`-`0x6e1e7e`): the alert recompute (`0x6e1ea4`), then ours alone, the bar's usable update and its item updates for the old then the new entry (`0x6e1ec2`, `0x6e1ed2`, `0x6e1ee2`); the main hand's `UNIT_ATTACK` then its book update (`0x6e1f2c`, `0x6e1f37`), the off hand's `UNIT_ATTACK` (`0x6e1f21`), the ranged slot's `UNIT_RANGED_ATTACK_POWER` then its book update (`0x6e1f08`, `0x6e1f13`). The trade-skill refresh ahead of the alerts (`0x6e1e9c`) is the trade-skill module's.
+/// Our visible entry watch on `slot` (`0x6e1e10`), the entry moved by magnitude or sign (`0x6e1e56`-`0x6e1e7e`): the alert recompute (`0x6e1ea4`), then ours alone, the bar's usable update and its item updates for the old then the new entry (`0x6e1ec2`, `0x6e1ed2`, `0x6e1ee2`); the main hand's `UNIT_ATTACK` then its book update (`0x6e1f2c`, `0x6e1f37`), the off hand's `UNIT_ATTACK` (`0x6e1f21`), the ranged slot's `UNIT_RANGED_ATTACK_POWER` then its book update (`0x6e1f08`, `0x6e1f13`); the trade-skill list's refresh in place ahead of the alerts (`0x6e1e9c`).
 fn visible_entry_watch(sc: &mut Scene, slot: u8, old: u32, new: u32) {
     let (old, new) = (old as i32, new as i32);
     if old.unsigned_abs() == new.unsigned_abs() && (old > 0) == (new > 0) {
         return;
     }
+    sc.ui.world(crate::ui_tradeskill::refresh_in_place);
     sc.ui.world(crate::ui_char::update_inventory_alerts);
     sc.ui.world(crate::ui_action::usable_cache::step(
         crate::ui_action::usable_cache::Pass::Bar,
@@ -2522,6 +2561,8 @@ fn own_player_watches(sc: &mut Scene, guid: u64, edges: &[(u16, u32, u32)]) {
         if index == benilla_protocol::field::FIELD_PLAYER_GUILDID {
             if old != new {
                 sc.ui.fire("TABARD_CANSAVE_CHANGED", Vec::new());
+                // The active player's guild-recruitment cascade (`0x6e1beb`).
+                sc.ui.world(crate::ui_chat::update_guild_status_step);
                 // The merchant's refresh with a vendor set (`0x6e1c09`), ahead of the tabs' clear.
                 sc.ui.world(crate::ui_merchant::refresh);
                 crate::ui_guild_bank::guild_id_changed(&mut sc.ui);
@@ -2632,6 +2673,11 @@ fn merge_fields(
             mount_zeroed |=
                 e.unit_field(benilla_protocol::field::FIELD_UNIT_MOUNTDISPLAYID) && e.new == 0;
             merged.flags_moved |= e.unit_field(benilla_protocol::field::FIELD_UNIT_FLAGS);
+            // The active player's flags handler: the taxi bit moved and now clear (`0x728fcd`, `0x728fe6`).
+            merged.taxi_landed |= own
+                && e.unit_field(benilla_protocol::field::FIELD_UNIT_FLAGS)
+                && (e.old ^ e.new) & UNIT_FLAG_TAXI_FLIGHT != 0
+                && e.new & UNIT_FLAG_TAXI_FLIGHT == 0;
             merged.display_moved |=
                 own && e.unit_field(benilla_protocol::field::FIELD_UNIT_DISPLAYID);
             merged.level_moved |= own && e.unit_field(benilla_protocol::field::FIELD_UNIT_LEVEL);
@@ -2815,6 +2861,8 @@ type GuidHalves = (Option<u32>, Option<u32>);
 #[derive(Default)]
 struct Merged {
     flags_moved: bool,
+    /// Our flags' taxi bit cleared: a landing.
+    taxi_landed: bool,
     /// Our own `UNIT_FIELD_DISPLAYID` moved (`0x716860`).
     display_moved: bool,
     /// Our own `UNIT_FIELD_LEVEL` moved (`0x72e40c` -> `0x6d66e0`).
@@ -3056,7 +3104,8 @@ fn item_disable_watch(sc: &mut Scene, guid: u64) {
     if owner.is_none() || owner != sc.self_guid.0 {
         return;
     }
-    // The bar's item update (`0x70b0d0`) before the walk.
+    // The trade-skill list's refresh in place (`0x70b0c4`), then the bar's item update (`0x70b0d0`) before the walk.
+    sc.ui.world(crate::ui_tradeskill::refresh_in_place);
     sc.ui
         .world(move |world| crate::ui_action::slots::update_item(world, entry));
     let me = sc.self_guid.0.is_some_and(|g| sc.index.0.contains_key(&g));

@@ -145,21 +145,22 @@ pub use chat::{
     CHAT_MSG_WHISPER_INFORM, CHAT_MSG_YELL, MACRO_EXPANDED_TYPES,
 };
 pub use chat::{
-    CHAT_MSG_CHANNEL_JOIN, CHAT_MSG_CHANNEL_LEAVE, CHAT_MSG_CHANNEL_LIST, CHAT_MSG_CHANNEL_NOTICE,
-    CHAT_MSG_CHANNEL_NOTICE_USER, CHAT_MSG_COMBAT_FACTION_CHANGE, CHAT_MSG_COMBAT_HONOR_GAIN,
-    CHAT_MSG_COMBAT_MISC_INFO, CHAT_MSG_COMBAT_XP_GAIN, CHAT_MSG_LOOT, CHAT_MSG_MONEY,
-    CHAT_MSG_MONSTER_PARTY, CHAT_MSG_OPENING, CHAT_MSG_PET_INFO, CHAT_MSG_RESTRICTED,
-    CHAT_MSG_SKILL, CHAT_MSG_TARGETICONS, CHAT_MSG_TEXT_EMOTE, CHAT_MSG_TRADESKILLS,
+    wotlk_chat_type, CHAT_MSG_BATTLENET, CHAT_MSG_CHANNEL_JOIN, CHAT_MSG_CHANNEL_LEAVE,
+    CHAT_MSG_CHANNEL_LIST, CHAT_MSG_CHANNEL_NOTICE, CHAT_MSG_CHANNEL_NOTICE_USER,
+    CHAT_MSG_COMBAT_FACTION_CHANGE, CHAT_MSG_COMBAT_HONOR_GAIN, CHAT_MSG_COMBAT_MISC_INFO,
+    CHAT_MSG_COMBAT_XP_GAIN, CHAT_MSG_LOOT, CHAT_MSG_MONEY, CHAT_MSG_MONSTER_PARTY,
+    CHAT_MSG_OPENING, CHAT_MSG_PET_INFO, CHAT_MSG_RESTRICTED, CHAT_MSG_SKILL, CHAT_MSG_TARGETICONS,
+    CHAT_MSG_TEXT_EMOTE, CHAT_MSG_TRADESKILLS,
 };
 pub use client::{
     auth_session, auth_session_wotlk, channel_announcements, channel_ban, channel_invite,
     channel_kick, channel_list, channel_moderate, channel_moderator, channel_mute, channel_owner,
     channel_password, channel_set_owner, channel_unban, channel_unmoderator, channel_unmute,
-    char_create, collision_height_ack, creature_query, force_speed_ack, full_guid, join_channel,
-    join_channel_wotlk, knock_back_ack, leave_channel, leave_channel_wotlk, messagechat,
-    messagechat_channel, messagechat_kind, messagechat_whisper, move_flag_ack, move_spline_done,
-    move_time_skipped, movement, pet_name_query, ping, played_time, query_time, random_roll,
-    teleport_ack, text_emote, time_sync_resp,
+    char_create, chat_ignored, collision_height_ack, creature_query, force_speed_ack, full_guid,
+    join_channel, join_channel_wotlk, knock_back_ack, leave_channel, leave_channel_wotlk,
+    messagechat, messagechat_channel, messagechat_kind, messagechat_whisper, move_flag_ack,
+    move_spline_done, move_time_skipped, movement, pet_name_query, ping, played_time, query_time,
+    random_roll, teleport_ack, text_emote, time_sync_resp,
 };
 pub use combat_log::{
     spell_hit_info, BuildingDamage, DamageShield, DispelFailed, EnchantmentLog,
@@ -275,12 +276,13 @@ pub use parse::{parse_auth_response_wotlk, parse_server, parse_server_with_tail}
 pub use pet::{
     pet_abandon, pet_action, pet_cancel_aura, pet_cast_spell, pet_cast_trajectory, pet_rename,
     pet_set_action, pet_spell_autocast, pet_stop_attack, pet_tame_failure_key, pet_unlearn,
-    PetActionEntry, PetMode, PetSpellCooldown, PetSpells, PetUnlearnConfirm, TrajectoryShot,
-    PET_ACTION_SLOTS, PET_ACT_COMMAND, PET_ACT_DISABLED, PET_ACT_ENABLED, PET_ACT_PASSIVE,
-    PET_ACT_REACTION, PET_AUTOCAST_ALLOWED, PET_AUTOCAST_ON, PET_COMMAND_ATTACK,
-    PET_COMMAND_DISMISS, PET_COMMAND_FOLLOW, PET_COMMAND_STAY, PET_COOLDOWN_PERMANENT,
-    PET_REACT_AGGRESSIVE, PET_REACT_DEFENSIVE, PET_REACT_PASSIVE, PET_STATE_VEHICLE,
-    PET_TALK_ATTACK, PET_TALK_ORDER, PET_TYPE_SPELL, PET_TYPE_SPELL_EXTRA, PET_UNUSABLE_UNIT_FLAGS,
+    update_missile_trajectory, PetActionEntry, PetMode, PetSpellCooldown, PetSpells,
+    PetUnlearnConfirm, TrajectoryShot, PET_ACTION_SLOTS, PET_ACT_COMMAND, PET_ACT_DISABLED,
+    PET_ACT_ENABLED, PET_ACT_PASSIVE, PET_ACT_REACTION, PET_AUTOCAST_ALLOWED, PET_AUTOCAST_ON,
+    PET_COMMAND_ATTACK, PET_COMMAND_DISMISS, PET_COMMAND_FOLLOW, PET_COMMAND_STAY,
+    PET_COOLDOWN_PERMANENT, PET_REACT_AGGRESSIVE, PET_REACT_DEFENSIVE, PET_REACT_PASSIVE,
+    PET_STATE_VEHICLE, PET_TALK_ATTACK, PET_TALK_ORDER, PET_TYPE_SPELL, PET_TYPE_SPELL_EXTRA,
+    PET_UNUSABLE_UNIT_FLAGS,
 };
 pub use petition::{
     offer_petition, petition_buy, petition_decline, petition_query, petition_rename,
@@ -429,9 +431,8 @@ pub fn faction_language(race: u8) -> u32 {
     }
 }
 /// The `ChatMsg` lanes the client sends as `CMSG_MESSAGECHAT`'s `u32` `type`: `SendChatMessage`'s
-/// name table (`0x4fbb20`), whose type defaults to SAY = 1 (`0x50d1d8`). It has no RAID_LEADER or
-/// BATTLEGROUND_LEADER: the client never sends either. The inbound `u8` field has its own set,
-/// [`CHAT_MSG_SAY`] etc.
+/// name table (`0x4fbb20`), whose type defaults to SAY = 1 (`0x50d1d8`), and the leader lanes the
+/// verb picks past it. The inbound `u8` field has its own set, [`CHAT_MSG_SAY`] etc.
 pub const CHAT_TYPE_SAY: u32 = 0x01;
 pub const CHAT_TYPE_PARTY: u32 = 0x02;
 /// The party leader's `PARTY` line, past the name table (`0x50d516`).
@@ -447,3 +448,11 @@ pub const CHAT_TYPE_AFK: u32 = 0x17;
 pub const CHAT_TYPE_DND: u32 = 0x18;
 pub const CHAT_TYPE_RAID_WARNING: u32 = 0x28;
 pub const CHAT_TYPE_BATTLEGROUND: u32 = 0x2C;
+/// The group leader's `RAID` line (`0x50d412`).
+pub const CHAT_TYPE_RAID_LEADER: u32 = 0x27;
+/// The group leader's `BATTLEGROUND` line (`0x50d4e9`).
+pub const CHAT_TYPE_BATTLEGROUND_LEADER: u32 = 0x2D;
+pub const CHAT_TYPE_BN: u32 = 0x2F;
+pub const CHAT_TYPE_BN_WHISPER: u32 = 0x35;
+pub const CHAT_TYPE_BN_WHISPER_INFORM: u32 = 0x36;
+pub const CHAT_TYPE_BN_CONVERSATION: u32 = 0x37;

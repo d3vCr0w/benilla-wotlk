@@ -14,7 +14,7 @@ use crate::net::{GuidIndex, NetEntity};
 use crate::transport::TransportRider;
 
 use super::passenger::Transit;
-use super::ride::{seat_transform, SeatPose, SeatRide};
+use super::ride::{plays_exit_anims, seat_pose, seat_transform, SeatPose, SeatRide};
 use super::{Passenger, Vehicle, VehicleTables};
 
 /// On a passenger in an enter or exit: the free anchor its rig rides.
@@ -114,22 +114,29 @@ fn unwrap_yaw(from: f32, mut to: f32) -> f32 {
     to
 }
 
+/// The facing a motion turns the passenger to (`0x747a30` reads the unit's): on the enter its
+/// facing on the vehicle, its local facing plus the vehicle's, which the unit's own frame does not
+/// carry until it sits; on the exit the unit's own.
+fn motion_facing(entering: bool, vehicle_yaw: Option<f32>, local: f32, own: f32) -> f32 {
+    match vehicle_yaw.filter(|_| entering) {
+        Some(vehicle) => vehicle + local,
+        None => own,
+    }
+}
+
 /// A transform's yaw about +Y.
 fn yaw_of(t: &GlobalTransform) -> f32 {
     t.compute_transform().rotation.to_euler(EulerRot::YXZ).0
 }
 
-/// The enter's lower anim through its pre-delay and motion (`0x747b20` in states 1 and 2): the
-/// seat's enter loop where the seat animates the enter (`flags & 0x1`).
-fn enter_anim(seat: &VehicleSeatRec) -> Option<u16> {
-    if seat.flags & 0x1 == 0 {
-        return None;
-    }
-    let anim = match seat.passenger_anims[1] {
-        -1 => seat.passenger_anims[0],
-        loop_ => loop_,
-    };
-    u16::try_from(anim).ok().filter(|&a| a != 506)
+/// The passenger's anims in `state` on `seat`, its extra flags choosing the exit's flag.
+fn pose_of(
+    seat: &VehicleSeatRec,
+    state: u8,
+    flags2: Option<&super::aim::MoveFlags2>,
+) -> Option<SeatPose> {
+    let exit = plays_exit_anims(seat, flags2.map_or(0, |f| f.0));
+    seat_pose(seat, state, exit)
 }
 
 /// The world point a seated passenger's origin sits at: the seat's local transform under the
@@ -166,6 +173,7 @@ pub(super) fn ride_transits(
         Option<&TransportRider>,
         Option<&SeatRide>,
         Option<&TransitAnchor>,
+        Option<&super::aim::MoveFlags2>,
     )>,
     left: Query<(Entity, &NetEntity, &TransitAnchor), Without<Transit>>,
     vehicles: Query<(&Vehicle, Option<&BoneAttach>)>,
@@ -192,7 +200,7 @@ pub(super) fn ride_transits(
             .entity(entity)
             .remove::<(TransitAnchor, SeatPose)>();
     }
-    for (entity, _, p, transit, rider, ride, anchor) in &mut units {
+    for (entity, _, p, transit, rider, ride, anchor, flags2) in &mut units {
         let Some(mut t) = transit else { continue };
         if !matches!(p.state, 1 | 2 | 5) {
             continue;
@@ -235,9 +243,9 @@ pub(super) fn ride_transits(
             let (duration, gravity, scale) = motion(seat, entering, distance);
             debug!(
                 "vehicle: passenger {entity} {} motion {duration:.3} s over {distance:.2} yd \
-                 (gravity {gravity:.2}, arc scale {scale:.3}, anim {:?}) at {now:.3} s",
+                 (gravity {gravity:.2}, arc scale {scale:.3}, pose {:?}) at {now:.3} s",
                 if entering { "enter" } else { "exit" },
-                enter_anim(seat),
+                pose_of(seat, p.state, flags2),
             );
             t.end_s = Some(t.start_s + f64::from(duration));
             t.gravity = gravity;
@@ -255,7 +263,11 @@ pub(super) fn ride_transits(
         } else {
             let b = blend(seat, entering, linear);
             let lift = arc(t.gravity, t.arc_scale, total, b);
-            let target = unwrap_yaw(from.1, yaw_of(own));
+            let vehicle_yaw = transforms.get(vehicle).ok().map(yaw_of);
+            let target = unwrap_yaw(
+                from.1,
+                motion_facing(entering, vehicle_yaw, facing, yaw_of(own)),
+            );
             (
                 from.0.lerp(to, b) + Vec3::Y * lift,
                 from.1 + (target - from.1) * b,
@@ -284,8 +296,9 @@ pub(super) fn ride_transits(
                     .id();
                 crate::entities::mount::reseat_rig(&mut commands, &mut rig, a, false);
                 commands.entity(entity).insert(TransitAnchor(a));
-                match enter_anim(seat).filter(|_| entering) {
-                    Some(anim) => commands.entity(entity).insert(SeatPose(anim)),
+                // The enter's anims, or the exit's with its end.
+                match pose_of(seat, p.state, flags2) {
+                    Some(pose) => commands.entity(entity).insert(pose),
                     None => commands.entity(entity).remove::<SeatPose>(),
                 };
             }
@@ -366,6 +379,23 @@ mod tests {
         s.flags = 0x60;
         assert!((blend(&s, true, 0.5) - 0.5).abs() < 1.0e-6);
         assert_eq!(blend(&s, false, 0.5), 0.5, "the exit's bits are others");
+    }
+
+    /// The enter turns the passenger to its facing on the vehicle through the whole motion; its
+    /// own frame still holds the facing it jumped from.
+    #[test]
+    fn the_enter_turns_to_the_facing_on_the_vehicle() {
+        assert_eq!(motion_facing(true, Some(1.0), 0.25, 0.0), 1.25);
+        assert_eq!(
+            motion_facing(false, Some(1.0), 0.25, -0.5),
+            -0.5,
+            "the exit's own"
+        );
+        assert_eq!(
+            motion_facing(true, None, 0.25, -0.5),
+            -0.5,
+            "no vehicle frame"
+        );
     }
 
     #[test]

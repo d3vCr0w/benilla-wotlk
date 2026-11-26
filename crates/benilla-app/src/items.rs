@@ -455,6 +455,10 @@ pub(crate) enum RecordWait {
     Buyback,
     /// The trainer's, from a recipe's description read (`0x595b02` -> `0x593ca0`).
     Trainer,
+    /// The tradeskill list's, from a rebuild's product read (`0x5d9f80`).
+    TradeSkillList,
+    /// The tradeskill list's, from a reagent's or tool's read (`0x5de100`).
+    TradeSkillItem,
     /// The petition vendor's, from a row's read (`0x5a1fb0` -> `0x5a1f30`).
     PetitionVendor,
     /// A dressing-room pane's try-on, from its record read (`0x5980fa` -> `0x5980b0`).
@@ -484,6 +488,10 @@ pub(crate) enum RecordWait {
     /// The auction house's: a list row's, a sold row's or a notice's line (`0x59cb70`, `0x59cbb0`,
     /// `0x59cbe0`, `0x59cc10`, `0x59a400`).
     Auction(crate::ui_auction::Callback),
+    /// A tradeskill-create line's, by caster (`0x50bdb1` -> `0x4fb970`).
+    TradeskillLine(u64),
+    /// A feed-pet line's, by caster (`0x50bb11` -> `0x4fb950`).
+    FeedPetLine(u64),
 }
 
 impl RecordWaits {
@@ -845,6 +853,7 @@ pub(crate) fn test_template(name: &str) -> ItemInfo {
         material: 0,
         sheath: 0,
         random_property: 0,
+        random_suffix: 0,
         block: 0,
         item_set: 0,
         max_durability: 0,

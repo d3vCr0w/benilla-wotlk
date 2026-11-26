@@ -14,6 +14,7 @@ use std::sync::Arc;
 mod aim;
 mod camera;
 mod control;
+pub(crate) mod facing;
 mod override_bar;
 pub(crate) use override_bar::update_override_bar;
 mod passenger;
@@ -23,10 +24,10 @@ mod shot;
 mod targeting;
 mod transit;
 
-pub(crate) use shot::{TrajectoryCast, TrajectoryCasts};
+pub(crate) use shot::{LocalTrajectoryGos, TrajectoryCast, TrajectoryCasts};
 
 pub(crate) use passenger::{Passenger, TransitionCue, SEATED};
-pub(crate) use ride::SeatPose;
+pub(crate) use ride::{SeatPose, VehicleSeatLoop};
 
 use bevy::prelude::*;
 
@@ -154,6 +155,7 @@ impl Plugin for VehiclePlugin {
             .init_resource::<aim::VehicleAim>()
             .init_resource::<SeatStop>()
             .init_resource::<shot::TrajectoryCasts>()
+            .init_resource::<shot::LocalTrajectoryGos>()
             .init_resource::<targeting::TrajectoryTargeting>()
             .init_resource::<VehicleSignals>()
             .add_message::<EnteredWorldMessage>()
@@ -718,6 +720,9 @@ fn drive_vehicle_aim(
     // The mouse's motion is the camera's again unless a held aim takes it this frame.
     let delta = rig.as_deref_mut().map_or(0.0, |r| {
         r.hold_pitch_for_aim = false;
+        r.vehicle_facing = None;
+        r.vehicle_pitch = None;
+        r.vehicle_fixed_facing = false;
         std::mem::take(&mut r.aim_pitch_delta)
     });
     if let Some(power) = script
@@ -743,7 +748,16 @@ fn drive_vehicle_aim(
         orientation: player.facing().rem_euclid(std::f32::consts::TAU),
     };
     let rec = vehicle.and_then(|v| tables.vehicle(v.id));
+    if let Some(rig) = rig.as_deref_mut() {
+        let in_motion = seat.is_some_and(|p| matches!(p.state, 2 | 5));
+        rig.vehicle_fixed_facing = in_motion || rec.is_some_and(facing::fixed_render_facing);
+    }
     if let (Some(rec), Some(rig)) = (rec, rig.as_deref_mut()) {
+        // The limits sit about the vehicle's own facing, relative to any transport it rides.
+        let deck = player.transport_yaw();
+        rig.vehicle_facing = vehicle
+            .and_then(|v| facing::legal_range(rec, v.raw_facing))
+            .map(|(min, max)| (min + deck, max + deck));
         let upright = store.is_some_and(|s| {
             !s.0.unit_is_dead()
                 && s.0.unit_flags() & targeting::UNIT_FLAG_STUNNED == 0
@@ -770,20 +784,22 @@ fn drive_vehicle_aim(
             script.turn().as_deref_mut(),
         );
     }
-    if aim.target.is_none() && aim.keys == [false, false] && aim.turning == 0 {
-        return;
+    if aim.target.is_some() || aim.keys != [false, false] || aim.turning != 0 {
+        let rate = speeds.map_or(std::f32::consts::PI, |s| s.0.pitch_rate);
+        let mut script = script;
+        aim::drive(
+            &mut aim,
+            &pose,
+            rec,
+            rate,
+            time.delta_secs(),
+            &net,
+            script.turn().as_deref_mut(),
+        );
     }
-    let rate = speeds.map_or(std::f32::consts::PI, |s| s.0.pitch_rate);
-    let mut script = script;
-    aim::drive(
-        &mut aim,
-        &pose,
-        rec,
-        rate,
-        time.delta_secs(),
-        &net,
-        script.turn().as_deref_mut(),
-    );
+    if let (Some(_), Some(rig)) = (rec, rig.as_deref_mut()) {
+        rig.vehicle_pitch = Some(aim.pitch);
+    }
 }
 
 /// Fire what the frame owes, each once per token naming the unit (`0x60bb70`).

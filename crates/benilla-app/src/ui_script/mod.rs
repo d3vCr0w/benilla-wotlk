@@ -294,26 +294,13 @@ pub(crate) struct UiInput;
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UiDrain;
 
-/// The frame's atomic (`Instant`, `GetTime`) pair, the one base for mapping a store `Instant` onto
-/// `GetTime`: `anchor`'s steps are the VM clock's deltas, so a mapped start is stable frame to
-/// frame. Neither leg restarts with the VM: the reference's `GetTime` is `GetTickCount`, and stock
-/// `Cooldown.lua:3` gates on `start > 0`, so a reset would hide every running cooldown's sweep.
-#[derive(Resource)]
+/// The frame's `GetTime`, which does not restart with the VM: the reference's `GetTime` is
+/// `GetTickCount`, and stock `Cooldown.lua:3` gates on `start > 0`, so a reset would hide every
+/// running cooldown's sweep.
+#[derive(Resource, Default)]
 pub(crate) struct UiClock {
-    /// `Time<Real>::last_update()` at the tick that produced [`Self::ui_now`].
-    pub(crate) anchor: std::time::Instant,
-    /// The VM clock after that tick, in seconds since this process started.
+    /// The VM clock after the frame's tick, in seconds since this process started.
     pub(crate) ui_now: f64,
-}
-
-/// The pre-boot pair, replaced by [`lifecycle::seed_vm_clock`] at the first VM.
-impl Default for UiClock {
-    fn default() -> Self {
-        Self {
-            anchor: std::time::Instant::now(),
-            ui_now: 0.0,
-        }
-    }
 }
 
 /// The FrameXML digest this process loads, which the corpus harness stamps on each report.
@@ -618,7 +605,8 @@ pub(crate) use lifecycle::load_ingame_ui_on_world_entry;
 pub(crate) use lifecycle::shutdown_on_exit;
 #[cfg(test)]
 pub(crate) use lifecycle::{
-    finish_ui_load, install_boot_vm, is_emote_token_line, seat_from_roster, shutdown_ui_state,
+    finish_ui_load, install_boot_vm, is_emote_token_line, run_leave_world_sweep, seat_from_roster,
+    shutdown_ui_state,
 };
 
 /// `GetFramerate()`'s host half: FPS on `Time<Real>`, smoothed by a one-second pole; how the

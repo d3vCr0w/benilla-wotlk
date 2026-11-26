@@ -152,13 +152,18 @@ mod movie;
 pub use movie::{load_movies, MovieCatalog, MovieFile};
 mod bank_bag_slot_prices;
 mod creature_movement_info;
+mod object_effects;
 pub use creature_movement_info::{load_creature_movement_info, CreatureMovementInfo};
+pub use object_effects::{
+    load_object_effects, EffectGroup, ObjectEffect, ObjectEffectCatalog, EFFECT_SOUND,
+};
 mod currency;
 pub use bank_bag_slot_prices::{load_bank_bag_slot_prices, BankBagSlotPrices};
 pub use currency::{load_currency_tables, CurrencyCategory, CurrencyTables, CurrencyType};
 mod item_extended_cost;
 pub use item_extended_cost::{
-    load_item_extended_costs, ExtendedCostRow, ItemExtendedCosts, EXTENDED_COST_ITEMS,
+    load_item_extended_costs, load_item_purchase_groups, ExtendedCostRow, ItemExtendedCosts,
+    ItemPurchaseGroups, PurchaseGroupRow, EXTENDED_COST_ITEMS, PURCHASE_GROUP_ITEMS,
 };
 mod stable_slot_prices;
 pub use stable_slot_prices::{load_stable_slot_prices, StableSlotPrices};
@@ -200,7 +205,7 @@ pub use item_visuals::{
 };
 mod item_random_properties;
 pub use item_random_properties::{
-    load_random_property_catalog, RandomProperty, RandomPropertyCatalog,
+    load_random_property_catalog, RandPropPointsRow, RandomProperty, RandomPropertyCatalog,
     RANDOM_PROPERTY_FIRST_SLOT, RANDOM_PROPERTY_SLOTS,
 };
 mod ground_effects;

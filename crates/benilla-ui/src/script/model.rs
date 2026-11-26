@@ -9,8 +9,8 @@ use super::{
     auction, backdrop, bind_confirm, calendar, camera_view, char_stats, chat_window, colorselect,
     combat_log, container, cursor, death, duel, follow, guild, inspect, lfg, macros, mirror_timer,
     parse_unit_token, party, petition, pvp, quest, quest_log, session, simplehtml, skills, slider,
-    social, stable, trade, tradeskill, unit_menu, weapon_enchant, FontObject, MusicRequest,
-    RegionData, ScriptValue, SoundRequest, UnitState, UnitTokenParse,
+    social, stable, trade, unit_menu, weapon_enchant, FontObject, MusicRequest, RegionData,
+    ScriptValue, SoundRequest, UnitState, UnitTokenParse,
 };
 
 // ── The Rust-side model ──
@@ -300,10 +300,9 @@ pub(crate) struct Model {
     /// `DropItemOnUnit` tokens, gated by the app; a refusal silently keeps the item.
     pub(crate) drop_item_on_unit: Vec<String>,
 
-    /// Channels the server confirmed, in join order: the numbers `GetChannelName` answers.
-    pub(crate) joined_channels: Vec<Option<String>>,
-    /// The channel pane's display list, selection and roster.
-    pub(crate) channel_pane: super::channel_pane::ChannelPane,
+    /// The channel pane's state where no lent game state holds it (a VM outside the app, the
+    /// addon harness); the app's game state holds it otherwise.
+    pub(crate) unlent_channel_pane: super::channel_pane::ChannelPane,
     /// The party or raid roster the app pushes; the default is not in a group.
     pub(crate) party: party::PartyState,
     /// The instance difficulties the app pushes, `GetDungeonDifficulty`'s and `GetRaidDifficulty`'s.
@@ -314,9 +313,6 @@ pub(crate) struct Model {
     pub(crate) refer_a_friend: unit_menu::ReferAFriendState,
     /// Party and loot-method calls (`AcceptGroup`, `InviteUnit`, `SetLootMethod`, …) queued.
     pub(crate) party_requests: Vec<party::PartyRequest>,
-    /// System chat lines the bindings composed (`SendSystemMessage`, the party verbs), drained by
-    /// the app.
-    pub(crate) party_lines: Vec<String>,
     /// The ready-check deadline and the unanswered flags the timeout tick reads.
     pub(crate) ready_check: party::ReadyCheckState,
     /// Saved raid lockouts from `SMSG_RAID_INSTANCE_INFO`, which outlive any roster change.
@@ -378,8 +374,6 @@ pub(crate) struct Model {
     /// Chat-type colours: 94 fixed and 10 `CHANNELn`, overlaid by `chat-cache.txt`.
     pub(crate) chat_colors: Vec<super::chat_types::ChatTypeColor>,
     pub(crate) chat_colors_changed: bool,
-    /// The zone channel ids `ResetChatWindows` put back in the auto-join mask.
-    pub(crate) zone_mask_additions: Vec<u32>,
     /// A trade enchant slot ask: `false` the slot's click, `true` the replace popup's Accept.
     pub(crate) trade_enchant_targets: Vec<bool>,
     /// The languages this character knows, in `Languages.dbc` row order.
@@ -388,11 +382,10 @@ pub(crate) struct Model {
     pub(crate) class_names: Vec<super::class_list::ClassNames>,
     /// `Languages.dbc`'s `(ID, Name_lang)` rows in file order, whatever the character knows.
     pub(crate) language_table: Vec<(u32, String)>,
-    pub(crate) zone_channel_catalog: Vec<super::channel::ZoneChannelRow>,
     pub(crate) channel_commands: Vec<super::channel::ChannelCommand>,
     /// The recruitment auto-join latch, the chat's guild-recruitment mode: 0 `STANDARD`, 1 `AUTO`.
     /// Boots at 1, as the reference writes `AUTO` for an untouched option.
-    pub(crate) guild_recruitment_mode: u8,
+    pub(crate) guild_recruitment_mode: i32,
     /// The recruitment mode moved: the chat cache's dirty signal.
     pub(crate) guild_recruitment_changed: bool,
     /// `DoEmote` calls queued.
@@ -434,10 +427,9 @@ pub(crate) struct Model {
     pub(crate) console_lines: Vec<String>,
     /// `ConsoleAddMessage` lines for the console.
     pub(crate) console_prints: Vec<String>,
-    /// `LoggingChat` and `LoggingCombat`'s flags, and their change cue.
+    /// `LoggingChat` and `LoggingCombat`'s flags (`0xb759d0`).
     pub(crate) logging_chat: bool,
     pub(crate) logging_combat: bool,
-    pub(crate) logging_changed: bool,
     /// The default chat language; `None` is no player, so `GetDefaultLanguage()` returns nothing.
     pub(crate) default_language: Option<String>,
     /// `AcceptDuel`, `CancelDuel` and `StartDuel` calls; Lua sees duels only through events.
@@ -446,8 +438,8 @@ pub(crate) struct Model {
     pub(crate) mirror_timers: [Option<mirror_timer::MirrorTimer>; 3],
     /// `FollowUnit` and follow-by-name calls; Lua sees following only as `AUTOFOLLOW_*` events.
     pub(crate) follow_requests: Vec<follow::FollowRequest>,
-    /// `SetView`, `SaveView`, `ResetView`, `NextView`, `PrevView` and `FlipCameraYaw` calls; the
-    /// views reach Lua only as CVars, `cameraView` and `camera{Distance,Pitch,Yaw}{,A..D}`.
+    /// `SetView`, `SaveView`, `ResetView`, `NextView`, `PrevView` and `FlipCameraYaw` calls;
+    /// `cameraView` is visible to Lua while the 24 view-data CVars are hidden (`0x40`).
     pub(crate) camera_view_requests: Vec<camera_view::CameraViewRequest>,
     /// `Logout`, `Quit`, `CancelLogout`, `ForceQuit` calls; Lua sees the countdown only as events.
     pub(crate) session_requests: Vec<session::SessionRequest>,
@@ -634,9 +626,6 @@ pub(crate) struct Model {
     /// A bound-but-tradeable item's `ITEM_FIELD_CREATE_PLAYED_TIME`, by guid, for an item the player
     /// owns with `ITEM_FIELD_FLAGS & 0x100` and no binding enchant.
     pub(crate) bound_trade_stamps: HashMap<u64, u32>,
-    /// The played clock (`player+0x194c`, `+0x1950`): the total seconds the server last said and
-    /// the `GetTime` second it arrived; `None` until then, when the clock reads 0 (`0x6cf440`).
-    pub(crate) played_time: Option<(u32, f64)>,
     /// `ContainerRefundItemPurchase` sends, item guids, for the app.
     pub(crate) refund_sends: Vec<u64>,
     /// A fixture's looted object, 0 with none, read where no view is lent.
@@ -659,8 +648,6 @@ pub(crate) struct Model {
     pub(crate) vehicle_requests: Vec<super::vehicle::VehicleRequest>,
     /// `s_vehicleAimNormPower`, 0..1.
     pub(crate) vehicle_aim_power: f32,
-    /// Chat-kind lines [`super::UiScript::show_text`] showed with no chat log lent, their chat type and text, which the app adds to the chat log.
-    pub(crate) chat_lines: Vec<(u8, String)>,
 
     /// `PetAbandon()` and `PetDismiss()` calls, counted apart though both end at one opcode.
     pub(crate) pet_abandons: u32,
@@ -722,7 +709,9 @@ pub(crate) struct Model {
     pub(crate) drag_registered: HashMap<FrameHandle, HashSet<String>>,
     /// The indented word wrap (style bit `0x20000`) of a message frame's, edit box's or SimpleHTML's
     /// own font, by frame and font slot (SimpleHTML's `P`, `H1`, `H2`, `H3` are 0 to 3; every other
-    /// frame has slot 0). Stored, not applied, as on a FontString.
+    /// frame has slot 0). A message frame's rows narrow and step in by it
+    /// ([`super::LineMeasureRequest::indented`]); an edit box's and a SimpleHTML's are read by
+    /// their getter alone (#1468).
     pub(crate) frame_indented_wrap: HashSet<(FrameHandle, u8)>,
     /// The minimap art every minimap shares, by the setter that replaced it (`SetBlipTexture`,
     /// `SetIconTexture`, ...); an absent key is the stock file.
@@ -786,8 +775,10 @@ pub(crate) struct Model {
     #[cfg(any(test, feature = "fixtures"))]
     pub(crate) taxi: Option<super::taxi::TaxiUiState>,
 
-    /// The open tradeskill window, its filters and repeat.
-    pub(crate) trade_skill: tradeskill::TradeSkillModel,
+    /// A test's tradeskill window and the recipes it answers, read where the lent view does not
+    /// hold the list.
+    #[cfg(any(test, feature = "fixtures"))]
+    pub(crate) trade_skill: Option<Box<super::tradeskill::TradeSkillFixture>>,
 
     /// The dungeon finder.
     pub(crate) lfg: lfg::LfgModel,
@@ -1087,8 +1078,6 @@ pub(crate) struct Model {
     pub(crate) chat_sends: Vec<super::chat_send::ChatSend>,
     /// `SendAddonMessage` broadcasts: `LANG_ADDON`, four distributions, `prefix` TAB `message`.
     pub(crate) addon_sends: Vec<super::addon_message::AddonSend>,
-    /// `RequestTimePlayed()` calls, one empty `CMSG_PLAYED_TIME` each.
-    pub(crate) played_time_asks: u32,
     /// `OpeningCinematic()` calls, one empty `CMSG_OPENING_CINEMATIC` each.
     pub(crate) opening_cinematic_asks: u32,
     /// `GameMovieFinished()` calls, each a `StopMovie` (`0x51d590`).
@@ -1134,8 +1123,9 @@ pub(crate) struct Model {
     pub(crate) knows_cold_weather_flying: bool,
     /// What the macro conditions `equipped` and `worn` read.
     pub(crate) equipped_for_macros: super::EquippedForMacros,
-    /// Whispered names by folded name: the spelling and the time last used, for autocomplete.
-    pub(crate) autocomplete_contacts: std::collections::HashMap<String, (String, f64)>,
+    /// Whispered contacts by guid (`0x57ae80`): the name, empty until one is passed, and the time
+    /// last used, for autocomplete.
+    pub(crate) autocomplete_contacts: std::collections::HashMap<u64, (String, f64)>,
     /// Condition names `SecureCmdOptionParse` did not know, for `ERR_UNKNOWN_MACRO_OPTION_S`.
     pub(crate) unknown_macro_options: Vec<String>,
 }
@@ -1154,12 +1144,42 @@ impl Model {
 }
 
 impl Model {
-    /// A named font object, matched case-insensitively (ASCII) as the client's compare does.
+    /// The wrap style bits FontString data `d` lays out by: its own, the indent and the non-space
+    /// wrap falling back to its font object's, which a dependent inherits until it sets its own
+    /// (inherit mask `0x2107f`, `0x485317`, merged at `0x487090`). The measure sweep asks it of
+    /// every FontString every frame, so the font resolves once and without allocating.
+    pub(crate) fn text_wrap(&self, d: &super::RegionData) -> super::TextWrap {
+        let font = match (d.non_space_wrap, d.indented_word_wrap) {
+            (Some(_), Some(_)) => None,
+            _ => d.font_object.as_deref().and_then(|n| self.font_object(n)),
+        };
+        super::TextWrap {
+            word_wrap: !d.no_word_wrap,
+            non_space_wrap: d
+                .non_space_wrap
+                .unwrap_or_else(|| font.is_some_and(|fo| fo.non_space_wrap)),
+            indented: d
+                .indented_word_wrap
+                .unwrap_or_else(|| font.is_some_and(|fo| fo.indented_word_wrap)),
+        }
+    }
+
+    /// A named font object, matched case-insensitively (ASCII) as the client's compare does. A
+    /// mixed-case name up to 128 bytes lowercases on the stack: the hot reads allocate nothing.
     pub(crate) fn font_object(&self, name: &str) -> Option<&FontObject> {
-        if name.bytes().any(|b| b.is_ascii_uppercase()) {
-            self.font_objects_by_lower.get(&name.to_ascii_lowercase())
-        } else {
-            self.font_objects_by_lower.get(name)
+        if !name.bytes().any(|b| b.is_ascii_uppercase()) {
+            return self.font_objects_by_lower.get(name);
+        }
+        let mut buf = [0u8; 128];
+        match buf.get_mut(..name.len()) {
+            Some(lower) => {
+                lower.copy_from_slice(name.as_bytes());
+                lower.make_ascii_lowercase();
+                // ASCII lowercasing keeps the bytes valid UTF-8.
+                let lower = std::str::from_utf8(lower).ok()?;
+                self.font_objects_by_lower.get(lower)
+            }
+            None => self.font_objects_by_lower.get(&name.to_ascii_lowercase()),
         }
     }
 
@@ -1484,14 +1504,12 @@ impl Model {
             script_calls: Vec::new(),
             input: Default::default(),
             drop_item_on_unit: Vec::new(),
-            joined_channels: Vec::new(),
-            channel_pane: Default::default(),
+            unlent_channel_pane: Default::default(),
             party: party::PartyState::default(),
             difficulty: Default::default(),
             lfg_restricted: false,
             refer_a_friend: Default::default(),
             party_requests: Vec::new(),
-            party_lines: Vec::new(),
             ready_check: party::ReadyCheckState::default(),
             saved_instances: Vec::new(),
             raid_selection: 0,
@@ -1526,12 +1544,10 @@ impl Model {
             chat_window_changes: HashSet::new(),
             chat_colors: super::chat_types::seed(),
             chat_colors_changed: false,
-            zone_mask_additions: Vec::new(),
             trade_enchant_targets: Vec::new(),
             known_languages: Vec::new(),
             class_names: Vec::new(),
             language_table: Vec::new(),
-            zone_channel_catalog: Vec::new(),
             channel_commands: Vec::new(),
             guild_recruitment_mode: 1,
             guild_recruitment_changed: false,
@@ -1555,7 +1571,6 @@ impl Model {
             chat_records: Default::default(),
             logging_chat: false,
             logging_combat: false,
-            logging_changed: false,
             default_language: None,
             duel_requests: Vec::new(),
             mirror_timers: Default::default(),
@@ -1645,7 +1660,6 @@ impl Model {
             socket_sends: Vec::new(),
             refund_records: HashMap::new(),
             bound_trade_stamps: HashMap::new(),
-            played_time: None,
             refund_sends: Vec::new(),
             #[cfg(any(test, feature = "fixtures"))]
             loot_source: 0,
@@ -1657,7 +1671,6 @@ impl Model {
             power_displays: Default::default(),
             vehicle_requests: Vec::new(),
             vehicle_aim_power: 0.0,
-            chat_lines: Vec::new(),
             pet_abandons: 0,
             pet_dismisses: 0,
             pet_renames: Vec::new(),
@@ -1718,7 +1731,8 @@ impl Model {
             trainer: None,
             #[cfg(any(test, feature = "fixtures"))]
             taxi: None,
-            trade_skill: Default::default(),
+            #[cfg(any(test, feature = "fixtures"))]
+            trade_skill: None,
             lfg: Default::default(),
             calendar: Default::default(),
             #[cfg(any(test, feature = "fixtures"))]
@@ -1837,7 +1851,6 @@ impl Model {
             minimap_ping: (0.0, 0.0),
             chat_sends: Vec::new(),
             addon_sends: Vec::new(),
-            played_time_asks: 0,
             opening_cinematic_asks: 0,
             game_movie_finished_calls: 0,
             screenshot_asks: 0,

@@ -403,7 +403,7 @@ pub(super) fn control(
         }
         // After `apply_server_moves`, so this frame's root edge is already in `modes`.
         let may_translate = mover.may_translate(player.modes.rooted);
-        let axes = input::move_axes(
+        let mut axes = input::move_axes(
             binds,
             &buttons,
             &mut player,
@@ -452,6 +452,17 @@ pub(super) fn control(
             let rate = turn_rate * if slowed { TURN_RATE_MOVING } else { 1.0 };
             turn_delta = turn * rate * dt;
             player.face_yaw += turn_delta;
+            // A vehicle's key turn runs to its facing limit and stops there (`0x6f0f70`).
+            if let Some(limit) = rig
+                .vehicle_facing
+                .and_then(|r| crate::vehicle::facing::clamp(player.face_yaw, r))
+            {
+                let past = wrap_pi(player.face_yaw - limit);
+                player.face_yaw -= past;
+                turn_delta -= past;
+                axes.turn_left = false;
+                axes.turn_right = false;
+            }
         }
         // The drunk veer: while moving, the wobble adds to the facing every frame and commits
         // through the facing setter, so it streams like a turn; a held keyboard turn skips it. Both
@@ -460,6 +471,15 @@ pub(super) fn control(
         if drunk_wobble != 0.0 && translating && !turning {
             player.face_yaw += drunk_wobble;
             turn_delta = drunk_wobble;
+            // Every facing write on a limited vehicle clamps into its range (`0x6ee3a0`).
+            if let Some(limit) = rig
+                .vehicle_facing
+                .and_then(|r| crate::vehicle::facing::clamp(player.face_yaw, r))
+            {
+                let past = wrap_pi(player.face_yaw - limit);
+                player.face_yaw -= past;
+                turn_delta -= past;
+            }
         }
         let face_rot = Quat::from_rotation_y(player.face_yaw);
         let move_fwd = flat(face_rot * Vec3::NEG_Z);
@@ -724,7 +744,12 @@ pub(super) fn control(
         let aim_pitch = cam.pitch + rig.smart_pivot.bias();
         if mouselook && aim_pitch != player.aim_pitch_seen {
             player.aim_pitch_seen = aim_pitch;
-            player.mover_pitch = aim_pitch.clamp(-MOUSELOOK_PITCH_CLAMP, MOUSELOOK_PITCH_CLAMP);
+            if rig.vehicle_pitch.is_none() {
+                player.mover_pitch = aim_pitch.clamp(-MOUSELOOK_PITCH_CLAMP, MOUSELOOK_PITCH_CLAMP);
+            }
+        }
+        if let Some(pitch) = rig.vehicle_pitch {
+            player.mover_pitch = pitch;
         }
         let mut swim_pitch = 0.0_f32;
         // Pre-step feet Y, the true take-off height: the step already rises one jump tick.
@@ -841,11 +866,15 @@ pub(super) fn control(
             now,
             launch_y,
         );
+        // `0x73dab0` runs the facing chase only for a living model with a twist bone, outside
+        // swimming/flying (`afloat`), a passenger's motion (states 2/5), and a fixed-facing vehicle.
+        let twists = body.single().is_ok_and(|q| q.8.is_some());
         let anim_flags = gait::drive_body_heading(
             &mut player,
             pose_flags,
             dt,
             afloat,
+            rig.vehicle_fixed_facing || dead || !twists,
             moving,
             airborne,
             turning || mouselook,

@@ -276,7 +276,9 @@ pub(super) fn heal_rig_starved(
                 crate::creature_anim::AnimDriver,
                 (
                     benilla_world::rig_anim::RigPose,
+                    benilla_world::rig_anim::KeyBoneAnims,
                     crate::creature_anim::BodyTwist,
+                    crate::creature_anim::Wheels,
                     benilla_world::rig_anim::GlobalSeqDrive,
                 ),
                 benilla_world::rig_palette::RigSkin,
@@ -351,7 +353,9 @@ pub(super) fn rebuild_visual(commands: &mut Commands, entity: Entity) {
             crate::creature_anim::AnimDriver,
             (
                 benilla_world::rig_anim::RigPose,
+                benilla_world::rig_anim::KeyBoneAnims,
                 crate::creature_anim::BodyTwist,
+                crate::creature_anim::Wheels,
                 benilla_world::rig_anim::GlobalSeqDrive,
             ),
             benilla_world::rig_palette::RigSkin,

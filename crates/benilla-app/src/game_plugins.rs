@@ -924,7 +924,9 @@ pub(crate) mod schedule_tests {
     /// `place_cascades` reads the world camera's `GlobalTransform` after propagation against the
     /// nameplate, raid-mark and model-particle writers of other entities', and
     /// `mute_world_casters` reads new `Mesh3d`s against their writers, muting one a frame late.
-    const POST_UPDATE_CEILING: usize = 384;
+    /// The wheel spin adds 1: `spin_wheels` writes `RigPose` beside `apply_global_sequences`, which
+    /// keys no wheel bone on the vehicles that have them.
+    const POST_UPDATE_CEILING: usize = 385;
     const POST_UPDATE_SLACK: usize = 20;
     /// Whether the `PostUpdate` ratchet fails or only warns: off with every ceiling while #1245
     /// lands, which #1333 turns back on.
@@ -990,7 +992,7 @@ pub(crate) mod schedule_tests {
     ///   them writes, and only when the registry moved.
     /// - the sound-system restart (`sound::engine::restart_sound_system`) against the `Cvars`
     ///   writers and readers `persist_last_character`, `blood_spurts`, `drain_view_requests`,
-    ///   `apply_script_calls`, `movement_clears_afk`, `drain_addon_chat_sends`, `drive_glue_mgr` and
+    ///   `apply_script_calls`, `drive_glue_mgr` and
     ///   `read_plate_cvars`: it writes only the two `Sound_OutputDriver*` rows, which none of them
     ///   touches; and the restart's `.after(UiInput)` drains and the stream owners' stops against
     ///   `finish_colliders`, as the other such drains pair.
@@ -1314,9 +1316,12 @@ pub(crate) mod schedule_tests {
         // turn outside them (the zone feed's and the by-name asks' among them), each run only while
         // raises wait.
         // Counts the four destructible-building systems, each gated on its component.
-        ("Update", 662, 636),
+        // Counts `run_object_effects`, every frame: a live loop is re-armed per frame, as the
+        // reference updates each unit's playing effects (`0x6f39b0`).
+        ("Update", 663, 637),
         // Counts `apply_host_sequence` (ship state -> props), gated on `Changed<HostSequence>`.
-        ("PostUpdate", 183, 142),
+        // Counts `spin_wheels` (the wheel spin), gated on any unit with wheels.
+        ("PostUpdate", 184, 142),
         ("PreUpdate", 60, 60),
         ("First", 11, 8),
         ("RunFixedMainLoop", 7, 7),
@@ -1714,7 +1719,6 @@ pub(crate) mod schedule_tests {
     const PHASE_BATCHED: &[(&str, &str)] = &[
         ("::minimap::feed_minimap_mask", "a feed in the drain phase: the minimap's mask shape, which no later drain writes"),
         ("::sound::ui::feed_drivers", "a feed in the drain phase: the device list, after the restart chain that writes it"),
-        ("::ui_chat::logging::sync_chat_logging", "a feed in the drain phase: the logging CVars' state, which no later drain writes"),
         ("::ui_companion::feed_companion_booth", "a feed in the drain phase: the booth's model, which no later drain writes"),
         ("::ui_honor::feed_pvp_name_strings", "a feed in the drain phase: the rank names, which no later drain writes"),
         ("::ui_models::sync_tiles", "a feed in the drain phase: the model tiles' state, which no later drain writes"),
@@ -1965,8 +1969,6 @@ pub(crate) mod schedule_tests {
         /// Filled only by a server reply to a click in the interface, or (noted in the reason)
         /// another player's act on us, which meets the login burst only by coincidence.
         PlayerRoundTrip,
-        /// Consumed in the window or not, the state is re-asked or re-derived once the UI is up.
-        SelfHealing,
         /// The publication is driven by a `VmMemo` diff, so a new VM re-derives and re-fires it.
         MemoLatched,
         /// Documented at the line as intentional.
@@ -1976,6 +1978,8 @@ pub(crate) mod schedule_tests {
     /// Every one-shot VM consumer not gated on `ingame_ui_up` (read off the schedule) and not a
     /// memo-diffed `fire_event`, keyed `(path under src/, fn)`, with the reason it is safe.
     const EXEMPT: &[(&str, &str, Because, &str)] = &[
+        ("ui_chat/input/mod.rs", "drain_chat_input", Because::FilledByVm,
+         "it takes only the VM's own queued verb asks and the lines typed or probed into it, which exist only once the interface runs"),
         ("bindings.rs", "sync_dispatch", Because::MemoLatched,
          "`seen_generation` is a `VmMemo`: a new VM reads `None`, rebuilds and re-fires UPDATE_BINDINGS"),
         ("screenshot.rs", "ask_for_captures", Because::FilledByVm,
@@ -1994,8 +1998,8 @@ pub(crate) mod schedule_tests {
          "`sends` exist only after Lua acknowledged, cleared or reset a flag, and go to the wire"),
         ("ui_chat.rs", "end_session_chat", Because::Deliberate,
          "the session end in `OnExit(InWorld)`: it empties the chat log and clears the game VM's windows, publishing nothing a VM waits for"),
-        ("ui_chat/recruitment.rs", "guild_recruitment_cascade", Because::SelfHealing,
-         "`pending` is held until the zone mask and zone id are settled, which happens on the entry VM"),
+        ("ui_chat/recruitment.rs", "signal_chat_windows", Because::Deliberate,
+         "never scheduled: it ends the cascade or the mode setter inside its caller's step (a handler, the walk, a `SetCVar` call), as 12340 signals `UPDATE_CHAT_WINDOWS` there (`0x507db3`, `0x507df6`, `0x5082ab`)"),
         ("ui_gm_ticket.rs", "feed_gm_ticket", Because::MemoLatched,
          "`feed.vm: VmMemo<FedTicket>` counters restart per VM while `state.answers` keeps counting, so the latest answer is re-fired"),
         ("ui_inspect.rs", "feed_inspect", Because::MemoLatched,

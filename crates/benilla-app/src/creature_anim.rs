@@ -25,6 +25,10 @@ use select::{Mode, Special};
 mod twist;
 pub(crate) use twist::{wrap_pi, BodyTwist};
 
+/// The wheel spin, composed onto the wheel key bones (27-34) as the unit drives.
+mod wheels;
+pub(crate) use wheels::Wheels;
+
 /// Parks an off-frustum rig's pose while its clocks run, as the reference does not tick one; a
 /// parked unit's events fire only for a `MORE_AUDIBLE` template.
 mod lod;
@@ -1001,6 +1005,14 @@ pub(crate) struct AnimDriver {
     special_idle: Option<u16>,
     /// The [`CastHold::seq`] whose start anim has played out, the cleared start latch.
     start_spent: Option<u64>,
+    /// The seat anims last offered, whose change clears the start flags below (`0x7489c0`).
+    seat: Option<crate::vehicle::SeatPose>,
+    /// The seat's base start has played out (the passenger's flag `0x2`, `0x7484e0`).
+    seat_lower_spent: bool,
+    /// The seat's torso start has played out (flag `0x4`).
+    seat_upper_spent: bool,
+    /// An exit's end, owed once the seat anims are gone (`0x74b9c0`).
+    seat_end: Option<u16>,
     /// Read dead or dying on the last pass (`0x71f560`), for a display swap's replay.
     dead: bool,
 }
@@ -1119,6 +1131,10 @@ impl Default for AnimDriver {
             base_dir: None,
             special_idle: None,
             start_spent: None,
+            seat: None,
+            seat_lower_spent: false,
+            seat_upper_spent: false,
+            seat_end: None,
             dead: false,
         }
     }
@@ -1199,6 +1215,7 @@ impl Plugin for CreatureAnimPlugin {
     fn build(&self, app: &mut App) {
         net::register(app);
         twist::plugin(app);
+        wheels::plugin(app);
         lod::plugin(app);
         breath::register(app);
         // The breath classifier runs at its own 10 s cadence, outside the chain.
@@ -1320,13 +1337,23 @@ impl Plugin for CreatureAnimPlugin {
                     // change double-swaps the weapon placement for a frame.
                     .before(crate::entities::EntityVisualsSet),
             )
-            // The CharProc 11 freeze, after the driver so this frame's arms are in when it holds
-            // the clocks: Ice Block's cast one-shot is armed, then never advances.
+            // The CharProc 11 freeze marks after the driver; clocks hold only inside the chain.
             .add_systems(
                 Update,
                 crate::aura_visual::apply_aura_anim_rate
                     .after(drive_animations)
                     .after(crate::aura_visual::tick_body_procs),
+            )
+            .add_systems(
+                PostUpdate,
+                (
+                    crate::aura_visual::hold_frozen_clocks
+                        .after(bevy::animation::transition::advance_transitions)
+                        .before(bevy::animation::advance_animations),
+                    crate::aura_visual::release_frozen_clocks
+                        .after(bevy::animation::transition::expire_completed_transitions),
+                )
+                    .in_set(bevy::app::AnimationSystems),
             );
     }
 }
@@ -1360,6 +1387,16 @@ fn find_resolved<'a>(
     catalog: Option<&AnimDataCatalog>,
 ) -> Option<&'a AnimClip> {
     anims.find(resolved_id(anims, id, catalog))
+}
+
+/// The clip index in `anims.clips` (and `anims.pose.clips`) for `id` after fallback resolution.
+pub(crate) fn resolved_clip_index(
+    anims: &ModelAnimations,
+    id: u16,
+    catalog: Option<&AnimDataCatalog>,
+) -> Option<usize> {
+    let want = resolved_id(anims, id, catalog);
+    anims.clips.iter().position(|c| c.anim_id == want)
 }
 
 #[cfg(test)]

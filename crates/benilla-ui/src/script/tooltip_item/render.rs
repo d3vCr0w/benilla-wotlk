@@ -65,16 +65,19 @@ pub(super) struct ItemInstance {
     /// The requesting unit's level, which a scaling item shows when no link level does
     /// (`0x61e7bf`); 0 for a source whose requester is the player or no unit.
     pub requester_level: i32,
+    /// True for a carried/equipped item object, whose random-suffix points come from
+    /// `RandPropPoints.dbc` (`0x6298d0` -> `0x7089b0`), false for a link/block (`0x6298dd`).
+    pub is_object: bool,
 }
 
 /// The builder's p3, the requester guid, as far as the class 10 bind gate reads it: the gate
-/// compares it with the loot source `[0xbfa8d8]`, 0 with no loot open (`0x627efd`).
+/// compares it with the loot source `[0xbfa8d8]` (`0x627efd`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum Requester {
     /// A unit or object that is never the loot source: the player, a merchant, a quest giver.
     #[default]
     Object,
-    /// A zero guid, which matches while no loot is open.
+    /// A zero guid: a tooltip built from an id or a link.
     Zero,
     /// The loot source itself, `SetLootItem`'s (`0x62e638`).
     LootSource,
@@ -83,12 +86,12 @@ pub(super) enum Requester {
 }
 
 impl Requester {
-    /// Whether the requester equals the loot source `loot_source`.
-    fn is_loot_source(self, loot_source: u64) -> bool {
+    /// Whether a token prints its bind line: for the loot source, and for a zero requester at any
+    /// time, where 12340's zero passes only while no loot is open (`0x627f02`, docs/DEVIATIONS.md).
+    fn passes_token_bind_gate(self) -> bool {
         match self {
             Self::Object | Self::Merchant { .. } => false,
-            Self::Zero => loot_source == 0,
-            Self::LootSource => true,
+            Self::Zero | Self::LootSource => true,
         }
     }
 }
@@ -342,6 +345,7 @@ fn render_lines(
         show_item_level,
         colorblind,
         rated,
+        purchase_group,
         player,
     ) = {
         let mut model = crate::script::model_mut_of(lua);
@@ -365,20 +369,35 @@ fn render_lines(
                 knows(id)
             }
         });
-        // The open merchant's first row of the item: its rating demand, bracket and the check
-        // (`0x62b5ec`..`0x62b676`), the bracket clamped to 0..=3.
-        let rated = match flags.requester {
+        // The open merchant's first row of the item: its rating demand, bracket and check
+        // (`0x62b5ec`..`0x62b676`, bracket clamped to 0..=3) and its purchase group (`0x62b727`).
+        let (rated, purchase_group) = match flags.requester {
             Requester::Merchant { item_id } => {
-                { crate::script::merchant::first_vendor_row_of(&model, item_id) }
+                match crate::script::merchant::first_vendor_row_of(&model, item_id)
                     .and_then(|r| r.extended_cost)
-                    .filter(|c| c.required_rating > 0)
-                    .map(|c| {
-                        let bracket = c.arena_bracket.clamp(0, 3);
-                        let met = crate::script::arena_team::rating_met(c.required_rating, bracket);
-                        (c.required_rating, bracket, met)
-                    })
+                {
+                    Some(c) => {
+                        let rated = (c.required_rating > 0).then(|| {
+                            let bracket = c.arena_bracket.clamp(0, 3);
+                            let met =
+                                crate::script::arena_team::rating_met(c.required_rating, bracket);
+                            (c.required_rating, bracket, met)
+                        });
+                        let group = c.purchase_group.map(|g| {
+                            let owned = g.item_ids.iter().any(|&id| {
+                                id != 0
+                                    && crate::script::item_search::held_count(
+                                        &model, id, true, false,
+                                    ) > 0
+                            });
+                            (g.name, owned)
+                        });
+                        (rated, group)
+                    }
+                    None => (None, None),
+                }
             }
-            _ => None,
+            _ => (None, None),
         };
         // The player's PvP team and sex, which name a required honor rank (`0x6d6f00`).
         let player = model.unit("player").map(|u| (u.pvp_team, u.sex == 3));
@@ -430,6 +449,7 @@ fn render_lines(
             show_item_level,
             colorblind,
             rated,
+            purchase_group,
             player,
         )
     };
@@ -508,8 +528,7 @@ fn render_lines(
             keyed("ITEM_CONJURED", &[], WHITE, false)?;
         }
         let bound = inst.is_some_and(|i| i.already_bound);
-        let loot_source = crate::script::loot::source(&crate::script::model_mut_of(lua));
-        if let Some(key) = bind_key(v, bound, flags.requester.is_loot_source(loot_source)) {
+        if let Some(key) = bind_key(v, bound, flags.requester.passes_token_bind_gate()) {
             keyed(key, &[], WHITE, false)?;
         }
         if let Some((key, args)) = uniqueness_line(v) {
@@ -795,7 +814,7 @@ fn render_lines(
                 if let Some(bonus) = &v.socket_bonus_name {
                     keyed("ITEM_SOCKET_BONUS", &[Arg::S(bonus)], GRAY, false)?;
                 }
-                if v.random_property != 0 {
+                if v.random_property != 0 || v.random_suffix != 0 {
                     keyed("ITEM_RANDOM_ENCHANT", &[], GREEN, false)?;
                 }
             }
@@ -942,6 +961,7 @@ fn render_lines(
             known_spell,
             taught_known,
             rated,
+            purchase_group,
             player,
         };
         requirement_lines(&get, &keyed, &add, v, &req, facts)?;
@@ -1171,6 +1191,8 @@ struct ReqFacts {
     taught_known: bool,
     /// The open merchant's rating demand, bracket and check.
     rated: Option<(u32, i32, bool)>,
+    /// The open merchant's purchase group name and whether the player owns any item in it.
+    purchase_group: Option<(String, bool)>,
     /// The player's PvP team and sex, which name a required honor rank.
     player: Option<(i8, bool)>,
 }
@@ -1188,6 +1210,7 @@ fn requirement_lines(
         known_spell,
         taught_known,
         rated,
+        purchase_group,
         player,
     } = facts;
     if v.required_skill != 0 {
@@ -1232,7 +1255,11 @@ fn requirement_lines(
     if let (Ok(rank @ 1..), Some((team, female))) = (u8::try_from(v.required_honor_rank), player) {
         let title = crate::script::pvp::rank_title(
             &|key: &str| get(key).filter(|s| !s.is_empty()),
-            crate::script::pvp::RankTitle { rank, team, female },
+            crate::script::pvp::RankTitle {
+                rank: i32::from(rank),
+                team,
+                female,
+            },
         );
         if let Some(title) = title {
             let ok = req.honor_rank() >= rank;
@@ -1247,6 +1274,17 @@ fn requirement_lines(
             _ => "ITEM_REQ_ARENA_RATING",
         };
         keyed(key, &[Arg::D(rating.into())], req_color(met), false)?;
+    }
+    // The merchant's purchase group requirement (`0x62b727`..`0x62b7b5`): calls `0x754a20` with
+    // flag `8` (`0x7546f0` adds `0x247`, searching equipped items, bags, backpack, bank, keyring
+    // and currency); normal colour when any item in the group is held, red otherwise.
+    if let Some((name, owned)) = purchase_group {
+        keyed(
+            "ITEM_REQ_PURCHASE_GROUP",
+            &[Arg::S(&name)],
+            req_color(owned),
+            false,
+        )?;
     }
     // The medal, `PVP_MEDAL<n>` inside ITEM_REQ_SKILL, red unless held (`0x62b7e3`).
     if v.required_city_rank != 0 {

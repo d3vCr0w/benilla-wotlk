@@ -105,7 +105,6 @@ impl Plugin for NetPlugin {
             .init_resource::<ServerWallClock>()
             .init_resource::<Reputations>()
             .init_resource::<HomeBind>()
-            .init_resource::<PlayedTimeAnswer>()
             .init_resource::<PlayedClock>()
             .init_resource::<Proficiencies>()
             .init_resource::<ControlFlag>()
@@ -816,14 +815,8 @@ impl Reputations {
 #[derive(Resource, Default)]
 pub(crate) struct HomeBind(pub(crate) Option<u32>);
 
-/// The undelivered `/played` answer (`SMSG_PLAYED_TIME`): total seconds and seconds this level.
-/// One slot: the server sends one reply per request.
-#[derive(Resource, Default)]
-pub(crate) struct PlayedTimeAnswer(pub(crate) Option<(u32, u32)>);
-
 /// The played clock's seed (`0x6cf470`): every `SMSG_PLAYED_TIME`'s total, shown or not, and when
-/// it came, which the refund and trade windows count against. The feed stamps it on the `GetTime`
-/// clock for the VM.
+/// it came, which the refund and trade windows count against, read at the call.
 #[derive(Resource, Default)]
 pub(crate) struct PlayedClock(pub(crate) Option<(u32, Instant)>);
 
@@ -1004,7 +997,7 @@ impl MoveKind {
     }
 }
 
-/// The `ChatMsg` type an addon broadcast rides: the client's four-lane whitelist.
+/// The `ChatMsg` type an addon message rides: the verb's five lanes (`0x50062b`-`0x500645`).
 pub(crate) fn addon_wire_chat_type(distribution: benilla_ui::script::AddonDistribution) -> u32 {
     use benilla_protocol::messages as m;
     use benilla_ui::script::AddonDistribution as D;
@@ -1013,6 +1006,7 @@ pub(crate) fn addon_wire_chat_type(distribution: benilla_ui::script::AddonDistri
         D::Raid => m::CHAT_TYPE_RAID,
         D::Guild => m::CHAT_TYPE_GUILD,
         D::Battleground => m::CHAT_TYPE_BATTLEGROUND,
+        D::Whisper => m::CHAT_TYPE_WHISPER,
     }
 }
 
@@ -1034,7 +1028,7 @@ pub(crate) enum ChatKind {
     PartyLeader,
     /// `/ra`; needs a raid (`ChatHandler.cpp:514-536`).
     Raid,
-    /// `/rl`, leader only (`ChatHandler.cpp:538-559`).
+    /// `/ra` from the group leader (`0x50d412`).
     RaidLeader,
     /// `/rw`, leader or assistant only (`ChatHandler.cpp:561-576`).
     RaidWarning,
@@ -1044,7 +1038,7 @@ pub(crate) enum ChatKind {
     Officer,
     /// Needs a battleground group (`ChatHandler.cpp:579-593`).
     Battleground,
-    /// Battleground leader only (`ChatHandler.cpp:595-609`).
+    /// A battleground line from the group leader (`0x50d4e9`).
     BattlegroundLeader,
     /// Toggles AFK, the text the auto-reply if any; it clears DND (`ChatHandler.cpp:611-630`).
     Afk,
@@ -1052,6 +1046,11 @@ pub(crate) enum ChatKind {
     Dnd,
     /// A channel line by name, dropped unless we are on it (`ChatHandler.cpp:255-327`).
     Channel,
+    /// The four Battle.net names of `SendChatMessage`'s table (`0x4fbb20`), sent as typed.
+    Bn,
+    BnWhisper,
+    BnWhisperInform,
+    BnConversation,
 }
 
 impl ChatKind {
@@ -1073,7 +1072,12 @@ impl ChatKind {
             Self::Afk => m::CHAT_TYPE_AFK,
             Self::Dnd => m::CHAT_TYPE_DND,
             Self::Channel => m::CHAT_TYPE_CHANNEL,
-            Self::RaidLeader | Self::BattlegroundLeader => return None,
+            Self::RaidLeader => m::CHAT_TYPE_RAID_LEADER,
+            Self::BattlegroundLeader => m::CHAT_TYPE_BATTLEGROUND_LEADER,
+            Self::Bn => m::CHAT_TYPE_BN,
+            Self::BnWhisper => m::CHAT_TYPE_BN_WHISPER,
+            Self::BnWhisperInform => m::CHAT_TYPE_BN_WHISPER_INFORM,
+            Self::BnConversation => m::CHAT_TYPE_BN_CONVERSATION,
         })
     }
 }
@@ -1244,7 +1248,8 @@ pub(crate) enum ClientCommand {
     Chat {
         kind: ChatKind,
         target: Option<String>,
-        text: String,
+        /// The line's bytes as the verb cut them, which need not end on a UTF-8 boundary.
+        text: Vec<u8>,
         /// The `Languages.dbc` id `SendChatMessage` named; `None` speaks the character's own.
         language: Option<u32>,
     },
@@ -1252,7 +1257,9 @@ pub(crate) enum ClientCommand {
     /// whispered addon message). `text` is `prefix` TAB `message`.
     AddonMessage {
         distribution: benilla_ui::script::AddonDistribution,
-        text: String,
+        /// The whisper's player; `None` on the group lanes.
+        target: Option<String>,
+        text: Vec<u8>,
     },
     /// `CMSG_NAME_QUERY`, sent only by [`crate::names::NameCache`]'s ask-once resolve.
     NameQuery {
@@ -1434,6 +1441,17 @@ pub(crate) enum ClientCommand {
         /// The cast attempt's record `castCount` (`0x8050dc`).
         count: u8,
         pet_guid: u64,
+        spell_id: u32,
+        shot: benilla_protocol::messages::TrajectoryShot,
+        flags: u32,
+        flags2: u16,
+        pos: [f32; 3],
+        orientation: f32,
+    },
+    /// `CMSG_UPDATE_MISSILE_TRAJECTORY`: a trajectory cast's final aim and the mover's pose for its
+    /// stop report.
+    UpdateMissileTrajectory {
+        caster: u64,
         spell_id: u32,
         shot: benilla_protocol::messages::TrajectoryShot,
         flags: u32,
@@ -2519,9 +2537,16 @@ pub(crate) enum ClientCommand {
     DelMute {
         guid: u64,
     },
-    /// `CMSG_CHAT_IGNORED`: the server still delivers ignored chat, so the client drops it and
-    /// reports, and the sender hears they are ignored.
+    /// `CMSG_CHAT_IGNORED` (`0x500180`): the server still delivers ignored chat, so the client
+    /// drops it and reports, and the sender hears they are ignored; `reason` 0 for an ignored
+    /// sender (`0x50c186`), 1 for a commentator's refused whisper (`0x50c134`).
     ChatIgnored {
+        guid: u64,
+        reason: u8,
+    },
+    /// `CMSG_CHAT_FILTERED`: a whisper the spam filter dropped, reported with its sender
+    /// (`0x50a6c4`-`0x50a718`).
+    ChatFiltered {
         guid: u64,
     },
     /// `CMSG_WHO`, the `/who` filter parsed into wire fields as `SendWho` builds them.
@@ -3299,18 +3324,19 @@ mod tests {
             "…and the run arm is untouched by it"
         );
     }
-    /// The four lanes `SendAddonMessage` sends on (`0x4fbb20`'s numbering).
+    /// The five lanes `SendAddonMessage` sends on (`0x50062b`-`0x500645`).
     #[test]
-    fn addon_distributions_map_to_the_clients_own_four_wire_types() {
+    fn addon_distributions_map_to_the_clients_own_five_wire_types() {
         use benilla_ui::script::AddonDistribution as D;
-        let lanes: Vec<u32> = [D::Party, D::Raid, D::Guild, D::Battleground]
+        let lanes: Vec<u32> = [D::Party, D::Raid, D::Guild, D::Battleground, D::Whisper]
             .into_iter()
             .map(addon_wire_chat_type)
             .collect();
-        assert_eq!(lanes, [0x02, 0x03, 0x04, 0x2C]);
+        assert_eq!(lanes, [0x02, 0x03, 0x04, 0x2C, 0x07]);
     }
 
-    /// The chat bar's lanes: SAY is 1 (`0x50d1d8`), and the party leader's alone of the leader lanes.
+    /// The chat bar's lanes: SAY is 1 (`0x50d1d8`), and the leader lanes the verb picks (`0x50d516`,
+    /// `0x50d412`, `0x50d4e9`).
     #[test]
     fn chat_kinds_take_the_clients_own_wire_type() {
         for (kind, want) in [
@@ -3328,8 +3354,12 @@ mod tests {
             (ChatKind::Dnd, Some(0x18)),
             (ChatKind::RaidWarning, Some(0x28)),
             (ChatKind::Battleground, Some(0x2C)),
-            (ChatKind::RaidLeader, None),
-            (ChatKind::BattlegroundLeader, None),
+            (ChatKind::RaidLeader, Some(0x27)),
+            (ChatKind::BattlegroundLeader, Some(0x2D)),
+            (ChatKind::Bn, Some(0x2F)),
+            (ChatKind::BnWhisper, Some(0x35)),
+            (ChatKind::BnWhisperInform, Some(0x36)),
+            (ChatKind::BnConversation, Some(0x37)),
         ] {
             assert_eq!(kind.chat_type(), want, "{kind:?}");
         }

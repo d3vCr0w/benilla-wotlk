@@ -1460,9 +1460,15 @@ pub(super) fn writer_loop(
                         }
                     },
                     // The distribution is an enum, so its map to a chat type is total.
-                    ClientCommand::AddonMessage { distribution, text } => {
-                        w.send_addon_message(super::addon_wire_chat_type(distribution), &text)
-                    }
+                    ClientCommand::AddonMessage {
+                        distribution,
+                        target,
+                        text,
+                    } => w.send_addon_message(
+                        super::addon_wire_chat_type(distribution),
+                        target.as_deref(),
+                        &text,
+                    ),
                     ClientCommand::JoinChannel {
                         name,
                         password,
@@ -1634,6 +1640,23 @@ pub(super) fn writer_loop(
                     } => w.pet_cast_trajectory(
                         count,
                         pet_guid,
+                        spell_id,
+                        &shot,
+                        flags,
+                        flags2,
+                        pos,
+                        orientation,
+                    ),
+                    ClientCommand::UpdateMissileTrajectory {
+                        caster,
+                        spell_id,
+                        shot,
+                        flags,
+                        flags2,
+                        pos,
+                        orientation,
+                    } => w.update_missile_trajectory(
+                        caster,
                         spell_id,
                         &shot,
                         flags,
@@ -2181,7 +2204,8 @@ pub(super) fn writer_loop(
                     ClientCommand::AddMute { name } => w.add_mute(&name),
                     ClientCommand::DelMute { guid } => w.del_mute(guid),
                     ClientCommand::Who { request } => w.who(&request),
-                    ClientCommand::ChatIgnored { guid } => w.chat_ignored(guid),
+                    ClientCommand::ChatIgnored { guid, reason } => w.chat_ignored(guid, reason),
+                    ClientCommand::ChatFiltered { guid } => w.chat_filtered(guid),
                     ClientCommand::GuildQuery { guild_id } => w.guild_query(guild_id),
                     ClientCommand::GuildCreate { name } => w.guild_create(&name),
                     ClientCommand::GuildInvite { name } => w.guild_invite(&name),

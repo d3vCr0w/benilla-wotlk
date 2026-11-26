@@ -191,6 +191,26 @@ fn takes_vm(params: &str) -> bool {
 /// Holders that call no Lua, argued: (file, item, why).
 const CALLS_NO_LUA: &[(&str, &str, &str)] = &[
     (
+        "ui_chat/input/mod.rs",
+        "chat_arm",
+        "reads global strings and writes the model's session asks; its lines are added by the caller with the `World`",
+    ),
+    (
+        "ui_chat/recruitment.rs",
+        "cvar_leave",
+        "strips the recruitment Shortcut from the model's window lists ahead of the record lookup; its events fire in the caller's turn with the `World` lent",
+    ),
+    (
+        "ui_chat/recruitment.rs",
+        "cascade_run",
+        "strips the recruitment Shortcut from the model's window lists ahead of the record lookup; its events fire in the caller's turn with the `World` lent",
+    ),
+    (
+        "ui_chat/input/mod.rs",
+        "take_chat_lines",
+        "takes the VM's queued emote, roll and console asks and its typed and probe lines",
+    ),
+    (
         "ui_lfg.rs",
         "show_step",
         "reads the money line's global strings off the VM",
@@ -568,7 +588,7 @@ fn every_scheduled_holder_of_the_vm_lends_the_world() {
             }
         });
     }
-    // A floor that proves the census reads the schedule; the #1245 parts shrink the count.
+    // A floor that proves the census reads the schedule; it falls as the #1245 parts convert holders.
     assert!(holders > 100, "the census found only {holders} holders");
     assert!(
         offenders.is_empty(),

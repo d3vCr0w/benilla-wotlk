@@ -34,6 +34,8 @@ pub(crate) struct LiveView<'w, 's> {
     quest_tooltip: crate::ui_quest_log::tooltip::QuestTooltipLive<'w, 's>,
     quest_rows: crate::ui_quest_log::rows::QuestRowLive<'w, 's>,
     net: Option<Res<'w, crate::net::NetCommands>>,
+    /// The played clock's seed (`0x6cf470`), the refund and trade windows' base.
+    played: Option<Res<'w, crate::net::PlayedClock>>,
     bank_prices: Option<Res<'w, crate::ui_bank::BankPrices>>,
     /// The achievement tables and lists, and the name cache the criteria and links read.
     achievements: crate::ui_achievement::AchievementLive<'w>,
@@ -73,8 +75,11 @@ pub(crate) struct LiveView<'w, 's> {
     pub(crate) slots: Option<ResMut<'w, crate::ui_action::ActionSlots>>,
     /// The item locks (`item+0x394` bit 0): a verb locks and unlocks in the call (`0x513740`, `0x513770`).
     pub(crate) pending: Option<ResMut<'w, crate::pending_item_ops::PendingItemOps>>,
-    /// The open trade-skill book (`[0xc235a4]`), the current and selected tests' trade arm.
+    /// The tradeskill statics (`0xc235a0`-`0xc23604`): the list the verbs read and write, and the
+    /// open line, the current and selected tests' trade arm (`[0xc235a4]`).
     pub(crate) trade: Option<ResMut<'w, crate::ui_tradeskill::TradeSkillOpen>>,
+    /// What the tradeskill verbs read of the game at the call.
+    trade_live: crate::ui_tradeskill::TradeSkillLive<'w, 's>,
     /// The usable caches (`0x53cf10`), which every loan owns: a verb's site refreshes them.
     pub(crate) usable: Option<ResMut<'w, crate::ui_action::usable_cache::UsableCaches>>,
     /// The macros' bound spells, a macro slot's spell (`0x5a89f0`), which an edit's parse writes.
@@ -184,6 +189,8 @@ pub(crate) struct LiveView<'w, 's> {
     petition: Option<crate::ui_petition::PetitionLive<'w, 's>>,
     /// Every dressing-room pane's model and what a try-on reads.
     pub(crate) dressup: crate::ui_dressup::DressUpLive<'w>,
+    /// The channel records, the zone mask and the zone's channel catalog.
+    chat_channels: Option<crate::ui_chat::ChannelLive<'w>>,
 }
 
 impl crate::ui_items::ObjectLookup for LiveView<'_, '_> {
@@ -217,8 +224,10 @@ pub(crate) struct MainState<'w> {
     pub(crate) refunds: Option<NonSendMut<'w, crate::ui_socket::RefundRecords>>,
     pub(crate) guild_bank: Option<NonSendMut<'w, crate::ui_guild_bank::GuildBankState>>,
     pub(crate) spirit: Option<NonSendMut<'w, crate::ui_dialog_verbs::AreaSpiritHealer>>,
-    /// The chat windows, where the message display adds a chat line inside its call (`0x52183c`).
+    /// The chat windows, whose chat log `LoggingChat` opens inside its call (`0x4fbcb1`).
     pub(crate) chat: Option<ResMut<'w, crate::ui_chat::ChatWindows>>,
+    /// The combat log file `LoggingCombat` opens inside its call (`0x4fbcb1`).
+    pub(crate) combat_log_file: Option<ResMut<'w, crate::ui_chat::logging::CombatLogFile>>,
 }
 
 mod actions;
@@ -372,7 +381,7 @@ impl crate::ui_spell_info::CallReads for LiveView<'_, '_> {
         }
         now.auto_repeat = self.cast.auto_repeat.as_deref().and_then(|a| a.0);
         now.attacking = !self.engaged.is_empty();
-        now.trade_line = self.trade.as_deref().and_then(|t| t.line);
+        now.trade_line = self.trade.as_deref().and_then(|t| t.line());
         now.race_class = crate::spell::race_class(store);
         now.critter = store.and_then(|s| s.0.unit_critter());
         now.auras = me.and_then(|(e, _)| self.auras.get(e).ok());
@@ -388,6 +397,10 @@ impl crate::ui_spell_info::CallReads for LiveView<'_, '_> {
 
     fn unit_facts(&self, guid: u64) -> Option<crate::spell::RangeFacts> {
         self.item_range.facts().facts(guid)
+    }
+
+    fn link_line(&self, spell_id: u32) -> Option<u32> {
+        self.trade_live.link_line(spell_id)
     }
 }
 
@@ -554,12 +567,42 @@ impl LiveState for LiveView<'_, '_> {
             .is_some()
     }
 
-    fn add_chat_line(
-        &mut self,
-        chat_type: u8,
-        text: &str,
-    ) -> Option<(&'static str, Vec<ScriptValue>)> {
-        crate::ui_chat::add_chat_line(self.lent.chat.as_deref_mut()?, chat_type, text)
+    fn open_log(&mut self, chat: bool) -> Option<bool> {
+        if chat {
+            Some(self.lent.chat.as_deref_mut()?.logs.0.open())
+        } else {
+            Some(self.lent.combat_log_file.as_deref_mut()?.0.open())
+        }
+    }
+
+    fn channel_slots(&self) -> Vec<Option<benilla_ui::script::ChannelSlotInfo>> {
+        self.chat_channels
+            .as_ref()
+            .map(|c| c.slots())
+            .unwrap_or_default()
+    }
+
+    fn set_channel_flags(&mut self, slot: usize, flags: u8) {
+        if let Some(c) = self.chat_channels.as_mut() {
+            c.set_flags(slot, flags);
+        }
+    }
+
+    fn channel_pane(&mut self) -> Option<&mut benilla_ui::script::ChannelPane> {
+        Some(self.chat_channels.as_mut()?.pane())
+    }
+
+    fn zone_channel_catalog(&self) -> Vec<benilla_ui::script::ZoneChannelRow> {
+        self.chat_channels
+            .as_ref()
+            .map(|c| c.catalog())
+            .unwrap_or_default()
+    }
+
+    fn add_zone_channel_bit(&mut self, id: u32) {
+        if let Some(c) = self.chat_channels.as_mut() {
+            c.add_zone_bit(id);
+        }
     }
 
     fn world_state_ui_count(&self) -> Option<usize> {
@@ -1269,7 +1312,7 @@ impl LiveState for LiveView<'_, '_> {
                 .skill_lines
                 .as_deref()
                 .and_then(|l| l.catalog.spell_to_line(spell_id, race, class));
-            if line.is_some() && line == self.trade.as_deref().and_then(|t| t.line) {
+            if line.is_some() && line == self.trade.as_deref().and_then(|t| t.line()) {
                 return true;
             }
         }
@@ -1956,6 +1999,18 @@ impl LiveState for LiveView<'_, '_> {
     fn clear_banker(&mut self) {
         if let Some(b) = self.lent.bank.as_deref_mut() {
             b.clear();
+        }
+    }
+
+    fn played_now(&self) -> Option<i64> {
+        Some(self.played.as_deref()?.now())
+    }
+
+    fn send_played_time(&mut self) {
+        if let Some(net) = self.net.as_deref() {
+            let _ = net
+                .0
+                .send(crate::net::ClientCommand::PlayedTime { show: true });
         }
     }
 
@@ -2781,6 +2836,71 @@ impl LiveState for LiveView<'_, '_> {
         }
     }
 
+    fn trade_skill(&self) -> Option<&benilla_ui::script::TradeSkillList> {
+        self.trade.as_deref().map(|t| &t.list)
+    }
+
+    fn trade_skill_mut(&mut self) -> Option<&mut benilla_ui::script::TradeSkillList> {
+        self.trade.as_deref_mut().map(|t| &mut t.list)
+    }
+
+    fn trade_skill_line(&self) -> benilla_ui::script::TradeSkillLineView {
+        let line = self.trade.as_deref().map_or(0, |t| t.list.line);
+        self.trade_live.line_view(line)
+    }
+
+    fn trade_skill_recipe(
+        &self,
+        spell_id: u32,
+    ) -> Option<benilla_ui::script::TradeSkillRecipeView> {
+        self.trade_live.recipe(spell_id)
+    }
+
+    fn trade_skill_reagent(
+        &mut self,
+        _spell_id: u32,
+        item: u32,
+    ) -> benilla_ui::script::TradeSkillReagentView {
+        self.trade_live
+            .reagent(item, self.record_waits.as_deref_mut())
+    }
+
+    fn trade_skill_tools(&mut self, spell_id: u32) -> Vec<(String, bool)> {
+        self.trade_live
+            .tools(spell_id, self.record_waits.as_deref_mut())
+    }
+
+    fn trade_skill_description(
+        &self,
+        spell_id: u32,
+        global: benilla_ui::script::GlobalStrings<'_>,
+    ) -> Option<String> {
+        let empty = std::collections::BTreeSet::new();
+        let known = self.actions.as_deref().map_or(&empty, |a| &a.spells);
+        self.trade_live.description(spell_id, known, global)
+    }
+
+    fn trade_skill_list_link(&self) -> Option<String> {
+        let list = &self.trade.as_deref()?.list;
+        let empty = std::collections::BTreeSet::new();
+        let known = self.actions.as_deref().map_or(&empty, |a| &a.spells);
+        self.trade_live.list_link(list.opener, known)
+    }
+
+    fn trade_skill_filter_spell(
+        &self,
+        spell_id: u32,
+        min: i32,
+        max: i32,
+        name: Option<&str>,
+        global: benilla_ui::script::GlobalStrings<'_>,
+    ) -> bool {
+        let empty = std::collections::BTreeSet::new();
+        let known = self.actions.as_deref().map_or(&empty, |a| &a.spells);
+        self.trade_live
+            .filter_spell(spell_id, min, max, name, known, global)
+    }
+
     fn close_gossip(&mut self) -> u32 {
         use crate::ui_session::NpcSession;
         let giver_held = self.lent.giver.as_deref().and_then(|q| q.npc()).is_some();
@@ -2858,6 +2978,8 @@ enum UiEvent {
     World(WorldStep),
     /// One cast or channel edge applied to the caster's cast state, its events fired in turn.
     CastEdge(crate::ui_cast::CastBarEdge),
+    /// A chat line through the chat add at its step (`0x509dd0` runs inside its caller).
+    Chat(crate::ui_chat::ChatLine),
 }
 
 /// An argument a system line's template takes.
@@ -2905,6 +3027,44 @@ impl UiEvents {
     /// Write state the VM owns in turn with the events around it; `write` may fire its own.
     pub(crate) fn write(&mut self, write: impl FnOnce(&mut UiScript) + Send + Sync + 'static) {
         self.0.push(UiEvent::Write(Box::new(write)));
+    }
+
+    /// Add `line` through the chat add in turn with the events around it (`0x509dd0`).
+    pub(crate) fn chat(&mut self, line: crate::ui_chat::ChatLine) {
+        self.0.push(UiEvent::Chat(line));
+    }
+
+    /// The kind and text of every chat event line queued, in order.
+    #[cfg(test)]
+    pub(crate) fn chat_events(&self) -> Vec<(Option<crate::ui_chat::ChatEventKind>, String)> {
+        self.0
+            .iter()
+            .filter_map(|e| match e {
+                UiEvent::Chat(crate::ui_chat::ChatLine::Event(e)) => Some((e.kind, e.text.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The text of every chat event line queued, in order.
+    #[cfg(test)]
+    pub(crate) fn chat_texts(&self) -> Vec<String> {
+        self.chat_events().into_iter().map(|(_, t)| t).collect()
+    }
+
+    /// Every chat line queued, taken in order; the rest stays.
+    #[cfg(test)]
+    pub(crate) fn take_chat(&mut self) -> Vec<crate::ui_chat::ChatLine> {
+        let mut out = Vec::new();
+        let mut kept = Vec::new();
+        for e in std::mem::take(&mut self.0) {
+            match e {
+                UiEvent::Chat(line) => out.push(line),
+                other => kept.push(other),
+            }
+        }
+        self.0 = kept;
+        out
     }
 
     /// Run `step` over the `World` in turn with the events around it; what it queues fires next.
@@ -2998,17 +3158,42 @@ impl UiEvents {
     /// The fired event names, in order.
     #[cfg(test)]
     pub(crate) fn names(&self) -> Vec<&'static str> {
-        self.0
-            .iter()
-            .map(|e| match e {
-                UiEvent::Fire(name, _) => *name,
-                UiEvent::ClearCursor => "<clear cursor>",
-                UiEvent::Write(_) => "<write>",
-                UiEvent::SystemLine(key, _) => key,
-                UiEvent::World(_) => "<world>",
-                UiEvent::CastEdge(_) => "<cast edge>",
-            })
-            .collect()
+        self.0.iter().map(name_of).collect()
+    }
+
+    /// Take the queue's names in order, each step over the `World` run where it stands and what it
+    /// queued named after it, nothing fired: a handler's tail seen without a VM.
+    #[cfg(test)]
+    pub(crate) fn walk_for_test(world: &mut World) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        let mut events = std::collections::VecDeque::from(std::mem::take(
+            &mut world.resource_mut::<UiEvents>().0,
+        ));
+        while let Some(event) = events.pop_front() {
+            out.push(name_of(&event));
+            if let UiEvent::World(step) = event {
+                step(world);
+                let queued = std::mem::take(&mut world.resource_mut::<UiEvents>().0);
+                for e in queued.into_iter().rev() {
+                    events.push_front(e);
+                }
+            }
+        }
+        out
+    }
+}
+
+/// A queued event's name, for tests.
+#[cfg(test)]
+fn name_of(event: &UiEvent) -> &'static str {
+    match event {
+        UiEvent::Fire(name, _) => name,
+        UiEvent::ClearCursor => "<clear cursor>",
+        UiEvent::Write(_) => "<write>",
+        UiEvent::SystemLine(key, _) => key,
+        UiEvent::World(_) => "<world>",
+        UiEvent::CastEdge(_) => "<cast edge>",
+        UiEvent::Chat(_) => "<chat>",
     }
 }
 
@@ -3106,15 +3291,19 @@ pub(crate) fn fire_handler_events(world: &mut World) {
         return;
     }
     let mut events = std::collections::VecDeque::from(std::mem::take(&mut queued.0));
-    let mut lines = Vec::new();
     let mut batch = Vec::new();
     while let Some(event) = events.pop_front() {
         match event {
-            step @ (UiEvent::World(_) | UiEvent::CastEdge(_)) => {
-                fire_batch(world, &mut batch, &mut lines);
+            step @ (UiEvent::World(_)
+            | UiEvent::CastEdge(_)
+            | UiEvent::SystemLine(..)
+            | UiEvent::Chat(_)) => {
+                fire_batch(world, &mut batch);
                 match step {
                     UiEvent::World(step) => step(world),
                     UiEvent::CastEdge(edge) => crate::ui_cast::apply_edge(world, edge),
+                    UiEvent::SystemLine(key, args) => system_line(world, key, &args),
+                    UiEvent::Chat(line) => crate::ui_chat::add_now(world, line),
                     _ => unreachable!(),
                 }
                 // What the step queued fires in its turn, ahead of the rest.
@@ -3127,11 +3316,33 @@ pub(crate) fn fire_handler_events(world: &mut World) {
             other => batch.push(other),
         }
     }
-    fire_batch(world, &mut batch, &mut lines);
+    fire_batch(world, &mut batch);
 }
 
-/// Fire `batch` into the VM, in order, with the `World` lent, collecting the system lines.
-fn fire_batch(world: &mut World, batch: &mut Vec<UiEvent>, lines: &mut Vec<String>) {
+/// A handler's system line added at its step (`0x5498f6`, `0x5cfb20` -> `0x509dd0`): its template
+/// read off the VM and filled, then recorded and its `CHAT_MSG_SYSTEM` raised before the handler's
+/// next step; a missing or empty template adds nothing.
+fn system_line(world: &mut World, key: &'static str, args: &[LineArg]) {
+    use benilla_ui::strings::Arg;
+    let args: Vec<Arg> = args
+        .iter()
+        .map(|a| match a {
+            LineArg::S(s) => Arg::S(s),
+            LineArg::D(d) => Arg::D(*d),
+        })
+        .collect();
+    let text = world
+        .get_non_send_resource::<UiScript>()
+        .and_then(|script| crate::ui_chat::combat::global_string(script, key))
+        .map(|t| benilla_ui::strings::fill(&t, &args))
+        .filter(|t| !t.is_empty());
+    if let Some(text) = text {
+        crate::ui_chat::add_chat_line_now(world, 0, text);
+    }
+}
+
+/// Fire `batch` into the VM, in order, with the `World` lent.
+fn fire_batch(world: &mut World, batch: &mut Vec<UiEvent>) {
     if batch.is_empty() {
         return;
     }
@@ -3142,30 +3353,14 @@ fn fire_batch(world: &mut World, batch: &mut Vec<UiEvent>, lines: &mut Vec<Strin
                 UiEvent::Fire(event, args) => script.fire_event(event, args),
                 UiEvent::ClearCursor => script.clear_cursor_payload(),
                 UiEvent::Write(write) => write(script),
-                UiEvent::SystemLine(key, args) => {
-                    use benilla_ui::strings::Arg;
-                    let args: Vec<Arg> = args
-                        .iter()
-                        .map(|a| match a {
-                            LineArg::S(s) => Arg::S(s),
-                            LineArg::D(d) => Arg::D(*d),
-                        })
-                        .collect();
-                    let text = crate::ui_chat::combat::global_string(script, key)
-                        .map(|t| benilla_ui::strings::fill(&t, &args));
-                    lines.extend(text.filter(|t| !t.is_empty()));
-                }
                 // Split out by the caller.
-                UiEvent::World(_) | UiEvent::CastEdge(_) => {}
+                UiEvent::World(_)
+                | UiEvent::CastEdge(_)
+                | UiEvent::SystemLine(..)
+                | UiEvent::Chat(_) => {}
             }
         }
     });
-    // The chat log takes the batch's lines before the next step runs, so a nested step's lines follow them, as the chat feed's other system lines go.
-    if let Some(mut chat) = world.get_resource_mut::<crate::ui_chat::ChatLog>() {
-        for line in lines.drain(..) {
-            crate::ui_chat::away::push_system(&mut chat, line);
-        }
-    }
 }
 
 /// The unique signals queued this frame: each `(guid, event)` once, however often it is queued (`0x6143f0`), fired in queue order once per frame after the packets (`0x52b247` -> `0x614760`), a unit's to every token naming it then (`0x60bf10`). Main-thread state the handlers fill and a verb's call queues into ([`Lent`]).

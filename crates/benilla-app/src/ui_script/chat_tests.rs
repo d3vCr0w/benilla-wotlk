@@ -123,7 +123,7 @@ fn input_editbox_enter_drains_the_typed_line() {
     assert_eq!(
         sends
             .iter()
-            .map(|c| (c.text.as_str(), c.chat_type.as_str()))
+            .map(|c| (std::str::from_utf8(&c.text).unwrap(), c.chat_type.as_str()))
             .collect::<Vec<_>>(),
         vec![("hi", "YELL")]
     );
@@ -156,7 +156,11 @@ fn the_edit_box_speaks_the_language_picked_in_the_chat_menu() {
     assert_eq!(
         sends
             .iter()
-            .map(|c| (c.text.as_str(), c.chat_type.as_str(), c.language))
+            .map(|c| (
+                std::str::from_utf8(&c.text).unwrap(),
+                c.chat_type.as_str(),
+                c.language
+            ))
             .collect::<Vec<_>>(),
         vec![
             ("before", "SAY", Some(2)),
@@ -207,7 +211,7 @@ fn chat_box_arrows_edit_and_history_recalls() {
     assert_eq!(
         sends
             .iter()
-            .map(|c| (c.text.as_str(), c.chat_type.as_str()))
+            .map(|c| (std::str::from_utf8(&c.text).unwrap(), c.chat_type.as_str()))
             .collect::<Vec<_>>(),
         vec![("hi", "YELL")]
     );
@@ -424,7 +428,9 @@ fn chat_type_info_matches_the_host_color_table() {
         ("OPENING", K::Opening, 30),
         ("TARGETICONS", K::TargetIcons, 53),
     ];
-    assert_eq!(PAIRS.len(), K::ALL.len(), "every kind is listed");
+    // `0x32` fires no event, and the stock UI has no row for it.
+    let named = K::ALL.iter().filter(|&&k| k != K::ArenaPoints).count();
+    assert_eq!(PAIRS.len(), named, "every kind is listed");
 
     let s = chat_frame();
     for (name, kind, want_id) in PAIRS {
@@ -515,7 +521,8 @@ fn fired_event_names_are_all_chat_type_info_keys() {
     use crate::ui_chat::{event_name, ChatEventKind as K};
 
     let s = chat_frame();
-    for &kind in K::ALL {
+    // A type whose event slot has no name fires nothing (`0x32`).
+    for &kind in K::ALL.iter().filter(|&&k| !event_name(k).is_empty()) {
         let name = event_name(kind);
         let key = name
             .strip_prefix("CHAT_MSG_")
@@ -1100,7 +1107,10 @@ fn the_stock_afk_and_dnd_commands_reach_the_wire() {
         assert!(s.key_input("ENTER"), "the box consumes ENTER");
         let sends = s.take_chat_sends();
         assert_eq!(sends.len(), 1, "{line:?} produced one send");
-        (sends[0].text.clone(), sends[0].chat_type.clone())
+        (
+            String::from_utf8(sends[0].text.clone()).unwrap(),
+            sends[0].chat_type.clone(),
+        )
     };
 
     // Half one: the stock `SlashCmdList` body sends the token.

@@ -42,6 +42,10 @@ local function button2()
 end
 local VERBS = {
     { "taxi", function() return UnitOnTaxi("player") end },
+    { "chan1", function() return (select(2, GetChannelName(1))) end },
+    { "chann", function() return select("#", GetChannelList()) end },
+    { "chanl", function() return table.concat({ GetChannelList() }, ",") end },
+    { "roster1", function() return CHARZ_CHAN and (GetChannelRosterInfo(CHARZ_CHAN, 1)) end },
     { "achcan", function() return CanShowAchievementUI() end },
     { "achcrit", function() return CHARZ_CRIT and (select(4, GetAchievementCriteriaInfo(CHARZ_CRIT))) end },
     { "achtracked", function() return GetNumTrackedAchievements() end },
@@ -61,6 +65,12 @@ local VERBS = {
     { "skill2", function() return (select(4, GetSkillLineInfo(2))) end },
     { "tailor", function() local _, t = GetSpellLink(3908) return t and t:match("Htrade:%d+:(%d+:%d+)") end },
     { "alch", function() local _, t = GetSpellLink(2259) return t and t:match("Htrade:%d+:(%d+:%d+)") end },
+    { "tsline", function() local n, r, m = GetTradeSkillLine() return n .. ":" .. r .. ":" .. m end },
+    { "tsnum", function() return GetNumTradeSkills() end },
+    { "ts2", function() local n, t, a = GetTradeSkillInfo(2) return n and (n .. ":" .. t .. ":" .. a) end },
+    { "ts1", function() local n, t, a = GetTradeSkillInfo(1) return n and (n .. ":" .. t .. ":" .. (a or "")) end },
+    { "tsr2", function() local n, _, _, h = GetTradeSkillReagentInfo(2, 1) return h and ((n or "nil") .. ":" .. h) end },
+    { "tslink", function() local l = GetTradeSkillListLink() return l and l:match("Htrade:[^|]*") end },
     { "rating6", function() return GetCombatRating(6) end },
     { "spdmg", function() return GetSpellBonusDamage(2) end },
     { "mainatk", function() return (UnitAttackBothHands("player")) end },
@@ -7190,6 +7200,47 @@ fn the_guild_bank_fires_from_its_handlers_with_the_bank_read_at_the_call() {
     );
 }
 
+/// 12340 runs every callback on a name record in one list, in registration order (`0x67d880` appends, `0x680d03`-`0x680d2c` runs); benilla runs the guild bank's before the chat's whichever registered first (#1487): today's order, pinned for both registrations.
+#[test]
+fn a_name_answer_runs_the_bank_log_before_the_chat_line_whichever_asked_first() {
+    use benilla_protocol::messages::{GuildBankLog, GuildBankLogEntry};
+    const EVENTS: &[&str] = &["CHAT_MSG_SAY", "GUILDBANKLOG_UPDATE"];
+    let Some(mut rig) = Rig::login(&[OBJECT_TYPE_PLAYER]) else {
+        return;
+    };
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    rig.app.insert_resource(crate::net::NetCommands(tx));
+    let log = |player: u64| {
+        SessionEvent::GuildBankLog(GuildBankLog {
+            tab: 0,
+            entries: vec![GuildBankLogEntry {
+                kind: 1,
+                player,
+                ..Default::default()
+            }],
+        })
+    };
+    for (chat_first, guid, name) in [(true, 0x51, "Ann"), (false, 0x52, "Bob")] {
+        let asks = if chat_first {
+            vec![say_from(guid, "hi"), log(guid)]
+        } else {
+            vec![log(guid), say_from(guid, "hi")]
+        };
+        let seen = rig.packets(asks, 2);
+        assert!(
+            fired(&seen, EVENTS).is_empty(),
+            "{:?}",
+            fired(&seen, EVENTS)
+        );
+        let seen = rig.packets(vec![name_answer(guid, name)], 2);
+        assert_eq!(
+            fired(&seen, EVENTS),
+            ["GUILDBANKLOG_UPDATE", "CHAT_MSG_SAY"],
+            "chat registered first: {chat_first}"
+        );
+    }
+}
+
 /// One record's callbacks run in ask order across subsystems, as 12340 links every ask to the tail of the record's one list (`0x67ca82`, `0x67cab1`): our bag item's post-init (`0x70af17`) and an open guild bank's list (`0x5a7664`) wait on the same entry, and its answer runs them in the order they asked, the post-init's `BAG_UPDATE`s (`0x70ae0b`) and `GUILDBANKBAGSLOTS_CHANGED` (`0x5a47a0`) either way round; a verb's callback, the currency build's (`0x5b01d7`), joins the same list.
 #[test]
 fn one_records_callbacks_run_in_ask_order_across_subsystems() {
@@ -7683,10 +7734,11 @@ const FROSTBOLT_1: u32 = 116;
 
 /// The book update (`0x53ca70`) runs where 12340 runs it, each ending in `SPELLS_CHANGED` with the
 /// book rebuilt: our create's init (`0x6e7fdb`); a live learn, its tab flash after it (`0x542cd4`,
-/// `0x542d16`); a supersede, the removal's update then the learn's (`0x5401b8`, `0x542cd4`); a
+/// `0x542d16`); a supersede, the swap's removal's update, the learn's, then our player's removal's
+/// (`0x5401b8`, `0x542cd4`, `0x6e7361` -> `0x5401b8`); a
 /// removal (`0x5401b8`); and our level watch, which re-sorts nothing (`0x6d66fd`). Fireball and
 /// Frostbolt sit on two skill lines, so the learn flashes the second tab. A handler's events fire
-/// once its changes apply, so both of the supersede's read the new rank in the book. A hover of the
+/// once its changes apply, so all three of the supersede's read the new rank in the book. A hover of the
 /// new slot inside the learn's own events shows its whole tooltip: the builder runs at the call.
 #[test]
 fn book_updates_fire_from_their_handlers_in_wire_order() {
@@ -7722,6 +7774,7 @@ fn book_updates_fire_from_their_handlers_in_wire_order() {
             "SPELLS_CHANGED | tabs=2 book1=Fireball book2=Frostbolt tip2=4:Launches a bolt of frost at the enemy, causing 18 to 20 Frost damage and slowing movement speed by 40% for 5 sec.",
             "SPELLS_CHANGED | tabs=2 book1=Fireball book2=Frostbolt tip2=4:Launches a bolt of frost at the enemy, causing 18 to 20 Frost damage and slowing movement speed by 40% for 5 sec.",
             "LEARNED_SPELL_IN_TAB 1 | tabs=2 book1=Fireball book2=Frostbolt tip2=4:Launches a bolt of frost at the enemy, causing 18 to 20 Frost damage and slowing movement speed by 40% for 5 sec.",
+            "SPELLS_CHANGED | tabs=2 book1=Fireball book2=Frostbolt tip2=4:Launches a bolt of frost at the enemy, causing 18 to 20 Frost damage and slowing movement speed by 40% for 5 sec.",
             "SPELLS_CHANGED | tabs=1 book1=Fireball book2=nil tip2=nil",
             "SPELLS_CHANGED | tabs=1 book1=Fireball book2=nil tip2=nil",
         ]
@@ -9496,12 +9549,14 @@ fn group_loot_rolls_fire_from_their_handlers_with_the_rolls_read_at_the_call() {
                 "CHAT_MSG_LOOT Need Roll - 0 for |cffffffff|Hitem:593921:0:0:0:0:0:0:0:80|h[Charz Gem]|h|r by Probesix      0 0  0 1  0 | roll0=Charz Gem roll1=Charz Late roll2=nil rleft1=true".to_string(),
             ],
             vec![
+                // The won line is added (`0x6fb937`) before the roll closes (`0x6fb953`).
+                "CHAT_MSG_LOOT You won: |cffffffff|Hitem:593921:0:0:0:0:0:0:0:80|h[Charz Gem]|h|r      0 0  0 2  0 | roll0=Charz Gem roll1=Charz Late roll2=nil rleft1=true".to_string(),
                 "CANCEL_LOOT_ROLL 0 | roll0=nil roll1=Charz Late roll2=nil rleft1=true".to_string(),
-                "CHAT_MSG_LOOT You won: |cffffffff|Hitem:593921:0:0:0:0:0:0:0:80|h[Charz Gem]|h|r      0 0  0 2  0 | roll0=nil roll1=Charz Late roll2=nil rleft1=true".to_string(),
             ],
             vec![
+                // The all-passed line is added (`0x6fb4da`) before the roll closes (`0x6fb4f6`).
+                "CHAT_MSG_LOOT Everyone passed on: |cffffffff|Hitem:593922:0:0:0:0:0:0:0:80|h[Charz Late]|h|r      0 0  0 3  0 | roll0=nil roll1=Charz Late roll2=nil rleft1=true".to_string(),
                 "CANCEL_LOOT_ROLL 1 | roll0=nil roll1=nil roll2=nil rleft1=false".to_string(),
-                "CHAT_MSG_LOOT Everyone passed on: |cffffffff|Hitem:593922:0:0:0:0:0:0:0:80|h[Charz Late]|h|r      0 0  0 3  0 | roll0=nil roll1=nil roll2=nil rleft1=false".to_string(),
             ],
         ]
     );
@@ -10738,9 +10793,11 @@ fn an_auction_house_fires_from_its_handlers_with_the_lists_read_at_the_call() {
             vec![at("AUCTION_ITEM_LIST_UPDATE", browse)],
             Vec::new(),
             vec![at("AUCTION_OWNED_LIST_UPDATE", owned)],
+            // The bid's line is added inside the handler (`0x5a009f`), its listener reading the row
+            // before the bid's write (`0x5a0112`, `0x5a0121`) and its update (`0x5a0195`).
             vec![
+                at("CHAT_MSG_SYSTEM Bid accepted.      0 0  0 1  0", owned),
                 at("AUCTION_ITEM_LIST_UPDATE", bid),
-                at("CHAT_MSG_SYSTEM Bid accepted.      0 0  0 1  0", bid),
             ],
             vec![at("AUCTION_OWNED_LIST_UPDATE", bid)],
             vec![
@@ -10890,6 +10947,268 @@ fn set_current_title_sends_inside_the_call() {
         "both sent before the chunk returned"
     );
     assert_eq!(cur, 0, "the field waits for the server");
+}
+
+// ── Chat lines: the chat add in its caller's turn (#1283) ────────────────────────────────────────
+
+/// A spoken `SAY` line from `guid`.
+fn say_from(guid: u64, text: &str) -> SessionEvent {
+    SessionEvent::Chat(benilla_protocol::messages::ChatMessage {
+        chat_type: benilla_protocol::messages::CHAT_MSG_SAY,
+        language: 0,
+        sender_guid: guid,
+        target_guid: 0,
+        sender_name: None,
+        receiver_name: None,
+        channel: None,
+        text: text.into(),
+        chat_tag: 0,
+        achievement: 0,
+        wire_type: 0,
+        sender_word: 0,
+        gm: false,
+    })
+}
+
+/// A closed house's answer (`MSG_AUCTION_HELLO`), whose handler raises `AUCTION_HOUSE_DISABLED`
+/// itself: the marker the chat lines are ordered against.
+fn closed_house() -> SessionEvent {
+    SessionEvent::AuctionHello {
+        auctioneer: 0x77,
+        house_id: 1,
+        enabled: false,
+    }
+}
+
+/// The observer's `CHAT_MSG_SAY` (text and sender), `TIME_PLAYED_MSG` (its two numbers) and
+/// `AUCTION_HOUSE_DISABLED` (as `|`), in the order they fired.
+fn chat_order(seen: &[Seen]) -> Vec<String> {
+    seen.iter()
+        .filter_map(|s| match s.event.as_str() {
+            "CHAT_MSG_SAY" | "TIME_PLAYED_MSG" => Some(format!(
+                "{} {}",
+                s.event,
+                s.args.split(' ').take(2).collect::<Vec<_>>().join(" ")
+            )),
+            "AUCTION_HOUSE_DISABLED" => Some("|".to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// `SMSG_MESSAGECHAT` adds its line in the handler (`0x509dd0`), between the events of the packets
+/// around it: a sender not cached holds the line (`0x509f92` -> `0x50ad82`) and its name is asked
+/// once (`0x509e51`); the answer's callback adds it in the answer's handler (`0x503c80`,
+/// `0x503edb`), in whichever order the two packets come; a cached sender's line fires in its own.
+#[test]
+fn a_spoken_line_fires_in_its_handler_or_at_its_names_answer() {
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    let (tx, rx) = crossbeam_channel::unbounded();
+    rig.app.insert_resource(crate::net::NetCommands(tx));
+    const ANN: u64 = 0x31;
+    const BOB: u64 = 0x32;
+    // The line before its answer: held, then added at the answer, before the next handler.
+    let seen = rig.packets(
+        vec![
+            closed_house(),
+            say_from(ANN, "hello"),
+            closed_house(),
+            name_answer(ANN, "Ann"),
+            closed_house(),
+        ],
+        1,
+    );
+    assert_eq!(
+        chat_order(&seen),
+        ["|", "|", "CHAT_MSG_SAY hello Ann", "|"],
+        "the held line fires inside its name answer's handler"
+    );
+    let asks = rx
+        .try_iter()
+        .filter(|c| matches!(c, crate::net::ClientCommand::NameQuery { guid: ANN }))
+        .count();
+    assert_eq!(asks, 1, "the add asks the name once, with its callback");
+    // The answer before the line: the line finds the name and fires in its own handler.
+    let seen = rig.packets(
+        vec![
+            name_answer(BOB, "Bob"),
+            closed_house(),
+            say_from(BOB, "hi"),
+            closed_house(),
+        ],
+        1,
+    );
+    assert_eq!(chat_order(&seen), ["|", "CHAT_MSG_SAY hi Bob", "|"]);
+    // A name cached frames before: the same.
+    let seen = rig.packets(
+        vec![closed_house(), say_from(ANN, "again"), closed_house()],
+        1,
+    );
+    assert_eq!(chat_order(&seen), ["|", "CHAT_MSG_SAY again Ann", "|"]);
+}
+
+/// `SMSG_PLAYED_TIME`'s handler (`0x401390`) raises `TIME_PLAYED_MSG(total, level)` itself
+/// (`0x401463`), for a shown answer alone (`0x4013f6`), between the events of the packets around it.
+#[test]
+fn played_time_fires_from_its_handler_for_a_shown_answer_only() {
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    let answer = |show| SessionEvent::PlayedTime {
+        total: 360_000,
+        level: 7_200,
+        show,
+    };
+    let seen = rig.packets(
+        vec![answer(false), closed_house(), answer(true), closed_house()],
+        1,
+    );
+    assert_eq!(chat_order(&seen), ["|", "TIME_PLAYED_MSG 360000 7200", "|"]);
+}
+
+/// `RequestTimePlayed` (`0x515880`) sends `CMSG_PLAYED_TIME` inside the call (`0x5158c1`), asking for
+/// a shown answer, before the calling chunk goes on.
+#[test]
+fn request_time_played_sends_inside_the_call() {
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    let (tx, rx) = crossbeam_channel::unbounded();
+    rig.app.insert_resource(crate::net::NetCommands(tx));
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("RequestTimePlayed() RequestTimePlayed()").unwrap();
+    })
+    .expect("a VM");
+    let sent = rx
+        .try_iter()
+        .filter(|c| matches!(c, crate::net::ClientCommand::PlayedTime { show: true }))
+        .count();
+    assert_eq!(sent, 2, "each call sends before the chunk returns");
+}
+
+/// `SMSG_SERVER_MESSAGE` adds its `CHAT_MSG_SYSTEM` line in its handler (`0x50c980`), in wire order
+/// with the packets around it.
+#[test]
+fn a_server_message_adds_its_line_in_its_handler() {
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    let seen = rig.packets(
+        vec![
+            SessionEvent::PlayedTime {
+                total: 1,
+                level: 1,
+                show: true,
+            },
+            SessionEvent::ServerMessage {
+                message_type: 3,
+                text: "charz".into(),
+            },
+            SessionEvent::PlayedTime {
+                total: 2,
+                level: 2,
+                show: true,
+            },
+        ],
+        1,
+    );
+    let order: Vec<&str> = seen
+        .iter()
+        .filter(|s| s.event == "TIME_PLAYED_MSG" || s.event == "CHAT_MSG_SYSTEM")
+        .map(|s| s.event.as_str())
+        .collect();
+    assert_eq!(
+        order,
+        ["TIME_PLAYED_MSG", "CHAT_MSG_SYSTEM", "TIME_PLAYED_MSG"],
+        "the broadcast's line between the two answers' events"
+    );
+    let line = seen
+        .iter()
+        .find(|s| s.event == "CHAT_MSG_SYSTEM")
+        .map(|s| s.args.clone())
+        .unwrap_or_default();
+    assert!(line.contains("charz"), "{line}");
+}
+
+/// The two defense broadcasts (`0x50c3c0`, `0x50c850`) add their `CHAT_MSG_CHANNEL` lines in their
+/// handlers, against the slots and zone as they stand at the packet: a joined LocalDefense hears
+/// each between the answers around it, and a renamed or suspended one (`0x50c45e`, `0x50c8d6`)
+/// hears nothing.
+#[test]
+fn a_defense_broadcast_adds_its_channel_line_in_its_handler() {
+    use crate::ui_chat::edit::{ChannelSlot, ChannelState, SlotState};
+    const ELWYNN: u32 = 12;
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    let played = |n| SessionEvent::PlayedTime {
+        total: n,
+        level: n,
+        show: true,
+    };
+    let order = |seen: &[Seen]| -> Vec<String> {
+        seen.iter()
+            .filter(|s| s.event == "TIME_PLAYED_MSG" || s.event == "CHAT_MSG_CHANNEL")
+            .map(|s| s.event.clone())
+            .collect()
+    };
+    let slot = |rig: &mut Rig, state: SlotState| {
+        let w = rig.app.world_mut();
+        w.insert_resource(benilla_world::terrain_stream::CurrentArea(Some(ELWYNN)));
+        let mut channels = w.resource_mut::<ChannelState>();
+        let mut s = ChannelSlot::joined("LocalDefense - Elwynn Forest");
+        s.state = state;
+        channels.joined = vec![Some(s)];
+    };
+    let burst = || {
+        vec![
+            played(1),
+            SessionEvent::DefenseMessage {
+                zone_id: ELWYNN,
+                text: "charz defense".into(),
+            },
+            played(2),
+            SessionEvent::ZoneUnderAttack { area_id: ELWYNN },
+            played(3),
+        ]
+    };
+
+    slot(&mut rig, SlotState::Joined);
+    let seen = rig.packets(burst(), 1);
+    assert_eq!(
+        order(&seen),
+        [
+            "TIME_PLAYED_MSG",
+            "CHAT_MSG_CHANNEL",
+            "TIME_PLAYED_MSG",
+            "CHAT_MSG_CHANNEL",
+            "TIME_PLAYED_MSG"
+        ],
+        "each broadcast's line between the answers around it"
+    );
+    let lines: Vec<String> = seen
+        .iter()
+        .filter(|s| s.event == "CHAT_MSG_CHANNEL")
+        .map(|s| s.args.clone())
+        .collect();
+    assert!(lines[0].contains("charz defense"), "{lines:?}");
+    assert!(lines[1].contains("Elwynn Forest"), "{lines:?}");
+    assert!(
+        lines.iter().all(|l| l.contains("LocalDefense")),
+        "{lines:?}"
+    );
+
+    for state in [SlotState::Renamed, SlotState::Suspended] {
+        slot(&mut rig, state);
+        let seen = rig.packets(burst(), 1);
+        assert_eq!(
+            order(&seen),
+            ["TIME_PLAYED_MSG", "TIME_PLAYED_MSG", "TIME_PLAYED_MSG"],
+            "a {state:?} slot hears neither broadcast"
+        );
+    }
 }
 
 /// A reload keeps the skill list: the UI shutdown leaves it (`0x52b03e` -> `0x528f00`) and only the
@@ -11330,6 +11649,1304 @@ fn the_inspect_talent_packet_raises_inspect_talent_ready_for_the_target_alone() 
     );
 }
 
+/// The crafting list (`0xc235a0`-`0xc23604`): a profession opener's press opens it, the rebuild's `TRADE_SKILL_UPDATE` then `TRADE_SKILL_SHOW` (`0x5de2c3`, `0x5de2e5`); the skill value watch rebuilds it in place (`0x6da5fa`) and a learned recipe whole (`0x6e7c1a`), each `TRADE_SKILL_UPDATE` at its own step, so in one frame each listener reads the rank and the list as of its packet, in either order.
+#[test]
+fn the_trade_skill_list_rebuilds_at_each_handler_step() {
+    use benilla_protocol::field::{FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_UNIT_BYTES_0};
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    const HEAVY_LINEN_BANDAGE: u32 = 3276;
+    const ANTI_VENOM: u32 = 7934;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    // A human paladin with First Aid (129) at 1 of 75.
+    // The products' records, cached ahead (Linen, Heavy Linen Bandage, Anti-Venom: Consumable, Bandage).
+    let bandage = |entry: u32, name: &str| {
+        let mut t = crate::items::test_template(name);
+        t.class = 0;
+        t.subclass = 7;
+        SessionEvent::ItemTemplate {
+            entry,
+            info: Some(Box::new(t)),
+        }
+    };
+    let Some(mut rig) = Rig::login_after(
+        vec![
+            bandage(1251, "Linen Bandage"),
+            bandage(2581, "Heavy Linen Bandage"),
+            bandage(6452, "Anti-Venom"),
+            book(&[FIRST_AID, LINEN_BANDAGE]),
+        ],
+        &[
+            OBJECT_TYPE_PLAYER,
+            (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+            (SKILL, 129),
+            (SKILL + 1, pair(1, 75)),
+        ],
+    ) else {
+        return;
+    };
+    const EVENTS: &[&str] = &[
+        "TRADE_SKILL_UPDATE",
+        "TRADE_SKILL_SHOW",
+        "TRADE_SKILL_CLOSE",
+    ];
+    const VERBS: &[&str] = &["tsline", "tsnum", "ts2"];
+    rig.take();
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("CastSpellByName('First Aid')")
+    })
+    .expect("a VM")
+    .expect("the cast runs");
+    rig.run(1);
+    assert_eq!(
+        pin(&rig.take(), EVENTS, VERBS),
+        vec![
+            "TRADE_SKILL_UPDATE | tsline=First Aid:1:75 tsnum=2 ts2=Linen Bandage:optimal:0",
+            // The stock window's show sets its two filters, each verb's update inside its call.
+            "TRADE_SKILL_UPDATE | tsline=First Aid:1:75 tsnum=2 ts2=Linen Bandage:optimal:0",
+            "TRADE_SKILL_UPDATE | tsline=First Aid:1:75 tsnum=2 ts2=Linen Bandage:optimal:0",
+            "TRADE_SKILL_SHOW | tsline=First Aid:1:75 tsnum=2 ts2=Linen Bandage:optimal:0",
+        ]
+    );
+    let value = rig.packets(vec![self_values(&[(SKILL + 1, pair(2, 75))])], 2);
+    assert_eq!(
+        pin(&value, EVENTS, VERBS),
+        vec!["TRADE_SKILL_UPDATE | tsline=First Aid:2:75 tsnum=2 ts2=Linen Bandage:optimal:0"]
+    );
+    // The value ahead of the learn: the watch's rebuild lists two, the learn's three.
+    let value_first = rig.packets(
+        vec![
+            self_values(&[(SKILL + 1, pair(3, 75))]),
+            SessionEvent::SpellLearned {
+                spell_id: HEAVY_LINEN_BANDAGE,
+            },
+        ],
+        2,
+    );
+    assert_eq!(
+        pin(&value_first, EVENTS, &["tsline", "tsnum"]),
+        vec![
+            "TRADE_SKILL_UPDATE | tsline=First Aid:3:75 tsnum=2",
+            "TRADE_SKILL_UPDATE | tsline=First Aid:3:75 tsnum=3",
+        ]
+    );
+    // The learn ahead of the value: the learn's rebuild reads the old rank.
+    let learn_first = rig.packets(
+        vec![
+            SessionEvent::SpellLearned {
+                spell_id: ANTI_VENOM,
+            },
+            self_values(&[(SKILL + 1, pair(4, 75))]),
+        ],
+        2,
+    );
+    assert_eq!(
+        pin(&learn_first, EVENTS, &["tsline", "tsnum"]),
+        vec![
+            "TRADE_SKILL_UPDATE | tsline=First Aid:3:75 tsnum=4",
+            "TRADE_SKILL_UPDATE | tsline=First Aid:4:75 tsnum=4",
+        ]
+    );
+    // The opener again closes it (`0x5de1eb`).
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("CastSpellByName('First Aid')")
+    })
+    .expect("a VM")
+    .expect("the cast runs");
+    rig.run(1);
+    assert_eq!(
+        pin(&rig.take(), EVENTS, &["tsline"]),
+        vec![
+            "TRADE_SKILL_CLOSE | tsline=UNKNOWN:0:0",
+            // The stock window's hide calls CloseTradeSkill, which signals again (`0x5da8ef`).
+            "TRADE_SKILL_CLOSE | tsline=UNKNOWN:0:0",
+        ]
+    );
+}
+
+/// An abandoned line with the list open: the slot's id and ranks clear, and the value watch's
+/// rebuild in place (`0x6da5fa`) finds no slot, reading slot -1's value half unchecked
+/// (`0x5dd8cf`-`0x5dd8e5`), PLAYER_XP's low half, so each recipe's difficulty bands against it.
+#[test]
+fn the_rebuild_reads_a_missing_lines_rank_from_slot_minus_one() {
+    use benilla_protocol::field::{
+        FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_PLAYER_XP, FIELD_UNIT_BYTES_0,
+    };
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let mut t = crate::items::test_template("Linen Bandage");
+    t.class = 0;
+    t.subclass = 7;
+    // A human paladin with First Aid (129) at 1 of 75, Linen Bandage known, 300 experience.
+    let Some(mut rig) = Rig::login_after(
+        vec![
+            SessionEvent::ItemTemplate {
+                entry: 1251,
+                info: Some(Box::new(t)),
+            },
+            book(&[FIRST_AID, LINEN_BANDAGE]),
+        ],
+        &[
+            OBJECT_TYPE_PLAYER,
+            (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+            (SKILL, 129),
+            (SKILL + 1, pair(1, 75)),
+            (FIELD_PLAYER_XP, pair(300, 7)),
+        ],
+    ) else {
+        return;
+    };
+    rig.take();
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("CastSpellByName('First Aid')")
+    })
+    .expect("a VM")
+    .expect("the cast runs");
+    rig.run(1);
+    assert_eq!(
+        pin(&rig.take(), &["TRADE_SKILL_SHOW"], &["ts2"]),
+        vec!["TRADE_SKILL_SHOW | ts2=Linen Bandage:optimal:0"]
+    );
+    // The abandon clears the slot; the value and max watches' rebuilds (`0x6da5fa`, `0x6cddb7`)
+    // band against 300, past Linen Bandage's grey.
+    let abandoned = rig.packets(vec![self_values(&[(SKILL, 0), (SKILL + 1, 0)])], 2);
+    assert_eq!(
+        pin(&abandoned, &["TRADE_SKILL_UPDATE"], &["ts2"]),
+        vec![
+            "TRADE_SKILL_UPDATE | ts2=Linen Bandage:trivial:0",
+            "TRADE_SKILL_UPDATE | ts2=Linen Bandage:trivial:0",
+        ]
+    );
+}
+
+/// A product record in flight at the open: the rebuild files and counts the recipe (`0x5dd889`)
+/// and returns before its update (`0x5ddeb7`), so `TRADE_SKILL_SHOW` still fires (`0x5de2d1`,
+/// `0x5de2e5`); the record's callback rebuilds whole with its
+/// `TRADE_SKILL_UPDATE` (`0x5d9f94`); a learned recipe rebuilds whole (`0x6e7c1a`).
+#[test]
+fn the_trade_skill_window_shows_with_a_product_record_in_flight() {
+    use benilla_protocol::field::{FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_UNIT_BYTES_0};
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    const HEAVY_LINEN_BANDAGE: u32 = 3276;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let bandage = |entry: u32, name: &str| {
+        let mut t = crate::items::test_template(name);
+        t.class = 0;
+        t.subclass = 7;
+        SessionEvent::ItemTemplate {
+            entry,
+            info: Some(Box::new(t)),
+        }
+    };
+    // A human paladin with First Aid (129) at 1 of 75; only Heavy Linen Bandage's record cached.
+    let Some(mut rig) = Rig::login_after(
+        vec![
+            bandage(2581, "Heavy Linen Bandage"),
+            book(&[FIRST_AID, LINEN_BANDAGE]),
+        ],
+        &[
+            OBJECT_TYPE_PLAYER,
+            (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+            (SKILL, 129),
+            (SKILL + 1, pair(1, 75)),
+        ],
+    ) else {
+        return;
+    };
+    const EVENTS: &[&str] = &[
+        "TRADE_SKILL_UPDATE",
+        "TRADE_SKILL_SHOW",
+        "TRADE_SKILL_CLOSE",
+    ];
+    const VERBS: &[&str] = &["tsnum", "ts1"];
+    rig.take();
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("CastSpellByName('First Aid')")
+    })
+    .expect("a VM")
+    .expect("the cast runs");
+    rig.run(1);
+    assert_eq!(
+        pin(&rig.take(), EVENTS, VERBS),
+        vec![
+            // Nested in the show: the stock window's two filter verbs run the filter pass
+            // (`0x5dcc40`) over the one filed recipe, each with its update.
+            "TRADE_SKILL_UPDATE | tsnum=1 ts1=Linen Bandage:optimal:0",
+            "TRADE_SKILL_UPDATE | tsnum=1 ts1=Linen Bandage:optimal:0",
+            "TRADE_SKILL_SHOW | tsnum=1 ts1=Linen Bandage:optimal:0",
+        ]
+    );
+    let landed = rig.packets(vec![bandage(1251, "Linen Bandage")], 2);
+    assert_eq!(
+        pin(&landed, EVENTS, VERBS),
+        vec!["TRADE_SKILL_UPDATE | tsnum=2 ts1=Bandage:header:0"]
+    );
+    let learned = rig.packets(
+        vec![SessionEvent::SpellLearned {
+            spell_id: HEAVY_LINEN_BANDAGE,
+        }],
+        2,
+    );
+    // The learn's line reaches the chat through its feed until #1416; `learned_spell`'s test pins
+    // the line ahead of the rebuild.
+    assert_eq!(
+        pin(&learned, EVENTS, &["tsnum"]),
+        vec!["TRADE_SKILL_UPDATE | tsnum=3"]
+    );
+}
+
+/// The rebuild reads the open line's array entry by entry in add order (`0x5dd910`), not spell-id
+/// order: with products in flight it returns before the filter pass and its sort (`0x5ddeb7`), so
+/// after a learn the list indexes Heavy Linen Bandage (added first) ahead of Linen Bandage; the
+/// records landing file them under their header.
+#[test]
+fn the_trade_skill_list_reads_the_line_in_the_order_its_recipes_were_added() {
+    use benilla_protocol::field::{FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_UNIT_BYTES_0};
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    const HEAVY_LINEN_BANDAGE: u32 = 3276;
+    const SILK_BANDAGE: u32 = 7928;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let bandage = |entry: u32, name: &str| {
+        let mut t = crate::items::test_template(name);
+        t.class = 0;
+        t.subclass = 7;
+        SessionEvent::ItemTemplate {
+            entry,
+            info: Some(Box::new(t)),
+        }
+    };
+    // A human paladin with First Aid (129) at 1 of 75 and Heavy Linen Bandage known; no record cached.
+    let Some(mut rig) = Rig::login_after(
+        vec![book(&[FIRST_AID, HEAVY_LINEN_BANDAGE])],
+        &[
+            OBJECT_TYPE_PLAYER,
+            (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+            (SKILL, 129),
+            (SKILL + 1, pair(1, 75)),
+        ],
+    ) else {
+        return;
+    };
+    rig.packets(
+        vec![SessionEvent::SpellLearned {
+            spell_id: LINEN_BANDAGE,
+        }],
+        2,
+    );
+    const EVENTS: &[&str] = &["TRADE_SKILL_UPDATE", "TRADE_SKILL_SHOW"];
+    const VERBS: &[&str] = &["tsnum", "ts1", "ts2"];
+    rig.take();
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("CastSpellByName('First Aid')")
+    })
+    .expect("a VM")
+    .expect("the cast runs");
+    rig.run(1);
+    assert_eq!(
+        pin(&rig.take(), EVENTS, VERBS),
+        vec![
+            "TRADE_SKILL_UPDATE | tsnum=2 ts1=Heavy Linen Bandage:optimal:0 ts2=Linen Bandage:optimal:0",
+            "TRADE_SKILL_UPDATE | tsnum=2 ts1=Heavy Linen Bandage:optimal:0 ts2=Linen Bandage:optimal:0",
+            "TRADE_SKILL_SHOW | tsnum=2 ts1=Heavy Linen Bandage:optimal:0 ts2=Linen Bandage:optimal:0",
+        ]
+    );
+    // Learned with the products still in flight: the whole rebuild files the array as it stands,
+    // unsorted, with no update (`0x6e7c1a`, `0x5ddeb7`).
+    let learned = rig.packets(
+        vec![SessionEvent::SpellLearned {
+            spell_id: SILK_BANDAGE,
+        }],
+        2,
+    );
+    assert_eq!(pin(&learned, EVENTS, VERBS), Vec::<String>::new());
+    let read = super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.eval::<String>(
+            "local t = {} for i = 1, 3 do t[i] = (GetTradeSkillInfo(i)) end return table.concat(t, ',')",
+        )
+    })
+    .expect("a VM")
+    .expect("the read runs");
+    assert_eq!(read, "Heavy Linen Bandage,Linen Bandage,Silk Bandage");
+    let landed = rig.packets(
+        vec![
+            bandage(2581, "Heavy Linen Bandage"),
+            bandage(1251, "Linen Bandage"),
+            bandage(6450, "Silk Bandage"),
+        ],
+        2,
+    );
+    assert_eq!(
+        pin(&landed, EVENTS, VERBS),
+        vec!["TRADE_SKILL_UPDATE | tsnum=4 ts1=Bandage:header:0 ts2=Silk Bandage:optimal:0"]
+    );
+}
+
+/// A superseded recipe pair with the list open: the swap's removal updates the book (`0x542eba` ->
+/// `0x5401b8`) and its registrar returns at the recipe line before its own (`0x542692`); our
+/// player's removal (`0x6e7e81`) rebuilds without the old recipe, before the new one is in the
+/// line's array, then its book removal updates the book again (`0x6e7361` -> `0x5401b8`); only the
+/// learn (`0x6e7e92`) appends the new one (`0x6e7c11`) and rebuilds (`0x6e7c1a`).
+#[test]
+fn a_superseded_recipe_leaves_the_list_before_its_successor_joins() {
+    use benilla_protocol::field::{FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_UNIT_BYTES_0};
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    const HEAVY_LINEN_BANDAGE: u32 = 3276;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let bandage = |entry: u32, name: &str| {
+        let mut t = crate::items::test_template(name);
+        t.class = 0;
+        t.subclass = 7;
+        SessionEvent::ItemTemplate {
+            entry,
+            info: Some(Box::new(t)),
+        }
+    };
+    // A human paladin with First Aid (129) at 1 of 75 and Linen Bandage known; both records cached.
+    let Some(mut rig) = Rig::login_after(
+        vec![
+            bandage(1251, "Linen Bandage"),
+            bandage(2581, "Heavy Linen Bandage"),
+            book(&[FIRST_AID, LINEN_BANDAGE]),
+        ],
+        &[
+            OBJECT_TYPE_PLAYER,
+            (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+            (SKILL, 129),
+            (SKILL + 1, pair(1, 75)),
+        ],
+    ) else {
+        return;
+    };
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("CastSpellByName('First Aid')")
+    })
+    .expect("a VM")
+    .expect("the cast runs");
+    rig.run(1);
+    rig.take();
+    let seen = rig.packets(
+        vec![SessionEvent::SpellSuperceded {
+            old_spell_id: LINEN_BANDAGE,
+            new_spell_id: HEAVY_LINEN_BANDAGE,
+        }],
+        2,
+    );
+    assert_eq!(
+        pin(
+            &seen,
+            &[
+                "TRADE_SKILL_UPDATE",
+                "SPELLS_CHANGED",
+                "LEARNED_SPELL_IN_TAB"
+            ],
+            &["tsnum", "ts2"]
+        ),
+        vec![
+            "SPELLS_CHANGED | tsnum=2 ts2=Linen Bandage:optimal:0",
+            "TRADE_SKILL_UPDATE | tsnum=0 ts2=nil",
+            "SPELLS_CHANGED | tsnum=0 ts2=nil",
+            "TRADE_SKILL_UPDATE | tsnum=2 ts2=Heavy Linen Bandage:optimal:0",
+        ]
+    );
+}
+
+/// The item-driven rebuilds in place, each a step of its handler: a reagent's record landing
+/// (`0x5de100` -> `0x5de10b`); our item's post-init (`0x70ade4`); a pack slot's watch on a move
+/// (`0x5d9859`), one per slot; a stack count's (`0x7077db`) after its unlock and before the bar
+/// update and `BAG_UPDATE` (`0x7077e7`, `0x707805`); the skill max watch's (`0x6cddb7`); a
+/// removed recipe's whole rebuild
+/// (`0x6e72e6`). `GetTradeSkillInfo`'s count available and `GetTradeSkillReagentInfo`'s count
+/// held read the bags at each event.
+#[test]
+fn the_trade_skill_list_rebuilds_on_the_reagents_items_and_a_removed_recipe() {
+    use benilla_protocol::field::{
+        FIELD_ITEM_CONTAINED, FIELD_ITEM_OWNER, FIELD_ITEM_STACK_COUNT, FIELD_OBJECT_ENTRY,
+        FIELD_PLAYER_PACK_SLOT_1 as PACK, FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_UNIT_BYTES_0,
+    };
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    const HEAVY_LINEN_BANDAGE: u32 = 3276;
+    const LINEN_CLOTH: u32 = 2589;
+    const CLOTH: u64 = 0x4000_0000_0000_0400;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let bandage = |entry: u32, name: &str| {
+        let mut t = crate::items::test_template(name);
+        t.class = 0;
+        t.subclass = 7;
+        SessionEvent::ItemTemplate {
+            entry,
+            info: Some(Box::new(t)),
+        }
+    };
+    // A human paladin with First Aid (129) at 1 of 75; the products cached, the cloth's record not.
+    let Some(mut rig) = Rig::login_after(
+        vec![
+            bandage(1251, "Linen Bandage"),
+            bandage(2581, "Heavy Linen Bandage"),
+            book(&[FIRST_AID, LINEN_BANDAGE, HEAVY_LINEN_BANDAGE]),
+        ],
+        &[
+            OBJECT_TYPE_PLAYER,
+            (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+            (SKILL, 129),
+            (SKILL + 1, pair(1, 75)),
+        ],
+    ) else {
+        return;
+    };
+    const EVENTS: &[&str] = &["TRADE_SKILL_UPDATE", "BAG_UPDATE"];
+    const VERBS: &[&str] = &["tsnum", "ts2", "tsr2"];
+    rig.take();
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("CastSpellByName('First Aid')")
+    })
+    .expect("a VM")
+    .expect("the cast runs");
+    rig.run(1);
+    let opened = rig.take();
+    assert_eq!(
+        pin(&opened, &["TRADE_SKILL_SHOW"], VERBS),
+        vec!["TRADE_SKILL_SHOW | tsnum=3 ts2=Heavy Linen Bandage:optimal:0 tsr2=nil:0"],
+        "the reagent's record is asked at the call"
+    );
+    let mut cloth = crate::items::test_template("Linen Cloth");
+    cloth.class = 7;
+    cloth.stackable = 20;
+    let landed = rig.packets(
+        vec![SessionEvent::ItemTemplate {
+            entry: LINEN_CLOTH,
+            info: Some(Box::new(cloth)),
+        }],
+        2,
+    );
+    // One callback per call that asked, as the ask is not unique (`0x5de4ea`): the observer's
+    // verb asked at each of the open's six events.
+    assert_eq!(
+        pin(&landed, EVENTS, VERBS),
+        vec![
+            "TRADE_SKILL_UPDATE | tsnum=3 ts2=Heavy Linen Bandage:optimal:0 tsr2=Linen Cloth:0";
+            6
+        ]
+    );
+    let slot = |i: u16, guid: u64| {
+        [
+            (PACK + 2 * i, guid as u32),
+            (PACK + 2 * i + 1, (guid >> 32) as u32),
+        ]
+    };
+    let made = rig.packets(
+        vec![
+            SessionEvent::ItemCreate {
+                guid: CLOTH,
+                container: false,
+                fields: ObjectFields::from_pairs(&[
+                    (FIELD_OBJECT_ENTRY, LINEN_CLOTH),
+                    (FIELD_ITEM_OWNER, ME as u32),
+                    (FIELD_ITEM_OWNER + 1, (ME >> 32) as u32),
+                    (FIELD_ITEM_CONTAINED, ME as u32),
+                    (FIELD_ITEM_CONTAINED + 1, (ME >> 32) as u32),
+                    (FIELD_ITEM_STACK_COUNT, 2),
+                ])
+                .into_created(ObjectType::Item),
+            },
+            self_values(&slot(0, CLOTH)),
+        ],
+        2,
+    );
+    assert_eq!(
+        pin(&made, &["TRADE_SKILL_UPDATE"], VERBS),
+        vec![
+            "TRADE_SKILL_UPDATE | tsnum=3 ts2=Heavy Linen Bandage:optimal:0 tsr2=Linen Cloth:0",
+            "TRADE_SKILL_UPDATE | tsnum=3 ts2=Heavy Linen Bandage:optimal:1 tsr2=Linen Cloth:2",
+        ],
+        "the post-init's rebuild before the slot holds it, the slot watch's after"
+    );
+    let stacked = rig.packets(
+        vec![SessionEvent::ObjectValues {
+            guid: CLOTH,
+            fields: ObjectFields::from_pairs(&[(FIELD_ITEM_STACK_COUNT, 5)]),
+        }],
+        2,
+    );
+    assert_eq!(
+        pin(&stacked, EVENTS, VERBS),
+        vec![
+            "TRADE_SKILL_UPDATE | tsnum=3 ts2=Heavy Linen Bandage:optimal:2 tsr2=Linen Cloth:5",
+            "BAG_UPDATE 0 | tsnum=3 ts2=Heavy Linen Bandage:optimal:2 tsr2=Linen Cloth:5",
+            "BAG_UPDATE -2 | tsnum=3 ts2=Heavy Linen Bandage:optimal:2 tsr2=Linen Cloth:5",
+            "BAG_UPDATE -4 | tsnum=3 ts2=Heavy Linen Bandage:optimal:2 tsr2=Linen Cloth:5",
+        ]
+    );
+    // The cloth moves locked, as a pickup leaves it.
+    rig.app
+        .world_mut()
+        .resource_mut::<crate::pending_item_ops::PendingItemOps>()
+        .lock(CLOTH);
+    let mut words = slot(0, 0).to_vec();
+    words.extend(slot(1, CLOTH));
+    let moved = rig.packets(vec![self_values(&words)], 2);
+    assert_eq!(
+        pin(&moved, &["TRADE_SKILL_UPDATE"], VERBS),
+        vec![
+            "TRADE_SKILL_UPDATE | tsnum=3 ts2=Heavy Linen Bandage:optimal:2 tsr2=Linen Cloth:5",
+            "TRADE_SKILL_UPDATE | tsnum=3 ts2=Heavy Linen Bandage:optimal:2 tsr2=Linen Cloth:5",
+        ],
+        "one rebuild per moved slot"
+    );
+    // The new slot's rebuild (`0x5d9859`) fires before its unlock (`0x5d9863`) writes the lock.
+    assert_eq!(
+        pin(
+            &moved,
+            &["TRADE_SKILL_UPDATE", "ITEM_LOCK_CHANGED", "BAG_UPDATE"],
+            &["lock02"]
+        ),
+        vec![
+            "TRADE_SKILL_UPDATE | lock02=1",
+            "BAG_UPDATE 0 | lock02=1",
+            "BAG_UPDATE -2 | lock02=1",
+            "BAG_UPDATE -4 | lock02=1",
+            "TRADE_SKILL_UPDATE | lock02=1",
+            "ITEM_LOCK_CHANGED 0 2 | lock02=nil",
+            "BAG_UPDATE 0 | lock02=nil",
+            "BAG_UPDATE -2 | lock02=nil",
+            "BAG_UPDATE -4 | lock02=nil",
+        ]
+    );
+    // The max half's watch rebuilds in place (`0x6cddb7`), reading the new max at the call.
+    let maxed = rig.packets(vec![self_values(&[(SKILL + 1, pair(1, 150))])], 2);
+    assert_eq!(
+        pin(&maxed, &["TRADE_SKILL_UPDATE"], &["tsline"]),
+        vec!["TRADE_SKILL_UPDATE | tsline=First Aid:1:150"]
+    );
+    let removed = rig.packets(
+        vec![SessionEvent::SpellRemoved {
+            spell_id: HEAVY_LINEN_BANDAGE,
+        }],
+        2,
+    );
+    // Our player's removal rebuilds (`0x6e72e6`) before the known list drops the recipe
+    // (`0x6e7361`): the listener's list link (`0x5db060`) still carries the recipe's bit.
+    let at_maxed = pin(&maxed, &["TRADE_SKILL_UPDATE"], &["tslink"]);
+    let link = at_maxed[0].trim_start_matches("TRADE_SKILL_UPDATE | tslink=");
+    assert_eq!(
+        pin(&removed, &["TRADE_SKILL_UPDATE"], &["tsnum", "tslink"]),
+        vec![format!("TRADE_SKILL_UPDATE | tsnum=2 tslink={link}")]
+    );
+    let after = super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.eval::<String>("return (GetTradeSkillListLink():match('Htrade:[^|]*'))")
+    })
+    .expect("a VM")
+    .expect("the read runs");
+    assert_ne!(after, link, "the bit clears once the known list drops it");
+}
+
+/// The other item-driven rebuilds in place, each a step of its handler: the bag slots' watch
+/// after its contents and watched bags (`0x5d9bfe` -> `0x5d9c05`); a watched bag's slot watch,
+/// one per moved slot, before its unlock and `BAG_UPDATE` (`0x5d96bc`, `0x5d96c6`, `0x5d9746`);
+/// an owned item's disable before the bar's item update (`0x70b0c4`, `0x70b0d0`); the visible
+/// entry watch, ours and another player's, before the alert recompute (`0x6e1e9c`, `0x6e1ea4`).
+/// `GetTradeSkillReagentInfo`'s count held reads the bags at each event.
+#[test]
+fn the_trade_skill_list_rebuilds_on_the_bags_a_bag_slot_a_disabled_item_and_a_visible_entry() {
+    use benilla_protocol::field::{
+        FIELD_CONTAINER_NUM_SLOTS, FIELD_CONTAINER_SLOT_1, FIELD_ITEM_CONTAINED, FIELD_ITEM_OWNER,
+        FIELD_ITEM_STACK_COUNT, FIELD_OBJECT_ENTRY, FIELD_PLAYER_INV_SLOT_HEAD,
+        FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_PLAYER_VISIBLE_ITEM_1_ENTRYID as VISIBLE,
+        FIELD_UNIT_BYTES_0,
+    };
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    const HEAVY_LINEN_BANDAGE: u32 = 3276;
+    const LINEN_CLOTH: u32 = 2589;
+    const SACK: u64 = 0x4000_0000_0000_0600;
+    const CLOTH: u64 = 0x4000_0000_0000_0601;
+    const OTHER: u64 = 0x0000_0000_0000_0099;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let guid_pair =
+        |field: u16, guid: u64| [(field, guid as u32), (field + 1, (guid >> 32) as u32)];
+    let template = |entry: u32, name: &str, class: u32, subclass: u32| {
+        let mut t = crate::items::test_template(name);
+        t.class = class;
+        t.subclass = subclass;
+        t.stackable = 20;
+        SessionEvent::ItemTemplate {
+            entry,
+            info: Some(Box::new(t)),
+        }
+    };
+    // A human paladin with First Aid (129) at 1 of 75; the products and the cloth cached.
+    let Some(mut rig) = Rig::login_after(
+        vec![
+            template(1251, "Linen Bandage", 0, 7),
+            template(2581, "Heavy Linen Bandage", 0, 7),
+            template(LINEN_CLOTH, "Linen Cloth", 7, 0),
+            book(&[FIRST_AID, LINEN_BANDAGE, HEAVY_LINEN_BANDAGE]),
+        ],
+        &[
+            OBJECT_TYPE_PLAYER,
+            (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+            (SKILL, 129),
+            (SKILL + 1, pair(1, 75)),
+        ],
+    ) else {
+        return;
+    };
+    const EVENTS: &[&str] = &["TRADE_SKILL_UPDATE", "BAG_UPDATE"];
+    const VERBS: &[&str] = &["tsnum", "tsr2"];
+    let item = |guid: u64, entry: u32, inside: u64, extra: &[(u16, u32)]| {
+        let mut pairs = vec![(FIELD_OBJECT_ENTRY, entry), (FIELD_ITEM_STACK_COUNT, 4)];
+        pairs.extend(guid_pair(FIELD_ITEM_OWNER, ME));
+        pairs.extend(guid_pair(FIELD_ITEM_CONTAINED, inside));
+        pairs.extend_from_slice(extra);
+        let bag = extra.iter().any(|&(f, _)| f == FIELD_CONTAINER_NUM_SLOTS);
+        SessionEvent::ItemCreate {
+            guid,
+            container: bag,
+            fields: ObjectFields::from_pairs(&pairs).into_created(if bag {
+                ObjectType::Container
+            } else {
+                ObjectType::Item
+            }),
+        }
+    };
+    let mut sack = vec![(FIELD_CONTAINER_NUM_SLOTS, 4)];
+    sack.extend(guid_pair(FIELD_CONTAINER_SLOT_1, CLOTH));
+    rig.packets(
+        vec![
+            item(SACK, 4500, ME, &sack),
+            item(CLOTH, LINEN_CLOTH, SACK, &[]),
+        ],
+        2,
+    );
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("CastSpellByName('First Aid')")
+    })
+    .expect("a VM")
+    .expect("the cast runs");
+    rig.run(1);
+    assert_eq!(
+        pin(&rig.take(), &["TRADE_SKILL_SHOW"], VERBS),
+        vec!["TRADE_SKILL_SHOW | tsnum=3 tsr2=Linen Cloth:0"],
+        "the sack is not worn yet"
+    );
+    // The bag slots' watch: the worn sack's cloth counts at its rebuild.
+    let worn = rig.packets(
+        vec![self_values(&guid_pair(
+            FIELD_PLAYER_INV_SLOT_HEAD + 2 * 19,
+            SACK,
+        ))],
+        2,
+    );
+    assert_eq!(
+        pin(&worn, &["TRADE_SKILL_UPDATE"], VERBS),
+        vec!["TRADE_SKILL_UPDATE | tsnum=3 tsr2=Linen Cloth:4"]
+    );
+    // A watched bag's slot watch: one rebuild per moved slot, each before its slot's `BAG_UPDATE`;
+    // the cloth moves locked, and the new slot's rebuild (`0x5d96bc`) fires before its unlock
+    // (`0x5d96c6`) writes the lock.
+    rig.app
+        .world_mut()
+        .resource_mut::<crate::pending_item_ops::PendingItemOps>()
+        .lock(CLOTH);
+    let mut swap = guid_pair(FIELD_CONTAINER_SLOT_1, 0).to_vec();
+    swap.extend(guid_pair(FIELD_CONTAINER_SLOT_1 + 2, CLOTH));
+    let moved = rig.packets(
+        vec![SessionEvent::ObjectValues {
+            guid: SACK,
+            fields: ObjectFields::from_pairs(&swap),
+        }],
+        2,
+    );
+    assert_eq!(
+        pin(&moved, EVENTS, VERBS),
+        vec![
+            "TRADE_SKILL_UPDATE | tsnum=3 tsr2=Linen Cloth:4",
+            "BAG_UPDATE 1 | tsnum=3 tsr2=Linen Cloth:4",
+            "TRADE_SKILL_UPDATE | tsnum=3 tsr2=Linen Cloth:4",
+            "BAG_UPDATE 1 | tsnum=3 tsr2=Linen Cloth:4",
+        ]
+    );
+    assert_eq!(
+        pin(
+            &moved,
+            &["TRADE_SKILL_UPDATE", "ITEM_LOCK_CHANGED", "BAG_UPDATE"],
+            &["lock12"]
+        ),
+        vec![
+            "TRADE_SKILL_UPDATE | lock12=1",
+            "BAG_UPDATE 1 | lock12=1",
+            "TRADE_SKILL_UPDATE | lock12=1",
+            "ITEM_LOCK_CHANGED 1 2 | lock12=nil",
+            "BAG_UPDATE 1 | lock12=nil",
+        ]
+    );
+    // An owned item's disable on its destroy.
+    let gone = rig.packets(vec![SessionEvent::ObjectDestroyed(CLOTH)], 2);
+    assert_eq!(
+        pin(&gone, &["TRADE_SKILL_UPDATE"], VERBS),
+        vec!["TRADE_SKILL_UPDATE | tsnum=3 tsr2=Linen Cloth:0"]
+    );
+    // Our visible entry watch, then another player's.
+    let shown = rig.packets(vec![self_values(&[(VISIBLE + 2 * 15, 1251)])], 2);
+    assert_eq!(
+        pin(&shown, &["TRADE_SKILL_UPDATE"], VERBS),
+        vec!["TRADE_SKILL_UPDATE | tsnum=3 tsr2=Linen Cloth:0"]
+    );
+    rig.packets(vec![player_create(OTHER)], 2);
+    let theirs = rig.packets(
+        vec![SessionEvent::ObjectValues {
+            guid: OTHER,
+            fields: ObjectFields::from_pairs(&[(VISIBLE + 2 * 4, 1251)]),
+        }],
+        2,
+    );
+    assert_eq!(
+        pin(&theirs, &["TRADE_SKILL_UPDATE"], VERBS),
+        vec!["TRADE_SKILL_UPDATE | tsnum=3 tsr2=Linen Cloth:0"]
+    );
+}
+
+/// The UI shutdown closes the crafting list (`0x528f96` -> `0x5da5a0`) on a reload's root
+/// (`0x52b03e`): a waiting repeat stops with `UPDATE_TRADESKILL_RECAST` (`0x5da5d1`), then
+/// `TRADE_SKILL_CLOSE` (`0x5da5df`), both ahead of `PLAYER_LEAVING_WORLD` and `PLAYER_LOGOUT`;
+/// the reloaded UI's opener press then opens the line again (`0x5de2e5`).
+#[test]
+fn a_reload_closes_the_trade_skill_list_and_the_opener_opens_it_again() {
+    use benilla_protocol::field::{FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_UNIT_BYTES_0};
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let mut t = crate::items::test_template("Linen Bandage");
+    t.subclass = 7;
+    let Some(mut rig) = Rig::login_after(
+        vec![
+            SessionEvent::ItemTemplate {
+                entry: 1251,
+                info: Some(Box::new(t)),
+            },
+            book(&[FIRST_AID, LINEN_BANDAGE]),
+        ],
+        &[
+            OBJECT_TYPE_PLAYER,
+            (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+            (SKILL, 129),
+            (SKILL + 1, pair(1, 75)),
+        ],
+    ) else {
+        return;
+    };
+    let open = |rig: &mut Rig| {
+        super::live::with_live_world(rig.app.world_mut(), |s| {
+            s.run("CastSpellByName('First Aid')")
+        })
+        .expect("a VM")
+        .expect("the cast runs");
+        rig.run(1);
+        fired(&rig.take(), &["TRADE_SKILL_SHOW", "TRADE_SKILL_CLOSE"])
+    };
+    rig.take();
+    assert_eq!(open(&mut rig), ["TRADE_SKILL_SHOW"]);
+    // A repeat of two waiting for its cast start (`0x5d9fa0`).
+    rig.app
+        .world_mut()
+        .resource_mut::<crate::ui_tradeskill::TradeSkillOpen>()
+        .list
+        .set_recast(LINEN_BANDAGE, 2);
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run(
+            "RegisterCVar('charzTsShutdown', '') \
+             local f = CreateFrame('Frame') \
+             for _, e in ipairs({ 'UPDATE_TRADESKILL_RECAST', 'TRADE_SKILL_CLOSE', \
+               'PLAYER_LEAVING_WORLD', 'PLAYER_LOGOUT' }) do f:RegisterEvent(e) end \
+             f:SetScript('OnEvent', function(_, e) \
+               SetCVar('charzTsShutdown', GetCVar('charzTsShutdown') .. e .. ',') end)",
+        )
+    })
+    .expect("a VM")
+    .unwrap();
+    rig.app
+        .world()
+        .non_send_resource::<benilla_ui::script::UiScript>()
+        .run("ReloadUI()")
+        .unwrap();
+    rig.run(4);
+    let order = rig
+        .app
+        .world()
+        .resource::<crate::cvars::Cvars>()
+        .get("charzTsShutdown")
+        .unwrap_or_default();
+    assert_eq!(
+        order,
+        "UPDATE_TRADESKILL_RECAST,TRADE_SKILL_CLOSE,TRADE_SKILL_CLOSE,PLAYER_LEAVING_WORLD,PLAYER_LOGOUT,",
+        "the stock hide's CloseTradeSkill signals again (`0x5da8ef`)"
+    );
+    let list = &rig
+        .app
+        .world()
+        .resource::<crate::ui_tradeskill::TradeSkillOpen>()
+        .list;
+    assert_eq!((list.line, list.opener), (0, 0));
+    rig.take();
+    assert_eq!(
+        open(&mut rig),
+        ["TRADE_SKILL_SHOW"],
+        "the opener opens, not closes"
+    );
+}
+
+/// A logout runs the UI shutdown before the game shutdown (`0x529163` -> `0x528f00`, then
+/// `0x5291a4` -> `0x5dcaf0`): the close stops a waiting repeat with `UPDATE_TRADESKILL_RECAST`
+/// (`0x5da5d1`), then `TRADE_SKILL_CLOSE` (`0x5da5df`), and every listener up to `PLAYER_LOGOUT`
+/// (`0x52902a`) reads the list whole; the reset empties it after.
+#[test]
+fn a_logout_closes_the_trade_skill_list_before_the_game_shutdown_resets_it() {
+    use benilla_protocol::field::{FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_UNIT_BYTES_0};
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let mut t = crate::items::test_template("Linen Bandage");
+    t.subclass = 7;
+    let Some(mut rig) = Rig::login_after(
+        vec![
+            SessionEvent::ItemTemplate {
+                entry: 1251,
+                info: Some(Box::new(t)),
+            },
+            book(&[FIRST_AID, LINEN_BANDAGE]),
+        ],
+        &[
+            OBJECT_TYPE_PLAYER,
+            (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+            (SKILL, 129),
+            (SKILL + 1, pair(1, 75)),
+        ],
+    ) else {
+        return;
+    };
+    rig.take();
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("CastSpellByName('First Aid')")
+    })
+    .expect("a VM")
+    .expect("the cast runs");
+    rig.run(1);
+    assert_eq!(
+        fired(&rig.take(), &["TRADE_SKILL_SHOW"]),
+        ["TRADE_SKILL_SHOW"]
+    );
+    // A repeat of two waiting for its cast start (`0x5d9fa0`).
+    rig.app
+        .world_mut()
+        .resource_mut::<crate::ui_tradeskill::TradeSkillOpen>()
+        .list
+        .set_recast(LINEN_BANDAGE, 2);
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run(concat!(
+            "RegisterCVar('charzTsLogout', '') local f = CreateFrame('Frame') ",
+            "for _, e in ipairs({ 'UPDATE_TRADESKILL_RECAST', 'TRADE_SKILL_CLOSE', ",
+            "'PLAYER_LEAVING_WORLD', 'PLAYER_LOGOUT' }) do f:RegisterEvent(e) end ",
+            "f:SetScript('OnEvent', function(_, e) SetCVar('charzTsLogout', ",
+            "GetCVar('charzTsLogout') .. e .. ':' .. GetNumTradeSkills() .. ',') end)",
+        ))
+    })
+    .expect("a VM")
+    .unwrap();
+    rig.app
+        .world_mut()
+        .resource_mut::<NextState<crate::char_select::ClientState>>()
+        .set(crate::char_select::ClientState::CharSelect);
+    rig.run(2);
+    let order = rig
+        .app
+        .world()
+        .resource::<crate::cvars::Cvars>()
+        .get("charzTsLogout")
+        .unwrap_or_default();
+    assert_eq!(
+        order,
+        "UPDATE_TRADESKILL_RECAST:2,TRADE_SKILL_CLOSE:2,TRADE_SKILL_CLOSE:2,PLAYER_LEAVING_WORLD:2,PLAYER_LOGOUT:2,",
+        "the stock hide's CloseTradeSkill signals again (`0x5da8ef`)"
+    );
+    let list = &rig
+        .app
+        .world()
+        .resource::<crate::ui_tradeskill::TradeSkillOpen>()
+        .list;
+    assert_eq!((list.line, list.opener, list.filtered()), (0, 0, 0));
+}
+
+/// The rebuild finds the open line's recipes in our player's per-line array (`0x5dd7ac` ->
+/// `0x6e73b0`): a line no recipe was ever added to has none, so the rebuild exits with nothing
+/// filed and no `TRADE_SKILL_UPDATE` (`0x5dd7b6`), and the open no `TRADE_SKILL_SHOW` (`0x5de2d1`);
+/// the first recipe learned makes the array (`0x6e7c07`) and rebuilds (`0x6e7c1a`); its removal
+/// leaves the emptied array (`0x6e72df`), whose rebuild still fires (`0x6e72e6`).
+#[test]
+fn the_trade_skill_list_rebuilds_a_line_only_once_it_has_held_a_recipe() {
+    use benilla_protocol::field::{FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_UNIT_BYTES_0};
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let mut t = crate::items::test_template("Linen Bandage");
+    t.subclass = 7;
+    let Some(mut rig) = Rig::login_after(
+        vec![
+            SessionEvent::ItemTemplate {
+                entry: 1251,
+                info: Some(Box::new(t)),
+            },
+            book(&[FIRST_AID]),
+        ],
+        &[
+            OBJECT_TYPE_PLAYER,
+            (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+            (SKILL, 129),
+            (SKILL + 1, pair(1, 75)),
+        ],
+    ) else {
+        return;
+    };
+    const EVENTS: &[&str] = &["TRADE_SKILL_UPDATE", "TRADE_SKILL_SHOW"];
+    rig.take();
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("CastSpellByName('First Aid')")
+    })
+    .expect("a VM")
+    .expect("the cast runs");
+    rig.run(1);
+    assert_eq!(fired(&rig.take(), EVENTS), Vec::<String>::new());
+    let learned = rig.packets(
+        vec![SessionEvent::SpellLearned {
+            spell_id: LINEN_BANDAGE,
+        }],
+        2,
+    );
+    assert_eq!(
+        pin(&learned, EVENTS, &["tsnum"]),
+        vec!["TRADE_SKILL_UPDATE | tsnum=2"]
+    );
+    let removed = rig.packets(
+        vec![SessionEvent::SpellRemoved {
+            spell_id: LINEN_BANDAGE,
+        }],
+        2,
+    );
+    assert_eq!(
+        pin(&removed, EVENTS, &["tsnum"]),
+        vec!["TRADE_SKILL_UPDATE | tsnum=0"]
+    );
+}
+
+/// The open keeps its line as the last only after the rebuild returns (`0x5de2c3`, then
+/// `0x5de2c8`, `0x5de2d7`): a `TRADE_SKILL_UPDATE` listener that closes the list inside the open
+/// leaves the last line 0, so the next open of the line resets its filters (`0x5de269`).
+#[test]
+fn a_close_inside_the_opens_update_leaves_no_last_line() {
+    use benilla_protocol::field::{FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_UNIT_BYTES_0};
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let mut t = crate::items::test_template("Linen Bandage");
+    t.subclass = 7;
+    let Some(mut rig) = Rig::login_after(
+        vec![
+            SessionEvent::ItemTemplate {
+                entry: 1251,
+                info: Some(Box::new(t)),
+            },
+            book(&[FIRST_AID, LINEN_BANDAGE]),
+        ],
+        &[
+            OBJECT_TYPE_PLAYER,
+            (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+            (SKILL, 129),
+            (SKILL + 1, pair(1, 75)),
+        ],
+    ) else {
+        return;
+    };
+    let run = |rig: &mut Rig, lua: &str| {
+        super::live::with_live_world(rig.app.world_mut(), |s| s.run(lua))
+            .expect("a VM")
+            .expect("the chunk runs");
+        rig.run(1);
+    };
+    let levels = |rig: &mut Rig| {
+        run(
+            rig,
+            "local lo, hi = GetTradeSkillItemLevelFilter() \
+             SetCVar('charzTsLevels', tostring(lo) .. '-' .. tostring(hi))",
+        );
+        rig.app
+            .world()
+            .resource::<crate::cvars::Cvars>()
+            .get("charzTsLevels")
+            .unwrap_or_default()
+            .to_string()
+    };
+    run(
+        &mut rig,
+        "RegisterCVar('charzTsLevels', '') charzTsCloseOnce = false \
+         local f = CreateFrame('Frame') f:RegisterEvent('TRADE_SKILL_UPDATE') \
+         f:SetScript('OnEvent', function() \
+           if charzTsCloseOnce then charzTsCloseOnce = false CloseTradeSkill() end end)",
+    );
+    rig.take();
+    run(&mut rig, "CastSpellByName('First Aid')");
+    run(&mut rig, "SetTradeSkillItemLevelFilter(5, 10)");
+    assert_eq!(levels(&mut rig), "5-10");
+    // The opener again closes it; the last line stays First Aid.
+    run(&mut rig, "CastSpellByName('First Aid')");
+    // The same line again keeps the filters; the listener closes inside its rebuild.
+    run(
+        &mut rig,
+        "charzTsCloseOnce = true CastSpellByName('First Aid')",
+    );
+    assert_eq!(levels(&mut rig), "5-10");
+    let list = &rig
+        .app
+        .world()
+        .resource::<crate::ui_tradeskill::TradeSkillOpen>()
+        .list;
+    assert_eq!((list.line, list.opener), (0, 0));
+    run(&mut rig, "CastSpellByName('First Aid')");
+    assert_eq!(
+        levels(&mut rig),
+        "0-0",
+        "the close inside the update left no last line, so the line switch resets"
+    );
+}
+
+/// Our object's init adds each buffered spell in turn (`0x6e7fb0`-`0x6e7fd3` -> `0x6e7fc5`), each
+/// recipe's whole rebuild signalling inside its add (`0x6e7c1a` -> `0x5de0d5`), before the next
+/// recipe joins and before the book update (`0x6e7fdb`): with the line open across a re-create,
+/// each `TRADE_SKILL_UPDATE` reads the list as of its add, ahead of `SPELLS_CHANGED`.
+#[test]
+fn our_objects_init_rebuilds_the_open_line_at_each_recipe_it_adds() {
+    use benilla_protocol::field::{FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_UNIT_BYTES_0};
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    const HEAVY_LINEN_BANDAGE: u32 = 3276;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let bandage = |entry: u32, name: &str| {
+        let mut t = crate::items::test_template(name);
+        t.class = 0;
+        t.subclass = 7;
+        SessionEvent::ItemTemplate {
+            entry,
+            info: Some(Box::new(t)),
+        }
+    };
+    let fields = [
+        OBJECT_TYPE_PLAYER,
+        (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+        (SKILL, 129),
+        (SKILL + 1, pair(1, 75)),
+    ];
+    let Some(mut rig) = Rig::login_after(
+        vec![
+            bandage(1251, "Linen Bandage"),
+            bandage(2581, "Heavy Linen Bandage"),
+            book(&[FIRST_AID, LINEN_BANDAGE, HEAVY_LINEN_BANDAGE]),
+        ],
+        &fields,
+    ) else {
+        return;
+    };
+    rig.take();
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("CastSpellByName('First Aid')")
+    })
+    .expect("a VM")
+    .expect("the cast runs");
+    rig.run(1);
+    assert_eq!(
+        fired(&rig.take(), &["TRADE_SKILL_SHOW"]),
+        ["TRADE_SKILL_SHOW"]
+    );
+    let seen = rig.packets(
+        vec![SessionEvent::ObjectDestroyed(ME), self_create(&fields)],
+        3,
+    );
+    assert_eq!(
+        pin(&seen, &["TRADE_SKILL_UPDATE", "SPELLS_CHANGED"], &["tsnum"]),
+        vec![
+            "TRADE_SKILL_UPDATE | tsnum=2",
+            "TRADE_SKILL_UPDATE | tsnum=3",
+            "SPELLS_CHANGED | tsnum=3",
+        ]
+    );
+}
+
+/// A worldport with the line open purges our player and creates it afresh; its init finds us by
+/// the active player's guid (`0x5dd656` -> `0x4d3790`, `0x5dd669` -> `0x4d4db0`) and files each
+/// recipe by our race and class (`0x6e7b90`), so each add rebuilds the open line, which the engine
+/// leaves open: only the UI shutdown and the same opener close it (`0x528f96`, `0x5de1eb`).
+#[test]
+fn a_worldport_with_the_line_open_rebuilds_it_at_each_recipe_our_init_adds() {
+    use benilla_protocol::field::{FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_UNIT_BYTES_0};
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    const HEAVY_LINEN_BANDAGE: u32 = 3276;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let bandage = |entry: u32, name: &str| {
+        let mut t = crate::items::test_template(name);
+        t.class = 0;
+        t.subclass = 7;
+        SessionEvent::ItemTemplate {
+            entry,
+            info: Some(Box::new(t)),
+        }
+    };
+    let fields = [
+        OBJECT_TYPE_PLAYER,
+        (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+        (SKILL, 129),
+        (SKILL + 1, pair(1, 75)),
+    ];
+    let known = [FIRST_AID, LINEN_BANDAGE, HEAVY_LINEN_BANDAGE];
+    let Some(mut rig) = Rig::login_after(
+        vec![
+            bandage(1251, "Linen Bandage"),
+            bandage(2581, "Heavy Linen Bandage"),
+            book(&known),
+        ],
+        &fields,
+    ) else {
+        return;
+    };
+    rig.take();
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("CastSpellByName('First Aid')")
+    })
+    .expect("a VM")
+    .expect("the cast runs");
+    rig.run(1);
+    assert_eq!(
+        fired(&rig.take(), &["TRADE_SKILL_SHOW"]),
+        ["TRADE_SKILL_SHOW"]
+    );
+    rig.packets(
+        vec![SessionEvent::Worldport {
+            map_id: 0,
+            position: [-8949.95, -132.493, 83.5312],
+            orientation: 0.0,
+            needs_ack: true,
+        }],
+        3,
+    );
+    // The server sends the book again ahead of our create, as after a port's ack.
+    let seen = rig.packets(vec![book(&known), self_create(&fields)], 4);
+    assert_eq!(
+        pin(&seen, &["TRADE_SKILL_UPDATE", "SPELLS_CHANGED"], &["tsnum"]),
+        vec![
+            "TRADE_SKILL_UPDATE | tsnum=2",
+            "TRADE_SKILL_UPDATE | tsnum=3",
+            "SPELLS_CHANGED | tsnum=3",
+        ]
+    );
+}
+
+/// The opener's line and the rebuild read our name record without an ask (`0x5da61d`, `0x5dd696`):
+/// with our own record invalidated, the open finds no line and exits before it writes anything
+/// (`0x5de13f`), so the line stays unknown and nothing fires; once the record is back the same
+/// opener opens the list, rebuilt and shown.
+#[test]
+fn the_open_rebuilds_nothing_while_our_name_record_is_missing() {
+    use benilla_protocol::field::{FIELD_PLAYER_SKILL_INFO_1_1 as SKILL, FIELD_UNIT_BYTES_0};
+    const FIRST_AID: u32 = 3273;
+    const LINEN_BANDAGE: u32 = 3275;
+    let pair = |lo: u32, hi: u32| lo | hi << 16;
+    let mut t = crate::items::test_template("Linen Bandage");
+    t.class = 0;
+    t.subclass = 7;
+    // A human paladin with First Aid (129) at 1 of 75 and Linen Bandage known; its record cached.
+    let Some(mut rig) = Rig::login_after(
+        vec![
+            SessionEvent::ItemTemplate {
+                entry: 1251,
+                info: Some(Box::new(t)),
+            },
+            book(&[FIRST_AID, LINEN_BANDAGE]),
+        ],
+        &[
+            OBJECT_TYPE_PLAYER,
+            (FIELD_UNIT_BYTES_0, 1 | 2 << 8 | 1 << 24),
+            (SKILL, 129),
+            (SKILL + 1, pair(1, 75)),
+        ],
+    ) else {
+        return;
+    };
+    rig.packets(vec![SessionEvent::InvalidatePlayer { guid: ME }], 1);
+    rig.take();
+    let open = |rig: &mut Rig| {
+        super::live::with_live_world(rig.app.world_mut(), |s| {
+            s.run("CastSpellByName('First Aid')")
+        })
+        .expect("a VM")
+        .expect("the cast runs");
+        rig.run(1);
+        pin(
+            &rig.take(),
+            &["TRADE_SKILL_UPDATE", "TRADE_SKILL_SHOW"],
+            &["tsnum"],
+        )
+    };
+    assert_eq!(open(&mut rig), Vec::<String>::new());
+    // No line was switched to: `GetTradeSkillLine` answers the unknown line (`0x5db810`).
+    assert_eq!(
+        super::live::with_live_world(rig.app.world_mut(), |s| s.eval::<String>(
+            "local n, r, m = GetTradeSkillLine() return n .. ',' .. r .. ',' .. m .. ',' .. GetNumTradeSkills()"
+        ))
+        .expect("a VM")
+        .expect("the line"),
+        "UNKNOWN,0,0,0"
+    );
+    rig.app
+        .world_mut()
+        .resource_mut::<crate::names::NameCache>()
+        .insert_player(ME, "Benilla".into(), None);
+    rig.take();
+    // The first show loads the stock frame, whose dropdowns' OnLoads set two filters, each rebuilding.
+    assert_eq!(
+        open(&mut rig),
+        vec![
+            "TRADE_SKILL_UPDATE | tsnum=2",
+            "TRADE_SKILL_UPDATE | tsnum=2",
+            "TRADE_SKILL_UPDATE | tsnum=2",
+            "TRADE_SKILL_SHOW | tsnum=2",
+        ]
+    );
+    // The links read the line through the same record at the call (`0x5db9c8`, `0x5db0df`): with
+    // it gone the recipe link drops its line prefix (`0x5dba01`), and the list link and the
+    // opener's trade link are nil (`0x5db0eb`).
+    let links = |rig: &mut Rig| {
+        super::live::with_live_world(rig.app.world_mut(), |s| {
+            s.eval::<String>(concat!(
+                "local i = GetFirstTradeSkill() return GetTradeSkillRecipeLink(i) .. ',' ",
+                ".. tostring(GetTradeSkillListLink() ~= nil) .. ',' ",
+                ".. tostring(select(2, GetSpellLink(3273)) ~= nil)",
+            ))
+        })
+        .expect("a VM")
+        .expect("the links")
+    };
+    assert_eq!(
+        links(&mut rig),
+        "|cffffd000|Henchant:3275|h[First Aid: Linen Bandage]|h|r,true,true"
+    );
+    rig.packets(vec![SessionEvent::InvalidatePlayer { guid: ME }], 1);
+    assert_eq!(
+        links(&mut rig),
+        "|cffffd000|Henchant:3275|h[Linen Bandage]|h|r,false,false"
+    );
+}
+
 /// Two minor glyphs off the install, by `GlyphProperties.dbc` id, and the first one's spell.
 fn two_minor_glyphs() -> (u32, u32, u32) {
     let data = benilla_formats::wow_data().expect("install");
@@ -11500,4 +13117,712 @@ fn remove_glyph_from_socket_sends_inside_the_call() {
         "socket 2 alone, sent before the chunk returned"
     );
     assert_eq!(left, i64::from(spell), "the glyph waits for the server");
+}
+
+// ── Chat channels: the records read live, the list's update and the roster's names (#1283) ──────
+
+/// `SMSG_CHANNEL_NOTIFY` for `channel`.
+fn channel_notice(
+    notice: u8,
+    channel: &str,
+    tail: benilla_protocol::messages::ChannelNoticeTail,
+) -> SessionEvent {
+    SessionEvent::ChannelNotify {
+        notice,
+        channel: channel.into(),
+        tail,
+    }
+}
+
+/// Our `YOU_JOINED` and `YOU_LEFT` for `channel`.
+/// The join verb ahead of its confirm: 12340 claims the record at the join (`0x507c47`), and a
+/// `YOU_JOINED` with no record writes nothing (`0x5078a4`).
+fn join_charz(rig: &mut Rig) {
+    if !rig
+        .app
+        .world()
+        .contains_resource::<crate::net::NetCommands>()
+    {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        rig.app.insert_resource(crate::net::NetCommands(tx));
+    }
+    super::live::with_live_world(rig.app.world_mut(), |s| s.run("JoinChannelByName('Charz')"))
+        .expect("a VM")
+        .unwrap();
+}
+
+fn joined_notice(channel: &str) -> SessionEvent {
+    use benilla_protocol::messages::{channel_notice, ChannelNoticeTail};
+    channel_notice(
+        channel_notice::YOU_JOINED,
+        channel,
+        ChannelNoticeTail::YouJoined {
+            flags: 0,
+            instance: 0,
+            text: None,
+        },
+    )
+}
+
+fn left_notice(channel: &str) -> SessionEvent {
+    use benilla_protocol::messages::{channel_notice, ChannelNoticeTail};
+    channel_notice(
+        channel_notice::YOU_LEFT,
+        channel,
+        ChannelNoticeTail::YouLeft { constant: false },
+    )
+}
+
+/// The channel events and the auction marker (`|`), with the channel verbs' answers at each.
+fn channel_order(seen: &[Seen]) -> Vec<String> {
+    seen.iter()
+        .filter_map(|s| match s.event.as_str() {
+            "CHANNEL_UI_UPDATE" | "CHANNEL_COUNT_UPDATE" | "CHANNEL_ROSTER_UPDATE" => {
+                Some(s.line(&["chan1", "chanl", "roster1"]))
+            }
+            "CHAT_MSG_CHANNEL_NOTICE" => Some(format!(
+                "{} {} | {}",
+                s.event,
+                s.args.split(' ').next().unwrap_or_default(),
+                s.line(&["chan1", "chanl"])
+                    .split(" | ")
+                    .nth(1)
+                    .unwrap_or_default()
+            )),
+            "AUCTION_HOUSE_DISABLED" => Some("|".to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The join's confirm relists in its handler before the notice line (`0x507880` -> `0x505d40`);
+/// the leave marks the record left and relists before its line (`0x507900`: `0x50792c`,
+/// `0x507a18`), then drops it and relists again after (`0x50eaa5` -> `0x507a30`, `0x507a78`), and
+/// `GetChannelName` and `GetChannelList` read the records at each event (`0xbcf094`): a left record
+/// answers neither from the first relist on. Each fires between the packets around it.
+#[test]
+fn a_join_and_a_leave_relist_in_their_handlers_and_read_the_records_live() {
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    join_charz(&mut rig);
+    let seen = rig.packets(
+        vec![
+            closed_house(),
+            joined_notice("Charz"),
+            closed_house(),
+            left_notice("Charz"),
+            closed_house(),
+        ],
+        1,
+    );
+    assert_eq!(
+        channel_order(&seen),
+        [
+            "|",
+            "CHANNEL_UI_UPDATE | chan1=Charz chanl=1,Charz roster1=nil",
+            "CHAT_MSG_CHANNEL_NOTICE YOU_JOINED | chan1=Charz chanl=1,Charz",
+            "|",
+            "CHANNEL_UI_UPDATE | chan1=nil chanl= roster1=nil",
+            "CHAT_MSG_CHANNEL_NOTICE YOU_LEFT | chan1=nil chanl=",
+            "CHANNEL_UI_UPDATE | chan1=nil chanl= roster1=nil",
+            "|",
+        ]
+    );
+}
+
+/// The channel records outlive the UI shutdown's `PLAYER_LEAVING_WORLD` (`0x528edc`) and
+/// `PLAYER_LOGOUT`: the game shutdown runs the UI's (`0x529163` -> `0x528f00`) before the chat's
+/// (`0x529172` -> `0x5072b0`), so a logout handler still reads the joined channel.
+#[test]
+fn the_channels_answer_at_the_logout_events() {
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    join_charz(&mut rig);
+    rig.packets(vec![joined_notice("Charz")], 1);
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run(
+            "RegisterCVar('charzChanLeaving', '-') RegisterCVar('charzChanLogout', '-') \
+             local f = CreateFrame('Frame') \
+             f:RegisterEvent('PLAYER_LEAVING_WORLD') f:RegisterEvent('PLAYER_LOGOUT') \
+             f:SetScript('OnEvent', function(_, e) \
+               local n = GetChannelName('Charz') \
+               SetCVar(e == 'PLAYER_LOGOUT' and 'charzChanLogout' or 'charzChanLeaving', \
+                 n .. ':' .. table.concat({ GetChannelList() }, ',')) end)",
+        )
+    })
+    .expect("a VM")
+    .unwrap();
+    rig.app
+        .world_mut()
+        .resource_mut::<NextState<crate::char_select::ClientState>>()
+        .set(crate::char_select::ClientState::CharSelect);
+    rig.run(2);
+    let cvars = rig.app.world().resource::<crate::cvars::Cvars>();
+    assert_eq!(cvars.get("charzChanLeaving"), Some("1:1,Charz"));
+    assert_eq!(cvars.get("charzChanLogout"), Some("1:1,Charz"));
+}
+
+/// A reload reads the records where they live: the fresh files' `GetChannelName` answers the joined
+/// channel from `PLAYER_LOGIN` on, and nothing relists, as 12340's UI load fires no
+/// `CHANNEL_UI_UPDATE`.
+#[test]
+fn a_reload_reads_the_joined_channels_with_no_relist() {
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    join_charz(&mut rig);
+    rig.packets(vec![joined_notice("Charz")], 1);
+    super::live::with_live_world(rig.app.world_mut(), |s| s.run("ReloadUI()"))
+        .expect("a VM")
+        .unwrap();
+    rig.run(4);
+    let seen = rig.take();
+    assert_eq!(
+        pin(
+            &seen,
+            &["PLAYER_LOGIN", "CHANNEL_UI_UPDATE"],
+            &["chan1", "chann"]
+        ),
+        ["PLAYER_LOGIN | chan1=Charz chann=2"]
+    );
+}
+
+/// The selected channel's display list (`0x503990`) waits on a member's name; the name answer's
+/// callback (`0x4ffe30`) fires the count and the roster in the answer's handler, with the roster
+/// reading the name, in whichever order the two packets come. A name cached before the list fires
+/// them in the list's handler.
+#[test]
+fn the_roster_fires_at_its_last_name_in_either_packet_order() {
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    let (tx, rx) = crossbeam_channel::unbounded();
+    rig.app.insert_resource(crate::net::NetCommands(tx));
+    join_charz(&mut rig);
+    rig.packets(vec![joined_notice("Charz")], 1);
+    // The custom header's one entry: group header, world header, custom header, Charz.
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("GetNumDisplayChannels() SetSelectedDisplayChannel(4) CHARZ_CHAN = 4")
+    })
+    .expect("a VM")
+    .unwrap();
+    const ANN: u64 = 0x41;
+    const BOB: u64 = 0x42;
+    let list = |guid| SessionEvent::ChannelList {
+        display: true,
+        channel: "Charz".into(),
+        flags: 0,
+        members: vec![(guid, 0)],
+    };
+    let seen = rig.packets(
+        vec![
+            list(ANN),
+            closed_house(),
+            name_answer(ANN, "Ann"),
+            closed_house(),
+        ],
+        1,
+    );
+    assert_eq!(
+        channel_order(&seen),
+        [
+            "|",
+            "CHANNEL_COUNT_UPDATE 4 1 | chan1=Charz chanl=1,Charz roster1=Ann",
+            "CHANNEL_ROSTER_UPDATE 4 1 | chan1=Charz chanl=1,Charz roster1=Ann",
+            "|",
+        ],
+        "the list waits; the answer's handler fires the roster"
+    );
+    assert!(
+        rx.try_iter()
+            .any(|c| matches!(c, crate::net::ClientCommand::NameQuery { guid: ANN })),
+        "the list asks the uncached name"
+    );
+    let seen = rig.packets(
+        vec![
+            name_answer(BOB, "Bob"),
+            closed_house(),
+            list(BOB),
+            closed_house(),
+        ],
+        1,
+    );
+    assert_eq!(
+        channel_order(&seen),
+        [
+            "|",
+            "CHANNEL_COUNT_UPDATE 4 1 | chan1=Charz chanl=1,Charz roster1=Bob",
+            "CHANNEL_ROSTER_UPDATE 4 1 | chan1=Charz chanl=1,Charz roster1=Bob",
+            "|",
+        ],
+        "a cached name: the list's own handler fires the roster"
+    );
+}
+
+/// The roster's name callback (`0x4ffe30`) joins the chat module's callbacks on the record in the
+/// order they were registered (`0x67d880` appends, `0x680d03`-`0x680d2c` runs): an uncached
+/// speaker's line asked first adds before the roster fires, and a display list asked first fires
+/// the roster before the line, at the one name answer.
+#[test]
+fn the_roster_and_a_held_line_run_in_registration_order() {
+    const EVENTS: &[&str] = &[
+        "CHAT_MSG_SAY",
+        "CHANNEL_COUNT_UPDATE",
+        "CHANNEL_ROSTER_UPDATE",
+    ];
+    let Some(mut rig) = Rig::login(&[OBJECT_TYPE_PLAYER]) else {
+        return;
+    };
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    rig.app.insert_resource(crate::net::NetCommands(tx));
+    join_charz(&mut rig);
+    rig.packets(vec![joined_notice("Charz")], 1);
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("GetNumDisplayChannels() SetSelectedDisplayChannel(4)")
+    })
+    .expect("a VM")
+    .unwrap();
+    let list = |guid| SessionEvent::ChannelList {
+        display: true,
+        channel: "Charz".into(),
+        flags: 0,
+        members: vec![(guid, 0)],
+    };
+    for (line_first, guid, name) in [(true, 0x61, "Ann"), (false, 0x62, "Bob")] {
+        let asks = if line_first {
+            vec![say_from(guid, "hi"), list(guid)]
+        } else {
+            vec![list(guid), say_from(guid, "hi")]
+        };
+        let seen = rig.packets(asks, 2);
+        assert!(
+            fired(&seen, EVENTS).is_empty(),
+            "{:?}",
+            fired(&seen, EVENTS)
+        );
+        let seen = rig.packets(vec![name_answer(guid, name)], 2);
+        let expected: &[&str] = if line_first {
+            &[
+                "CHAT_MSG_SAY",
+                "CHANNEL_COUNT_UPDATE",
+                "CHANNEL_ROSTER_UPDATE",
+            ]
+        } else {
+            &[
+                "CHANNEL_COUNT_UPDATE",
+                "CHANNEL_ROSTER_UPDATE",
+                "CHAT_MSG_SAY",
+            ]
+        };
+        assert_eq!(
+            fired(&seen, EVENTS),
+            expected,
+            "line registered first: {line_first}"
+        );
+    }
+}
+
+/// The confirmed join writes the notice's flags byte into the record (`0x5078e1`, `0x5078eb`), so a
+/// display list carrying the same flags finds them equal at `0x503a62` and fires nothing; one with
+/// other flags fires `CHANNEL_FLAGS_UPDATED`.
+#[test]
+fn the_join_writes_its_flags_and_an_equal_display_list_fires_nothing() {
+    use benilla_protocol::messages::{channel_notice, ChannelNoticeTail};
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    rig.app.insert_resource(crate::net::NetCommands(tx));
+    join_charz(&mut rig);
+    rig.packets(
+        vec![channel_notice(
+            channel_notice::YOU_JOINED,
+            "Charz",
+            ChannelNoticeTail::YouJoined {
+                flags: 0x18,
+                instance: 0,
+                text: None,
+            },
+        )],
+        1,
+    );
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("GetNumDisplayChannels() SetSelectedDisplayChannel(4)")
+    })
+    .expect("a VM")
+    .unwrap();
+    let list = |flags| SessionEvent::ChannelList {
+        display: true,
+        channel: "Charz".into(),
+        flags,
+        members: Vec::new(),
+    };
+    let seen = rig.packets(vec![list(0x18)], 1);
+    assert!(
+        fired(&seen, &["CHANNEL_FLAGS_UPDATED"]).is_empty(),
+        "the join's flags are the record's"
+    );
+    let seen = rig.packets(vec![list(0x1a)], 1);
+    assert_eq!(
+        fired(&seen, &["CHANNEL_FLAGS_UPDATED"]),
+        ["CHANNEL_FLAGS_UPDATED"]
+    );
+}
+
+/// The voice notices write the record's flags byte ahead of their line and rebuild after it
+/// (`0x50e9b0`, `0x50ea4d`, `0x50e9f2`; `0x50eaf3` -> `0x504840`): `VOICE_ON` fires its line then
+/// `CHANNEL_UI_UPDATE`, `VOICE_ENABLED` only the rebuild, and a display list then compares against
+/// the written byte (`0x503a62`). A notice for a channel with no record writes and rebuilds nothing.
+#[test]
+fn the_voice_notices_write_the_record_and_rebuild_after_the_line() {
+    use benilla_protocol::messages::{channel_notice, ChannelNoticeTail};
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    rig.app.insert_resource(crate::net::NetCommands(tx));
+    join_charz(&mut rig);
+    rig.packets(
+        vec![channel_notice(
+            channel_notice::YOU_JOINED,
+            "Charz",
+            ChannelNoticeTail::YouJoined {
+                flags: 0x18,
+                instance: 0,
+                text: None,
+            },
+        )],
+        1,
+    );
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("GetNumDisplayChannels() SetSelectedDisplayChannel(4)")
+    })
+    .expect("a VM")
+    .unwrap();
+    let voice =
+        |notice, channel: &str| channel_notice(notice, channel, ChannelNoticeTail::Actor(ME));
+    let list = |flags| SessionEvent::ChannelList {
+        display: true,
+        channel: "Charz".into(),
+        flags,
+        members: Vec::new(),
+    };
+    const EVENTS: &[&str] = &[
+        "CHAT_MSG_CHANNEL_NOTICE_USER",
+        "CHANNEL_UI_UPDATE",
+        "CHANNEL_FLAGS_UPDATED",
+        "AUCTION_HOUSE_DISABLED",
+    ];
+    let seen = rig.packets(
+        vec![
+            voice(channel_notice::VOICE_ON, "Charz"),
+            closed_house(),
+            list(0x98),
+        ],
+        1,
+    );
+    assert_eq!(
+        fired(&seen, EVENTS),
+        [
+            "CHAT_MSG_CHANNEL_NOTICE_USER",
+            "CHANNEL_UI_UPDATE",
+            "AUCTION_HOUSE_DISABLED"
+        ],
+        "the line, then the rebuild; the list's 0x98 is the record's"
+    );
+    let seen = rig.packets(
+        vec![
+            voice(channel_notice::VOICE_OFF, "Charz"),
+            closed_house(),
+            list(0x18),
+        ],
+        1,
+    );
+    assert_eq!(
+        fired(&seen, EVENTS),
+        [
+            "CHAT_MSG_CHANNEL_NOTICE_USER",
+            "CHANNEL_UI_UPDATE",
+            "AUCTION_HOUSE_DISABLED"
+        ],
+        "the clear brings the record back to 0x18"
+    );
+    let seen = rig.packets(
+        vec![
+            voice(channel_notice::VOICE_ENABLED, "Charz"),
+            closed_house(),
+            list(0x98),
+        ],
+        1,
+    );
+    assert_eq!(
+        fired(&seen, EVENTS),
+        ["CHANNEL_UI_UPDATE", "AUCTION_HOUSE_DISABLED"],
+        "the set adds no line"
+    );
+    let seen = rig.packets(vec![voice(channel_notice::VOICE_ON, "Elsewhere")], 1);
+    assert_eq!(
+        fired(&seen, EVENTS),
+        ["CHAT_MSG_CHANNEL_NOTICE_USER"],
+        "no record: the line alone"
+    );
+}
+
+/// The roster's callback is registered only on a member the cache missed at list time (`0x503bdb`):
+/// a re-answer for a member that was cached then (here after `SMSG_INVALIDATE_PLAYER`) leaves the
+/// count, and the uncached member's answer fires the count and the roster.
+#[test]
+fn a_cached_members_answer_leaves_the_rosters_count() {
+    const EVENTS: &[&str] = &["CHANNEL_COUNT_UPDATE", "CHANNEL_ROSTER_UPDATE"];
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    let (tx, _rx) = crossbeam_channel::unbounded();
+    rig.app.insert_resource(crate::net::NetCommands(tx));
+    join_charz(&mut rig);
+    rig.packets(vec![joined_notice("Charz")], 1);
+    super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("GetNumDisplayChannels() SetSelectedDisplayChannel(4)")
+    })
+    .expect("a VM")
+    .unwrap();
+    const ANN: u64 = 0x71;
+    const CAL: u64 = 0x73;
+    rig.packets(vec![name_answer(CAL, "Cal")], 1);
+    let seen = rig.packets(
+        vec![SessionEvent::ChannelList {
+            display: true,
+            channel: "Charz".into(),
+            flags: 0,
+            members: vec![(ANN, 0), (CAL, 0)],
+        }],
+        1,
+    );
+    assert!(fired(&seen, EVENTS).is_empty(), "Ann's name is out");
+    let seen = rig.packets(
+        vec![
+            SessionEvent::InvalidatePlayer { guid: CAL },
+            name_answer(CAL, "Cal"),
+        ],
+        1,
+    );
+    assert!(
+        fired(&seen, EVENTS).is_empty(),
+        "Cal's record carries no roster callback"
+    );
+    let seen = rig.packets(vec![name_answer(ANN, "Ann")], 1);
+    assert_eq!(fired(&seen, EVENTS), EVENTS);
+}
+
+/// `JoinChannelByName("General")` sends the join and claims a zone channel's record inside the call
+/// (`0x507a80`) with no `CHANNEL_UI_UPDATE`, and `GetChannelName` reads the claimed record in the
+/// same chunk; the zone walk's rename relists nothing either (`0x508090` calls no `0x505d40`), and
+/// the next `GetChannelName` reads the renamed record.
+#[test]
+fn a_join_verb_and_the_walks_rename_claim_records_with_no_relist() {
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    let (tx, rx) = crossbeam_channel::unbounded();
+    rig.app.insert_resource(crate::net::NetCommands(tx));
+    // The rig has no asset chain: `ChatChannels.dbc` is read here, as the startup load reads it.
+    let data = benilla_formats::wow_data().expect("install");
+    let mut chain = benilla_formats::open_chain(&data).expect("open chain");
+    rig.app
+        .world_mut()
+        .resource_mut::<crate::ui_chat::ChannelState>()
+        .channels =
+        benilla_formats::load_chat_channels_catalog(&mut chain).expect("ChatChannels.dbc");
+    let areas = benilla_formats::load_area_table_catalog(&mut chain).expect("AreaTable.dbc");
+    rig.app.insert_resource(crate::area::AreaTableRes(areas));
+    rig.run(1);
+    rig.take();
+    // Elwynn Forest, the zone id the verbs compose the catalog for.
+    rig.app
+        .insert_resource(crate::area::ZoneIds { zone: 12, area: 12 });
+    let number = super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.run("JoinChannelByName('General')")?;
+        s.eval::<i64>("return (GetChannelName('General - Elwynn Forest'))")
+    })
+    .expect("a VM")
+    .unwrap();
+    assert_ne!(number, 0, "the record is claimed inside the call");
+    assert!(
+        rx.try_iter().any(|c| matches!(
+            c,
+            crate::net::ClientCommand::JoinChannel { ref name, .. } if name == "General - Elwynn Forest"
+        )),
+        "the join went out inside the call"
+    );
+    rig.run(2);
+    assert!(
+        fired(&rig.take(), &["CHANNEL_UI_UPDATE"]).is_empty(),
+        "the join verb relists nothing"
+    );
+    crate::ui_chat::apply_walk(
+        &[crate::ui_chat::WalkStep::Rename {
+            old: "General - Elwynn Forest".into(),
+            new: "General - Westfall".into(),
+        }],
+        &mut rig
+            .app
+            .world_mut()
+            .resource_mut::<crate::ui_chat::ChannelState>(),
+        &crate::net::NetCommands(crossbeam_channel::unbounded().0),
+    );
+    rig.run(2);
+    assert!(
+        fired(&rig.take(), &["CHANNEL_UI_UPDATE"]).is_empty(),
+        "the walk's rename relists nothing"
+    );
+    // The name leg finds the record whatever its state (`0x4fe8e4`).
+    let renamed = super::live::with_live_world(rig.app.world_mut(), |s| {
+        s.eval::<i64>("return (GetChannelName('General - Westfall'))")
+    })
+    .expect("a VM")
+    .unwrap();
+    assert_eq!(renamed, number, "the record read at the call");
+}
+
+/// The join's record is in state 1 until its `YOU_JOINED` (`0x5077a7`, `0x5078b3`): the number leg
+/// misses (`0x4fe8a3`), the name leg finds it (`0x4fe8e4`), `GetChannelList` and `ListChannels`
+/// skip it (`0x4fe681`, `0x50db1a`), a `CHANNEL` send to its number goes nowhere (`0x50d565`) and
+/// `LeaveChannelByName` sends nothing (`0x5095b8`); the confirm makes each read it.
+#[test]
+fn a_join_awaiting_its_confirm_reads_as_joined_by_nothing() {
+    let Some(mut rig) = Rig::login(&[]) else {
+        return;
+    };
+    let (tx, rx) = crossbeam_channel::unbounded();
+    rig.app.insert_resource(crate::net::NetCommands(tx));
+    join_charz(&mut rig);
+    rx.try_iter().for_each(drop);
+    const READ: &str = "local n, name, i = GetChannelName(1)
+        local byname = GetChannelName('Charz')
+        return table.concat({ n, tostring(name), i, byname, select('#', GetChannelList()) }, ',')";
+    let read = |rig: &mut Rig| {
+        super::live::with_live_world(rig.app.world_mut(), |s| s.eval::<String>(READ))
+            .expect("a VM")
+            .unwrap()
+    };
+    let lines = |rig: &mut Rig| {
+        super::live::with_live_world(rig.app.world_mut(), |s| {
+            s.run(
+                "LINES = {} local f = CreateFrame('Frame') f:RegisterEvent('CHAT_MSG_CHANNEL_LIST')
+                 f:SetScript('OnEvent', function(_, _, text) LINES[#LINES + 1] = text end)
+                 ListChannels() f:UnregisterAllEvents()",
+            )?;
+            s.eval::<String>("return table.concat(LINES, '|')")
+        })
+        .expect("a VM")
+        .unwrap()
+    };
+    let sends = |rig: &mut Rig| {
+        super::live::with_live_world(rig.app.world_mut(), |s| {
+            s.run("SendChatMessage('hi', 'CHANNEL', nil, 1) LeaveChannelByName('Charz')")
+        })
+        .expect("a VM")
+        .unwrap();
+        rx.try_iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    crate::net::ClientCommand::LeaveChannel { .. }
+                        | crate::net::ClientCommand::Chat { .. }
+                )
+            })
+            .count()
+    };
+    // A member's join shows only on a record in state 0, and asks no name before (`0x4fdf19`).
+    const ANN: u64 = 0x51;
+    let member = || {
+        channel_notice(
+            benilla_protocol::messages::channel_notice::JOINED,
+            "Charz",
+            benilla_protocol::messages::ChannelNoticeTail::Guid(ANN),
+        )
+    };
+    let seen = rig.packets(vec![member()], 1);
+    assert!(fired(&seen, &["CHAT_MSG_CHANNEL_JOIN"]).is_empty());
+    assert!(
+        !rx.try_iter()
+            .any(|c| matches!(c, crate::net::ClientCommand::NameQuery { guid: ANN })),
+        "the pending record's member notice ends before the name ask"
+    );
+    assert_eq!(read(&mut rig), "0,nil,0,1,0", "pending: only the name leg");
+    assert_eq!(lines(&mut rig), "", "ListChannels skips the pending record");
+    assert_eq!(
+        sends(&mut rig),
+        0,
+        "neither the send nor the leave goes out"
+    );
+    rig.packets(vec![joined_notice("Charz"), name_answer(ANN, "Ann")], 1);
+    let seen = rig.packets(vec![member()], 1);
+    assert_eq!(
+        fired(&seen, &["CHAT_MSG_CHANNEL_JOIN"]),
+        ["CHAT_MSG_CHANNEL_JOIN"]
+    );
+    assert_eq!(read(&mut rig), "1,Charz,0,1,2", "confirmed: every leg");
+    assert_eq!(lines(&mut rig), "[1. Charz] ");
+    assert_eq!(sends(&mut rig), 2, "the send and the leave go out");
+}
+
+/// A combat line's uncached item: the tradeskill line asks its record with its callback and shows
+/// nothing (`0x50bdb1`); the answer runs the record's callbacks in ask order (`0x67ca30`), the
+/// line's composing it again (`0x4fb970`) before a later asker's runs, and a missing record shows
+/// nothing (`0x4fb977`).
+#[test]
+fn a_combat_lines_item_callback_runs_in_ask_order() {
+    use benilla_protocol::messages::{ExecuteLog, SpellLogExecute};
+    const CRAFTED: u32 = 591_101;
+    const MISSING: u32 = 591_102;
+    let Some(mut rig) = Rig::login(&[OBJECT_TYPE_PLAYER]) else {
+        return;
+    };
+    let create = |item_entry| {
+        SessionEvent::SpellLogExecute(SpellLogExecute {
+            caster: ME,
+            spell_id: 2_329,
+            effects: vec![(24, vec![ExecuteLog::CreateItem { item_entry }])],
+        })
+    };
+    let events = &["CHAT_MSG_TRADESKILLS", "TRAINER_DESCRIPTION_UPDATE"];
+    let seen = rig.packets(vec![create(CRAFTED)], 2);
+    assert!(
+        pin(&seen, events, &[]).is_empty(),
+        "nothing before the record"
+    );
+    // A later asker on the same record.
+    rig.app
+        .world_mut()
+        .non_send_resource_mut::<crate::items::RecordWaits>()
+        .wait(CRAFTED, crate::items::RecordWait::Trainer, false);
+    let seen = rig.packets(
+        vec![SessionEvent::ItemTemplate {
+            entry: CRAFTED,
+            info: Some(Box::new(crate::items::test_template("Charz Elixir"))),
+        }],
+        2,
+    );
+    let pinned = pin(&seen, events, &[]);
+    assert_eq!(pinned.len(), 2, "{pinned:?}");
+    assert!(
+        pinned[0].starts_with("CHAT_MSG_TRADESKILLS") && pinned[0].contains("Charz Elixir"),
+        "{pinned:?}"
+    );
+    assert_eq!(pinned[1], "TRAINER_DESCRIPTION_UPDATE");
+    rig.packets(vec![create(MISSING)], 2);
+    let seen = rig.packets(
+        vec![SessionEvent::ItemTemplate {
+            entry: MISSING,
+            info: None,
+        }],
+        2,
+    );
+    assert!(
+        pin(&seen, events, &[]).is_empty(),
+        "a missing record shows nothing"
+    );
 }

@@ -156,6 +156,13 @@ pub trait LiveState {
         false
     }
 
+    /// Open the chat log (`chat`) or the combat log inside `LoggingChat`/`LoggingCombat`'s call when
+    /// its flag goes on and it is not open yet (`0x4fbcb1`): whether it is open after, `None` with
+    /// no host.
+    fn open_log(&mut self, _chat: bool) -> Option<bool> {
+        None
+    }
+
     /// Add `text` to the chat log on the catalog row's `chat_type` inside the call (`0x509dd0`): the
     /// line recorded and its event's name and arguments handed back to fire; `None` with no chat log.
     fn add_chat_line(
@@ -165,6 +172,28 @@ pub trait LiveState {
     ) -> Option<(&'static str, Vec<super::ScriptValue>)> {
         None
     }
+
+    /// The channel records at the call (`0xbcf090` count, `0xbcf094` array), holes kept.
+    fn channel_slots(&self) -> Vec<Option<super::ChannelSlotInfo>> {
+        Vec::new()
+    }
+
+    /// A display list or user-list notice writes the channel record's flags byte (`0x503a69`).
+    fn set_channel_flags(&mut self, _slot: usize, _flags: u8) {}
+
+    /// The channel pane's state, the game's: a reload keeps it, only the session init clears it
+    /// (`0x50f198`-`0x50f202`).
+    fn channel_pane(&mut self) -> Option<&mut super::ChannelPane> {
+        None
+    }
+
+    /// `ChatChannels.dbc` composed for the zone id at the call (`0xbd080c`).
+    fn zone_channel_catalog(&self) -> Vec<super::ZoneChannelRow> {
+        Vec::new()
+    }
+
+    /// Set a channel id's bit in the `ZONECHANNELS` mask (`0xbcf010`).
+    fn add_zone_channel_bit(&mut self, _id: u32) {}
 
     /// The world-state readout's admitted row count at the call (`0x548720`), `None` without one.
     fn world_state_ui_count(&self) -> Option<usize> {
@@ -983,6 +1012,15 @@ pub trait LiveState {
         None
     }
 
+    /// The played clock at the call (`0x6cf440`): the last answer's total plus the seconds since;
+    /// `None` where no view lends it.
+    fn played_now(&self) -> Option<i64> {
+        None
+    }
+
+    /// `CMSG_PLAYED_TIME` asking for a shown answer, sent in the call (`0x5158c1`).
+    fn send_played_time(&mut self) {}
+
     /// The refund record on held item `item` (`item+0x3d4`, filled by `0x6d1650`); `Some(None)` for none.
     fn refund_record(&self, _item: u64) -> Option<Option<super::RefundView>> {
         None
@@ -1571,6 +1609,72 @@ pub trait LiveState {
     /// The setter's zero (`0x59411b`): the trainer and its records.
     fn trainer_zero(&mut self) {}
 
+    /// The client's tradeskill window at the call (`0xc235a0`-`0xc23604`); `None` where no view lends it.
+    fn trade_skill(&self) -> Option<&super::TradeSkillList> {
+        None
+    }
+
+    /// The tradeskill window, written by a verb inside its call; `None` where no view lends it.
+    fn trade_skill_mut(&mut self) -> Option<&mut super::TradeSkillList> {
+        None
+    }
+
+    /// The open line's `SkillLine.dbc` names and the player's ranks of it at the call (`0x5db810`).
+    fn trade_skill_line(&self) -> super::TradeSkillLineView {
+        super::TradeSkillLineView::default()
+    }
+
+    /// Recipe `spell_id`'s spell record read at the call (`0x5db2a0`, `0x5db550`, `0x5db6e0`); `None` without a record.
+    fn trade_skill_recipe(&self, _spell_id: u32) -> Option<super::TradeSkillRecipeView> {
+        None
+    }
+
+    /// Reagent `item` of recipe `spell_id` at the call (`0x5de400`): its record asked with the list's item callback (`0x5de50d` -> `0x5de100`), and the bags' count of it (`0x754d00`).
+    fn trade_skill_reagent(&mut self, _spell_id: u32, _item: u32) -> super::TradeSkillReagentView {
+        super::TradeSkillReagentView::default()
+    }
+
+    /// Recipe `spell_id`'s requirements at the call (`0x5de620`): `(name, has)` for the spell focus and the required area, both met, then the tools asked with the list's item callback and the tool categories, each tested against the bags.
+    fn trade_skill_tools(&mut self, _spell_id: u32) -> Vec<(String, bool)> {
+        Vec::new()
+    }
+
+    /// Recipe `spell_id`'s description parsed at the call (`0x5dbe10`), `None` for none.
+    fn trade_skill_description(
+        &self,
+        _spell_id: u32,
+        _global: GlobalStrings<'_>,
+    ) -> Option<String> {
+        None
+    }
+
+    /// Recipe `spell_id`'s cooldown at the call (`0x5da9a0`), as [`Self::spell_cooldown`] reads it.
+    fn trade_skill_cooldown(
+        &self,
+        spell_id: u32,
+        anchor: std::time::Instant,
+        ui_now: f64,
+    ) -> Option<(i64, u32, bool)> {
+        self.spell_cooldown(spell_id, anchor, ui_now)
+    }
+
+    /// The open line's `|Htrade:` link built at the call (`0x5dc0b0` -> `0x5db060`), `None` when it cannot link.
+    fn trade_skill_list_link(&self) -> Option<String> {
+        None
+    }
+
+    /// The text filter (`0x5dc110`) on recipe `spell_id` at the call: the product's required level within `min`..`max` (0 open), then `name`, folded, found in the product's, the recipe's, its reagents', tools' and focus' texts.
+    fn trade_skill_filter_spell(
+        &self,
+        _spell_id: u32,
+        _min: i32,
+        _max: i32,
+        _name: Option<&str>,
+        _global: GlobalStrings<'_>,
+    ) -> bool {
+        true
+    }
+
     /// Our coinage at the call (`PLAYER_FIELD_COINAGE`), 0 with no player object; `None` where no view lends it.
     fn player_money(&self) -> Option<u64> {
         None
@@ -1858,6 +1962,13 @@ pub(crate) struct TestView {
     /// The open banker and whether the interact target is it.
     pub banker: Option<u64>,
     pub bank_interacting: bool,
+    /// The channel records and the zone's channel catalog.
+    pub channel_slots: Vec<Option<super::ChannelSlotInfo>>,
+    /// The channel pane's state.
+    pub channel_pane: super::ChannelPane,
+    pub zone_channels: Vec<super::ZoneChannelRow>,
+    /// The `ZONECHANNELS` bits set, in order.
+    pub zone_bits: Vec<u32>,
     /// The purchased bank bag slots, `None` without the active player, and the price rows.
     pub bank_slots: Option<u8>,
     pub bank_costs: std::collections::HashMap<u32, u32>,
@@ -1958,6 +2069,12 @@ pub(crate) struct TestView {
     pub trainer_zeroes: u32,
     /// The chat lines the display added inside its calls, with their wire chat type.
     pub chat_lines: Vec<(u8, String)>,
+    /// The logs the logging verbs opened, `(chat, combat)`, and whether an open fails.
+    pub logs_opened: (bool, bool),
+    /// The played clock the refund and trade verbs read, and the `CMSG_PLAYED_TIME`s sent.
+    pub played: Option<i64>,
+    pub played_asks: u32,
+    pub log_open_fails: bool,
     /// The client's faction list and the faction table it reads.
     pub faction_list: super::FactionList,
     pub factions: super::StaticFactions,
@@ -2051,6 +2168,28 @@ impl TestView {
 
 #[cfg(test)]
 impl LiveState for TestView {
+    fn channel_slots(&self) -> Vec<Option<super::ChannelSlotInfo>> {
+        self.channel_slots.clone()
+    }
+
+    fn set_channel_flags(&mut self, slot: usize, flags: u8) {
+        if let Some(Some(s)) = self.channel_slots.get_mut(slot) {
+            s.flags = flags;
+        }
+    }
+
+    fn channel_pane(&mut self) -> Option<&mut super::ChannelPane> {
+        Some(&mut self.channel_pane)
+    }
+
+    fn zone_channel_catalog(&self) -> Vec<super::ZoneChannelRow> {
+        self.zone_channels.clone()
+    }
+
+    fn add_zone_channel_bit(&mut self, id: u32) {
+        self.zone_bits.push(id);
+    }
+
     fn reputation(
         &mut self,
         f: &mut dyn FnMut(&mut super::FactionList, &mut dyn super::FactionTable),
@@ -2270,6 +2409,26 @@ impl LiveState for TestView {
     fn taxi_act(&mut self, act: super::TaxiAct) -> Option<super::TaxiOutcome> {
         self.taxi_acts.push(act);
         None
+    }
+
+    fn played_now(&self) -> Option<i64> {
+        self.played
+    }
+
+    fn send_played_time(&mut self) {
+        self.played_asks += 1;
+    }
+
+    fn open_log(&mut self, chat: bool) -> Option<bool> {
+        if self.log_open_fails {
+            return Some(false);
+        }
+        if chat {
+            self.logs_opened.0 = true;
+        } else {
+            self.logs_opened.1 = true;
+        }
+        Some(true)
     }
 
     /// A system line fires `CHAT_MSG_SYSTEM`, a skill line `CHAT_MSG_SKILL`, with the text alone.

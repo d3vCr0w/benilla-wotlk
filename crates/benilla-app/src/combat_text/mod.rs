@@ -257,6 +257,7 @@ pub(crate) fn float_combat_text(
                 outline: Outline::None,
                 alpha_gradient: None,
                 spacing: 0.0,
+                wrap: benilla_ui::script::TextWrap::default(),
             },
             // A world overlay with its own seat; the UI grid does not apply.
             crate::ui_text::TextSeat::Exact,
@@ -507,6 +508,7 @@ mod tests {
                 name: name.into(),
                 old: "0".into(),
                 new: new.into(),
+                from_vm: false,
             });
             *app.world().resource::<DamageTextGates>()
         };

@@ -75,13 +75,15 @@ pub fn char_create(req: &CharCreateReq) -> Vec<u8> {
 }
 
 /// `CMSG_MESSAGECHAT` body: `u32` type and language, the target or channel name for whisper and
-/// channel only (`None` otherwise), then the message (vmangos `Server/Packets/Chat.cpp:3-12`).
+/// channel only (`None` otherwise), then the message's bytes as the client cut them, which need not
+/// end on a UTF-8 boundary (vmangos `Server/Packets/Chat.cpp:3-12`).
 pub fn messagechat_kind(
     chat_type: u32,
     language: u32,
     target: Option<&str>,
-    message: &str,
+    message: impl AsRef<[u8]>,
 ) -> Vec<u8> {
+    let message = message.as_ref();
     let mut body = Vec::with_capacity(message.len() + target.map_or(0, str::len) + 10);
     body.extend_from_slice(&chat_type.to_le_bytes());
     body.extend_from_slice(&language.to_le_bytes());
@@ -89,7 +91,7 @@ pub fn messagechat_kind(
         body.extend_from_slice(target.as_bytes());
         body.push(0);
     }
-    body.extend_from_slice(message.as_bytes());
+    body.extend_from_slice(message);
     body.push(0);
     body
 }
@@ -256,6 +258,16 @@ pub fn text_emote(text_id: u32, file_index: i32, target: u64) -> Vec<u8> {
     b.extend_from_slice(&file_index.to_le_bytes());
     b.extend_from_slice(&target.to_le_bytes());
     b
+}
+
+/// `CMSG_CHAT_IGNORED` body (`0x500180`): the sender's `u64` guid (`0x5001d0`), then a `u8`
+/// (`0x5001dc`): 0 for an ignored sender's whisper (`0x50c186`), 1 for one the commentator gate
+/// refuses (`0x50c134`).
+pub fn chat_ignored(guid: u64, reason: u8) -> Vec<u8> {
+    let mut body = Vec::with_capacity(9);
+    body.extend_from_slice(&guid.to_le_bytes());
+    body.push(reason);
+    body
 }
 
 pub fn full_guid(guid: u64) -> Vec<u8> {

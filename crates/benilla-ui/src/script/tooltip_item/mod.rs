@@ -247,6 +247,7 @@ fn slot_instance(s: &super::ContainerSlot, openable: bool) -> render::ItemInstan
         openable_source: openable,
         duration_ms: s.duration_ms,
         guid: s.guid,
+        is_object: true,
         ..Default::default()
     }
 }
@@ -988,6 +989,9 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                                         .as_deref()
                                         .and_then(ItemLinkFields::parse)
                                         .map_or_else(Default::default, |(_, f)| f),
+                                    // An inspected unit has no item object (`0x62e050`): its
+                                    // tooltip reads the link block's seed, not `RandPropPoints`.
+                                    is_object: unit.eq_ignore_ascii_case("player"),
                                     ..Default::default()
                                 },
                             )
@@ -1147,8 +1151,9 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                     clear_content(&mut model, h);
                 }
                 fire_cleared(lua, h);
-                let inst = block_instance(item.name.clone(), item.link.as_deref());
+                let mut inst = block_instance(item.name.clone(), item.link.as_deref());
                 // Ours is an item object (`0x62eff0`), theirs a block of its count (`0x62f1e0`).
+                inst.is_object = player_side;
                 let sell = if player_side {
                     Sell::Object {
                         stack: item.count,
@@ -1738,20 +1743,18 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                     Spell(u32),
                 }
                 let hover = {
-                    let model = lua
-                        .app_data_ref::<crate::script::ModelCell>()
-                        .expect("model app_data");
-                    let recipe = super::tradeskill::recipe_at(&model, index).ok_or_else(invalid)?;
+                    let (spell, recipe) =
+                        super::tradeskill::recipe_at(lua, index).ok_or_else(invalid)?;
                     match reagent {
                         Some(ri) => {
-                            let r = usize::try_from(ri - 1)
+                            let &(item, need) = usize::try_from(ri - 1)
                                 .ok()
                                 .and_then(|i| recipe.reagents.get(i))
                                 .ok_or_else(invalid)?;
                             Hover::Item(
-                                r.item,
+                                item,
                                 Sell::Block {
-                                    stack: r.need,
+                                    stack: need,
                                     max: None,
                                 },
                             )
@@ -1763,7 +1766,7 @@ pub(super) fn install_methods(lua: &Lua, m: &Table) -> mlua::Result<()> {
                                 max: Some(recipe.max_made),
                             },
                         ),
-                        None => Hover::Spell(recipe.spell_id),
+                        None => Hover::Spell(spell),
                     }
                 };
                 match hover {

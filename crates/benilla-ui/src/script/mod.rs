@@ -99,7 +99,7 @@ pub use level_grant::UnitRequest;
 pub use name_records::NameRecord;
 pub use unit_menu::{DifficultyState, ReferAFriendState};
 mod worldmap_arrow;
-// `camera_view`: the five camera views and `FlipCameraYaw`, as the reference's UI camera has them.
+// `camera_view`: the eight camera views and `FlipCameraYaw`, as the reference's UI camera has them.
 mod button;
 mod calendar;
 mod calls;
@@ -333,15 +333,17 @@ pub use calls::{
     apply_queued, set_answer, set_apply, AnswerHost, ApplyCall, CastAt, GuildBankVerdict,
     HostAnswer, HostAsk, LootVerb, NearestMode, ScriptCall, VerbPress,
 };
-pub use camera_view::{CameraViewRequest, CAMERA_VIEW_COUNT};
+pub use camera_view::{
+    CameraViewRequest, CAMERA_USER_VIEW_MAX, CAMERA_USER_VIEW_MIN, CAMERA_VIEW_COUNT,
+};
 pub use channel::{ChannelCommand, ZoneChannelRow};
-pub use channel_pane::ChannelSlotInfo;
+pub use channel_pane::{ChannelPane, ChannelSlotInfo};
 pub use char_stats::{
     weapon_subclass_skill, BankBagSlots, InvSlotView, InventorySlots, PaperDollSlotInfo,
     UnitCombatStats, BANK_BAG_SLOT_COUNT, INVENTORY_SLOT_COUNT, SKILL_DEFENSE, SKILL_UNARMED,
 };
 pub use chat_misc::{EmoteRequest, EmoteTarget};
-pub use chat_send::ChatSend;
+pub use chat_send::{chat_escapes_valid, ChatSend};
 pub use chat_types::{default_chat_color, ChatTypeColor};
 pub use chat_window::{
     frame_point_index, frame_point_name, message_group_index, ChatWindowLook,
@@ -375,6 +377,7 @@ pub use duel::DuelRequest;
 pub use follow::FollowRequest;
 pub use gm_ticket::{GmTicketIntent, SurveySubmission, SurveyTables};
 pub use gossip::{GossipOptionView, GossipQuestRow, GossipRead};
+pub use guild::{new_line_cut, truncate_new_lines};
 pub use guild::{
     GuildEventView, GuildMemberInfo, GuildRankEdit, GuildRankInfo, GuildRequest, GuildState,
     LastOnline, UnitGuild, MAX_RANKS, MIN_RANKS, RANK_RIGHT_BITS,
@@ -432,7 +435,7 @@ pub use item_stats::equip_loc_token;
 pub use item_stats::{
     item_usable, item_use_refusal, EnchantEffectView, EnchantRowView, GemView, ItemLimitView,
     ItemRecordWait, ItemSetMember, ItemSetView, ItemSpellView, ItemTables, ItemTemplateView,
-    PlayerFields, PlayerReqState, RandomSuffixView, ReqFields,
+    PlayerFields, PlayerReqState, RandPropPointsView, RandomSuffixView, ReqFields,
 };
 pub use item_text::ItemTextRead;
 pub use layout_cache::PlacedFrame;
@@ -457,7 +460,7 @@ pub use mail::{
 pub use measure::TextMeasure;
 pub use merchant::{
     CostItem, ExtendedCost, ItemStatsHead, MerchantAct, MerchantItem, MerchantList,
-    MerchantOutcome, MerchantState, RepairAt, RepairCosts,
+    MerchantOutcome, MerchantState, PurchaseGroup, RepairAt, RepairCosts,
 };
 pub(crate) use minimap::apply_model_attrs as apply_minimap_model_attrs;
 pub use model::{FontProbe, MacroIconSource, TextureProbe, TextureSizeProbe};
@@ -479,7 +482,7 @@ pub use quest_log::{
     QuestLogObjectiveView, QuestLogPlan, QuestLogRow, QuestLogState,
 };
 pub use quest_poi::QuestPoiLines;
-pub use quest_watch::{QuestPoiRegion, QuestPoiView, QuestSpecialItemView};
+pub use quest_watch::{quest_difficulty_color, QuestPoiRegion, QuestPoiView, QuestSpecialItemView};
 pub(crate) use region::{apply_font_parts, implicit_creation_anchor_lua, store_text};
 pub use reputation::{
     FactionEntry, FactionFlag, FactionList, FactionTable, ReputationSend, StaticFactions,
@@ -514,8 +517,11 @@ pub use tooltip_spell::SpellTooltipView;
 pub use totem::{TotemView, MAX_TOTEM_SLOTS};
 pub use trade::{TradeCells, TradeItemFacts, TradeItemSend, TradeTargetItem, TRADE_SLOTS};
 pub use tradeskill::{
-    TradeSkillDifficulty, TradeSkillGroup, TradeSkillReagent, TradeSkillRecipe, TradeSkillState,
+    TradeSkillDifficulty, TradeSkillGroup, TradeSkillLineView, TradeSkillList,
+    TradeSkillReagentView, TradeSkillRecipeView, TradeSkillRow,
 };
+#[cfg(any(test, feature = "fixtures"))]
+pub use tradeskill::{TradeSkillReagent, TradeSkillRecipe, TradeSkillState};
 pub use trainer::{
     trainer_type_filter, TrainerAbilityReq, TrainerGroup, TrainerService, TrainerServiceCategory,
     TrainerServiceLive, TrainerSkillReq, TrainerState, TrainerTooltip, TrainerWindow,
@@ -523,7 +529,7 @@ pub use trainer::{
 pub use types::{
     BlendMode, EditAction, EditBoxAdvanceRequest, EditBoxTextUi, EditOutcome, EditUnit,
     ExtractedQuad, FontObject, FontShadow, Gradient, JustifyH, JustifyV, LineMeasureRequest,
-    MeasureRequest, Outline, QuadContent, ScriptValue, TexCoords,
+    MeasureRequest, Outline, QuadContent, ScriptValue, TexCoords, TextWrap,
 };
 pub(crate) use types::{FontExplicit, MeasuredText, RegionData};
 pub use unit::{

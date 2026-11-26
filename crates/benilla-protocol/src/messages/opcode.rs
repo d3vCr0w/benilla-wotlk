@@ -369,6 +369,9 @@ pub const CMSG_PET_ACTION: u16 = 0x0175; // 373
 /// A cast whose caster is not the active player, the pet's client-targeted or possessed casts
 /// (the pending-cast send, `0x80b315`).
 pub const CMSG_PET_CAST_SPELL: u16 = 0x01F0; // 496
+/// A trajectory cast's final aim, sent when its cast time ends or its animation releases the
+/// missile (`0x6fd6b0`).
+pub const CMSG_UPDATE_MISSILE_TRAJECTORY: u16 = 0x0462; // 1122
 /// A pet bar drag: one or two `(position, packed)` pairs, told apart by body size alone.
 pub const CMSG_PET_SET_ACTION: u16 = 0x0174; // 372
 /// Set a pet spell's autocast bit to a given value (the right-click).
@@ -1527,6 +1530,8 @@ pub const SMSG_REAL_GROUP_UPDATE: u16 = 0x0397; // 919
 pub const SMSG_POWER_UPDATE: u16 = 0x0480; // 1152
 /// A unit's health, set as its predicted copy (`0x716d20`).
 pub const SMSG_HEALTH_UPDATE: u16 = 0x047F; // 1151
+/// A whisper the spam filter dropped, its sender's guid (`0x50a6e4`).
+pub const CMSG_CHAT_FILTERED: u16 = 0x0331; // 817
 /// The server's chat spam patterns, replacing the last list (`0x501c70`).
 pub const SMSG_EXPECTED_SPAM_RECORDS: u16 = 0x0332; // 818
 /// One reputation slot's at-war flag, set or cleared (`0x5d0850`).

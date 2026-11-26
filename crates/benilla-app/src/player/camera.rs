@@ -649,6 +649,56 @@ impl PivotGlide {
     }
 }
 
+/// A vehicle's camera fade window ([`CameraControl::vehicle_fade`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VehicleFade {
+    pub(crate) vehicle: Entity,
+    /// The model's world position.
+    pub(crate) at: Vec3,
+    /// Fully faded at or inside this distance past the near plane.
+    pub(crate) gone: f32,
+    /// Opaque at or past this one.
+    pub(crate) whole: f32,
+}
+
+/// The facing a vehicle passenger's camera is relative to while its seat's camera transition runs
+/// ([`CameraControl::vehicle_chase`]): it turns from `start` to `target` (the mover's facing when
+/// `None`) by the cosine ease of `progress` (`0x75a1c0`, `0x5fffd0`), all radians but `progress`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VehicleChase {
+    pub(crate) start: f32,
+    pub(crate) target: Option<f32>,
+    pub(crate) progress: f32,
+}
+
+impl VehicleChase {
+    /// The facing the camera is relative to, given the mover's.
+    pub(crate) fn facing(&self, mover: f32) -> f32 {
+        let target = self.target.unwrap_or(mover);
+        let eased = 0.5 - (self.progress.clamp(0.0, 1.0) * std::f32::consts::PI).cos() * 0.5;
+        self.start + eased * wrap_pi(target - self.start)
+    }
+
+    /// How far that facing trails the mover's: the camera's yaw, kept on the mover's, turns by it.
+    pub(crate) fn lag(&self, mover: f32) -> f32 {
+        wrap_pi(self.facing(mover) - mover)
+    }
+}
+
+/// `0x606f90`'s vehicle fade: the cosine ramp from gone to whole over the
+/// camera's distance to the model past the near plane.
+pub(crate) fn vehicle_fade_alpha(fade: &VehicleFade, eye: Vec3, nearclip: f32) -> f32 {
+    let near = eye.distance(fade.at) - nearclip;
+    if near >= fade.whole {
+        return 1.0;
+    }
+    if fade.gone >= near {
+        return 0.0;
+    }
+    let t = (near - fade.gone) / (fade.whole - fade.gone);
+    (1.0 - (t * std::f32::consts::PI).cos()) * 0.5
+}
+
 /// The camera rig's state: the zoom, the collided arm, the mouse-look session and the pose
 /// channels. `pub(crate)` so [`crate::cursor`] can hide the cursor while looking.
 #[derive(Resource, Default)]
@@ -667,6 +717,21 @@ pub(crate) struct CameraControl {
     pub(crate) hold_pitch_for_aim: bool,
     /// The pitch the held look would have turned the camera by, for the vehicle aim to take.
     pub(crate) aim_pitch_delta: f32,
+    /// The driven vehicle's legal facings, in world yaw ([`crate::vehicle::facing`]): a key turn
+    /// stops at a limit and a synced mouse-look holds the camera's yaw there. Set each frame by
+    /// the vehicle aim.
+    pub(crate) vehicle_facing: Option<(f32, f32)>,
+    /// The look session has been inside `vehicle_facing` (`m_flags & 0x4`, `0x6023d0`): once set,
+    /// dragging past a limit clamps the camera's yaw with the body.
+    pub(super) vehicle_facing_latched: bool,
+    /// The driven vehicle's aim pitch, which is its mover pitch: the reference's pitch setter
+    /// writes one field (`0x5fb3a0`), so mouse-look's plain camera-pitch store does not run on a
+    /// vehicle, whose camera route goes through the aim (`0x5fbe70`). Set each frame by the aim.
+    pub(crate) vehicle_pitch: Option<f32>,
+    /// The driven vehicle's record fixes its rendered facing (`flags & 0x200` or `0x1000`,
+    /// `0x73dab0`): the body turns with its facing at once, with no stationary chase or twist. Set
+    /// each frame by the vehicle aim.
+    pub(crate) vehicle_fixed_facing: bool,
     /// The mouse buttons the world owns this frame, latched by [`latch_world_mouse`].
     pub(super) world_mouse: WorldMouse,
     /// Logical cursor position captured when look began, to restore on release.
@@ -693,8 +758,30 @@ pub(crate) struct CameraControl {
     pub(super) clipped: bool,
     /// The vehicle seat zoom last applied, by its count.
     pub(super) vehicle_zoom_seen: u32,
-    /// The distance before a seat's zoom, which its exit restores (`m_vehicleExitZoomDistance`).
+    /// The distance before a seat's zoom, which its exit restores.
     pub(super) vehicle_exit_zoom: Option<f32>,
+    /// The vehicle's camera pitch offset as it eases in, radians: the view looks that much higher
+    /// (`0x606f90`), the arm untouched. Written by the seat camera.
+    pub(crate) vehicle_pitch_offset: f32,
+    /// The vehicle's camera yaw offset as it eases in: the arm swings that far about the pivot
+    /// while the view keeps its yaw (`0x600730`). Written by the seat camera.
+    pub(crate) vehicle_yaw_offset: f32,
+    /// Seated in a vehicle whose record fades it near the camera (`flags & 0x80000`): the camera
+    /// fades by its distance to the vehicle's model over the record's scalars of the model's radius,
+    /// in place of the self window, and the vehicle fades with us (`0x606f90`). Written by the
+    /// seat camera.
+    pub(crate) vehicle_fade: Option<VehicleFade>,
+    /// A vehicle seat's camera transition under way: the facing the camera is relative to, which
+    /// the reference sweeps from the passenger's to the vehicle's with the passenger's motion
+    /// (`0x75a1c0`, read by `0x604490`). This camera's yaw follows the mover, so the view turns by
+    /// the facing's lag behind it. Written by the seat camera.
+    pub(crate) vehicle_chase: Option<VehicleChase>,
+    /// The vehicle the fade last reached, to hand back opaque.
+    pub(super) vehicle_faded: Option<Entity>,
+    /// The vehicle zoom is on (`0x600590`): a 50 yd default max, its own saved distance.
+    pub(super) vehicle_zoom: bool,
+    /// The speed, yd/s, of a vehicle zoom toggle's glide, until it lands or the wheel moves.
+    pub(super) zoom_glide: Option<f32>,
 }
 
 impl CameraControl {
@@ -711,10 +798,11 @@ impl CameraControl {
 
     /// A vehicle seat's zoom (`0x74c0e0`): on the enter the preferred distance, raised or lowered
     /// as the seat allows, held within `(min, max)`, the distance before kept; on the exit that
-    /// distance back. Each request is applied once.
+    /// distance back. A `duration` above 0 glides there over it (`0x5ffb70`), else at the move
+    /// speed. Each request is applied once.
     pub(super) fn apply_vehicle_zoom(
         &mut self,
-        (count, zoom): (u32, super::camera_zoom::VehicleZoom),
+        (count, zoom, duration): (u32, super::camera_zoom::VehicleZoom, f32),
         (min, max): (f32, f32),
     ) {
         use super::camera_zoom::VehicleZoom;
@@ -741,15 +829,27 @@ impl CameraControl {
                 let target = target.max(min).min(max);
                 if (target - current).abs() > 0.001 {
                     self.vehicle_exit_zoom.get_or_insert(current);
-                    self.target_distance = target;
+                    self.zoom_to(target, duration);
                 }
             }
             VehicleZoom::Leave => {
                 if let Some(d) = self.vehicle_exit_zoom.take() {
-                    self.target_distance = d;
+                    self.zoom_to(d, duration);
                 }
             }
         }
+    }
+
+    /// Head the zoom for `target`: over `duration` seconds where it is above 0 (`0x5ffb70`), else
+    /// at the wheel's move speed.
+    fn zoom_to(&mut self, target: f32, duration: f32) {
+        self.target_distance = target;
+        self.zoom_glide = (duration > 0.0).then(|| (target - self.distance).abs() / duration);
+    }
+
+    /// A seat's exit has a distance to restore.
+    pub(crate) fn keeps_exit_zoom(&self) -> bool {
+        self.vehicle_exit_zoom.is_some()
     }
 
     /// Park the orbit distance at `d`, both the live value and the wheel target, or the glide
@@ -1093,7 +1193,22 @@ pub(super) fn run_look_session(
             cam.pitch = (cam.pitch + d_pitch).clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
         }
         if syncs {
-            *face_yaw = cam.yaw;
+            // `0x6023d0`: inside the vehicle's legal range, latch (`m_flags & 0x4`) and sync both;
+            // past a limit, clamp the camera with the body only while latched, else clamp only the
+            // body (`0x6ee3a0`) until the camera re-enters the range.
+            if let Some(limit) = rig
+                .vehicle_facing
+                .and_then(|r| crate::vehicle::facing::clamp(cam.yaw, r))
+            {
+                let clamped = cam.yaw - super::wrap_pi(cam.yaw - limit);
+                if rig.vehicle_facing_latched {
+                    cam.yaw = clamped;
+                }
+                *face_yaw = clamped;
+            } else {
+                rig.vehicle_facing_latched = true;
+                *face_yaw = cam.yaw;
+            }
         }
     }
     // Freelook is right-held mouse-look or a both-button run, which steers like it; a left-drag
@@ -1111,6 +1226,8 @@ fn engage_look(
     cursor_opts: &mut CursorOptions,
 ) {
     rig.look = Some(button);
+    // `0x601ff0` clears `m_flags & 0x4` on entering freelook.
+    rig.vehicle_facing_latched = false;
     if focused {
         take_cursor(rig, window, cursor_opts);
     } else {
@@ -1122,6 +1239,7 @@ fn engage_look(
 /// it was already free, when it is wherever the player left it.
 fn disengage_look(rig: &mut CameraControl, window: &mut Window, cursor_opts: &mut CursorOptions) {
     rig.look = None;
+    rig.vehicle_facing_latched = false;
     let stash = rig.cursor_stash.take();
     if !std::mem::take(&mut rig.cursor_released) {
         release_cursor(cursor_opts);
@@ -1420,18 +1538,33 @@ pub(super) fn seat_camera(
     // The ground tilt is part of the arm's pitch, unlike the bias: the reference clamps
     // `[cam+0xf4] + [cam+0x108]` to ±89° before the basis is built.
     let arm_pitch = (cam.pitch + rig.terrain_tilt.pitch()).clamp(-CAM_PITCH_LIMIT, CAM_PITCH_LIMIT);
-    let arm_rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, arm_pitch, 0.0);
+    // A seat's camera transition turns the whole view by its facing's lag behind the mover's: the
+    // reference adds that facing to its relative yaw (`0x604490`), this camera already holds the
+    // mover's.
+    let yaw = cam.yaw + rig.vehicle_chase.map_or(0.0, |c| c.lag(follow.face_yaw));
+    let arm_rotation = Quat::from_euler(EulerRot::YXZ, yaw, arm_pitch, 0.0);
     // Not re-clamped: the bias is composed after that clamp, bounded only by its own one-sided
     // accumulate (`SmartPivot::route_pitch`) and ±89° at the body hand-off.
-    let rotation = if bias == 0.0 {
+    // A vehicle's pitch offset turns the view before the bias does (`0x606f90`). The reference
+    // turns its basis by minus the offset and by the bias's own `[cam+0x104]`; this camera's
+    // pitch and bias run the other way (the vehicle aim takes `MouseLookOffsetPitch` plus the
+    // pitch, where `0x5fbe70` takes it less), so the offset adds: the view looks up.
+    let look_pitch = arm_pitch + bias + rig.vehicle_pitch_offset;
+    let rotation = if look_pitch == arm_pitch {
         arm_rotation
     } else {
-        Quat::from_euler(EulerRot::YXZ, cam.yaw, arm_pitch + bias, 0.0)
+        Quat::from_euler(EulerRot::YXZ, yaw, look_pitch, 0.0)
     };
     // `Transform::forward()` is exactly `rotation * -Z`; computed here so the write can be gated.
     let cam_fwd = arm_rotation * Vec3::NEG_Z;
     let pivot = player_pos + Vec3::Y * cam_pivot_height;
-    let seat = pivot - cam_fwd * rig.distance;
+    // A vehicle's yaw offset swings the arm, not the look (`0x601d60` through `0x600730`).
+    let arm_fwd = if rig.vehicle_yaw_offset == 0.0 {
+        cam_fwd
+    } else {
+        Quat::from_rotation_y(rig.vehicle_yaw_offset) * cam_fwd
+    };
+    let seat = pivot - arm_fwd * rig.distance;
     let boom = seat - head;
     let boom_len = boom.length().max(1.0e-3);
     // The camera collides with the WMO camera/LOS faces (DETAIL kept, NOCAMCOLLIDE dropped),
@@ -1508,11 +1641,14 @@ pub(super) fn seat_camera(
 
     // Fade by the realized camera-to-pivot distance from the seated eye, not the bobbed one, and
     // the live `nearclip`: the fade finishes where the near plane starts cutting.
-    rig.self_fade_alpha = self_model_fade_alpha(
-        (seated - pivot).length(),
-        dynamics.nearclip,
-        SELF_FADE_WINDOW,
-    );
+    rig.self_fade_alpha = match rig.vehicle_fade {
+        Some(fade) => vehicle_fade_alpha(&fade, seated, dynamics.nearclip),
+        None => self_model_fade_alpha(
+            (seated - pivot).length(),
+            dynamics.nearclip,
+            SELF_FADE_WINDOW,
+        ),
+    };
 }
 
 /// Apply the self-avatar fade ([`CameraControl::self_fade_alpha`]) to the body parts and every
@@ -1523,7 +1659,7 @@ pub(super) fn seat_camera(
 /// `Visibility` left to the card's hidden-owner mirror.
 #[allow(clippy::type_complexity)] // one Bevy system's full input set
 pub(crate) fn apply_self_model_fade(
-    rig: Res<CameraControl>,
+    mut rig: ResMut<CameraControl>,
     self_player: Query<(Entity, Option<&crate::aura_visual::AuraNodes>), With<Embodied>>,
     children_of: Query<&Children>,
     mut parts: Query<
@@ -1558,7 +1694,36 @@ pub(crate) fn apply_self_model_fade(
     mut reauthor: ResMut<benilla_world::interior::InteriorReauthor>,
     mut was_fading: Local<bool>,
 ) {
+    // The vehicle fades with us; one left behind, or no longer fading, is handed back opaque.
+    let vehicle = rig.vehicle_fade.map(|f| f.vehicle);
+    let left = rig.vehicle_faded.filter(|&v| Some(v) != vehicle);
+    if let Some(old) = left {
+        let mut walked = EntityHashSet::default();
+        apply_self_fade_to_descendants(
+            old,
+            1.0,
+            &children_of,
+            &mut parts,
+            &far_twins,
+            &mut reauthor,
+            &mut walked,
+        );
+        rig.vehicle_faded = None;
+    }
     let fading = rig.self_fade_alpha < 1.0;
+    if let Some(v) = vehicle.filter(|_| fading || rig.vehicle_faded.is_some()) {
+        let mut walked = EntityHashSet::default();
+        apply_self_fade_to_descendants(
+            v,
+            rig.self_fade_alpha,
+            &children_of,
+            &mut parts,
+            &far_twins,
+            &mut reauthor,
+            &mut walked,
+        );
+        rig.vehicle_faded = fading.then_some(v);
+    }
     if !fading && !*was_fading {
         // Steady opaque: nothing to author and nothing to release.
         return;
@@ -1796,6 +1961,21 @@ mod tests {
     }
 
     /// The arm's two speeds: in at once on a hit, out over the fixed span on the cosine.
+    /// A vehicle's fade runs from gone to whole past the near plane on the cosine ramp.
+    #[test]
+    fn a_vehicle_fades_by_the_camera_s_distance_to_its_model() {
+        let fade = VehicleFade {
+            vehicle: Entity::PLACEHOLDER,
+            at: Vec3::ZERO,
+            gone: 4.0,
+            whole: 6.0,
+        };
+        let at = |d: f32| vehicle_fade_alpha(&fade, Vec3::new(d, 0.0, 0.0), 0.1);
+        assert_eq!(at(4.0), 0.0);
+        assert!((at(5.1) - 0.5).abs() < 1e-5);
+        assert_eq!(at(6.5), 1.0);
+    }
+
     #[test]
     fn the_arm_pulls_in_at_once_and_returns_over_two_seconds() {
         let mut arm = CollisionArm::at(6.0);
